@@ -1,0 +1,680 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import stripe
+import os
+import resend
+import json
+from datetime import datetime
+import pytz
+import psycopg2
+from dotenv import load_dotenv
+from flask import send_from_directory
+
+paris_tz = pytz.timezone("Europe/Paris")
+
+load_dotenv()
+
+if os.environ.get("RAILWAY_ENVIRONMENT"):
+    # chạy trên Railway → dùng internal
+    DATABASE_URL = os.environ.get("DATABASE_URL")
+else:
+    # chạy local → dùng public
+    DATABASE_URL = os.environ.get("DATABASE_PUBLIC_URL")
+
+print("Using DB:", DATABASE_URL)
+
+conn = psycopg2.connect(DATABASE_URL)
+conn.autocommit = True
+
+# =========================
+# CONFIG
+# =========================
+stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")
+
+if not ADMIN_PASSWORD or not ADMIN_TOKEN:
+    raise Exception("Missing ADMIN credentials in ENV")
+
+EMAIL_FROM = "Restopi <contact@pierregroupe.com>"
+EMAIL_TO = "restopi2025@gmail.com"
+
+resend.api_key = RESEND_API_KEY
+
+app = Flask(__name__)
+CORS(app)
+
+app.config['JSON_AS_ASCII'] = False
+
+def save_order(order):
+    with conn.cursor() as cur:
+        cur.execute("""
+        INSERT INTO orders (
+            id, date, nom, prenom, tel, adresse,
+            pickup_time, note, items, total, printed
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+          ON CONFLICT (id) DO NOTHING
+        """, (
+            order["id"],
+            order["date"],
+            order["nom"],
+            order["prenom"],
+            order["tel"],
+            order["adresse"],
+            order["pickup_time"],
+            order["note"],
+            json.dumps(order["items"], ensure_ascii=False),
+            order["total"],
+            order["printed"]
+        ))
+
+# =========================
+# MEMORY (FIX CRASH)
+# =========================
+
+@app.route("/")
+def home():
+    return "Server OK Pierre 🚀"
+
+# =========================
+# ADMIN SECURITY
+# =========================
+def check_admin(req):
+    token = req.headers.get("Authorization")
+    return token == ADMIN_TOKEN
+
+# =========================
+# PRODUCTS DATABASE
+# =========================
+
+def load_products():
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM products WHERE active = TRUE")
+        rows = cur.fetchall()
+
+    result = {}
+    for row in rows:
+        result[row[0]] = {
+            "id": row[0],
+            "name": row[1],
+            "price": row[2],
+            "category": row[3],
+            "tva": row[4],
+            "img": row[5],
+            "active": row[6]
+        }
+
+    return result
+@app.route("/products", methods=["GET"])
+def public_products():
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM products WHERE active = TRUE")
+        rows = cur.fetchall()
+
+    result = []
+    for row in rows:
+        result.append({
+            "id": row[0],
+            "name": row[1],
+            "price": row[2],
+            "category": row[3],
+            "tva": row[4],
+            "img": row[5]
+        })
+
+    return jsonify(result)
+
+def init_db():
+    with conn.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id BIGINT PRIMARY KEY,
+            date TEXT,
+            nom TEXT,
+            prenom TEXT,
+            tel TEXT,
+            adresse TEXT,
+            pickup_time TEXT,
+            note TEXT,
+            items JSONB,
+            total FLOAT,
+            printed BOOLEAN DEFAULT FALSE
+        );
+        """)
+
+init_db()
+
+def init_products():
+    with conn.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            price FLOAT,
+            category TEXT,
+            tva FLOAT,
+            img TEXT,
+            active BOOLEAN
+        );
+        """)
+
+init_products()
+
+@app.route("/create-checkout-session", methods=["POST"])
+def create_checkout_session():
+    data = request.json or {}
+    items = data.get("items", [])
+    client = data.get("client", {})  # 🔥 NEW
+
+    line_items = []
+    
+    products = load_products()
+    for item in items:
+      product_id = int(item.get("id"))
+      qty = int(item.get("qty", 1))
+
+      
+      product = products.get(str(product_id))
+      if not product:
+        continue
+
+      line_items.append({
+        "price_data": {
+            "currency": "eur",
+            "product_data": {
+                "name": product["name"],
+            },
+            "unit_amount": int(round(product["price"] * 100)),
+        },
+        "quantity": qty,
+    })
+    if not line_items:
+      return jsonify({"error": "no valid items"}), 400
+    success_url = data.get("success_url") or "https://pierregroupe.com/success.html"
+    cancel_url = data.get("cancel_url") or "https://pierregroupe.com"
+    session = stripe.checkout.Session.create(
+        payment_method_types=["card"],
+        line_items=line_items,
+        mode="payment",
+
+        success_url=success_url,
+        cancel_url=cancel_url,
+
+        # 🔥 TRÈS IMPORTANT
+        metadata={
+            "client": json.dumps(client),
+            "items": json.dumps(items)
+        }
+    )
+
+    return jsonify({"id": session.id})
+
+def create_order_from_webhook(items, client, stripe_total):
+       
+    nom = client.get("nom", "").strip()
+    prenom = client.get("prenom", "").strip()
+    tel = client.get("tel", "").strip()
+    adresse = (client.get("adresse", "") + " " + client.get("city", "")).strip()
+    pickup_time = client.get("pickup_datetime", "")
+    note = client.get("note", "")
+
+    now = datetime.now(paris_tz)
+    order_id = int(now.timestamp())
+
+    # ✅ TOTAL = STRIPE (QUAN TRỌNG)
+    total = stripe_total
+
+    clean_items = []
+
+    products = load_products()
+    for item in items:
+      product_id = int(item.get("id"))
+      qty = int(item.get("qty", 0))
+
+      
+      product = products.get(str(product_id))
+      if not product or qty <= 0:
+        continue
+
+      clean_items.append({
+        "name": product["name"],
+        "qty": qty,
+        "price": product["price"]   # 🔥 đổi từ unit_price → price
+      })
+
+    order_data = {
+        "id": order_id,
+        "date": now.strftime("%d/%m/%Y %H:%M:%S"),
+        "nom": nom,
+        "prenom": prenom,
+        "tel": tel,
+        "adresse": adresse,
+        "pickup_time": pickup_time,
+        "note": note,
+        "items": clean_items,
+        "total": total,
+        "printed": False
+    }
+
+    save_order(order_data)
+
+    print("\n🔥 COMMANDE WEBHOOK 🔥")
+    print(f"Commande #{order_id}")
+    print(f"Client: {prenom} {nom}")
+    print(f"Tel: {tel}")
+    print(f"Adresse: {adresse}")
+    print(f"Heure retrait: {pickup_time}")
+    print(f"Note client: {note}")
+
+    print("\n--- Produits ---")
+    for item in clean_items:
+        print(f"{item['name']} x {item['qty']} ({item['price']} €)")
+
+    print(f"\nTOTAL: {total} €")
+    print("====================\n")
+
+    # =========================
+    # 📧 EMAIL VIA RESEND
+    # =========================
+    try:
+        text_content = f"""RESTOPI
+
+Commande #{order_id}
+Date: {order_data['date']}
+
+Client: {prenom} {nom}
+Tel: {tel}
+Adresse: {adresse}
+
+Heure de retrait: {pickup_time}
+Note client: {note}
+
+COMMANDE:
+"""
+
+        for item in clean_items:
+            text_content += f"- {item['name']} x {item['qty']} ({item['price']} €)\n"
+
+        text_content += f"\nTOTAL: {total} €\n"
+
+        params = {
+            "from": EMAIL_FROM,
+            "to": [EMAIL_TO],
+            "subject": f"Nouvelle commande #{order_id}",
+            "text": text_content,
+        }
+        # gửi cho client
+        if client.get("email"):
+           resend.Emails.send({
+           "from": EMAIL_FROM,
+           "to": [client.get("email")],
+           "subject": "Votre commande Restopi",
+           "text": text_content
+        })
+        # gửi cho admin
+        email = resend.Emails.send(params)
+        print("📧 Email envoyé avec succès")
+        print(email)
+
+    except Exception as e:
+        print("❌ Erreur email Resend:", e)
+
+@app.route("/next-order", methods=["GET"])
+def next_order():
+    with conn.cursor() as cur:
+        cur.execute("""
+        SELECT * FROM orders
+        WHERE printed = FALSE
+        ORDER BY id ASC
+        LIMIT 1
+        """)
+        row = cur.fetchone()
+
+        if not row:
+            return jsonify({"message": "no order"})
+
+        items = row[8]
+        if isinstance(items, str):
+            items = json.loads(items)
+
+        return jsonify({
+            "id": row[0],
+            "date": row[1],
+            "nom": row[2],
+            "prenom": row[3],
+            "tel": row[4],
+            "adresse": row[5],
+            "pickup_time": row[6],
+            "note": row[7],
+            "items": items,
+            "total": row[9],
+            "printed": row[10]
+        })
+
+@app.route("/last-order", methods=["GET"])
+def last_order():
+    with conn.cursor() as cur:
+        cur.execute("""
+        SELECT * FROM orders
+        ORDER BY id DESC
+        LIMIT 1
+        """)
+        row = cur.fetchone()
+
+    if not row:
+        return jsonify({"message": "no order"})
+
+    items = row[8]
+    if isinstance(items, str):
+        items = json.loads(items)
+
+    return jsonify({
+        "id": row[0],
+        "date": row[1],
+        "nom": row[2],
+        "prenom": row[3],
+        "tel": row[4],
+        "adresse": row[5],
+        "pickup_time": row[6],
+        "note": row[7],
+        "items": items,
+        "total": row[9],
+        "printed": row[10]
+    })
+
+@app.route("/orders-history", methods=["GET"])
+def orders_history():
+    with conn.cursor() as cur:
+        cur.execute("""
+        SELECT * FROM orders
+        ORDER BY id DESC
+        LIMIT 20
+        """)
+        rows = cur.fetchall()
+
+    result = []
+    for row in rows:
+        items = row[8]
+        if isinstance(items, str):
+            items = json.loads(items)
+
+        result.append({
+            "id": row[0],
+            "date": row[1],
+            "nom": row[2],
+            "prenom": row[3],
+            "tel": row[4],
+            "adresse": row[5],
+            "pickup_time": row[6],
+            "note": row[7],
+            "items": items,
+            "total": row[9],
+            "printed": row[10]
+        })
+
+    return jsonify(result)
+
+@app.route("/mark-printed", methods=["POST"])
+def mark_printed():
+    data = request.json
+    order_id = data.get("id")
+
+    with conn.cursor() as cur:
+        cur.execute("""
+        UPDATE orders SET printed = TRUE WHERE id = %s
+        """, (order_id,))
+
+    return jsonify({"status": "ok"})
+
+@app.route("/contact", methods=["POST"])
+def contact():
+    data = request.json or {}
+
+    name = data.get("name", "")
+    email = data.get("email", "")
+    message = data.get("message", "")
+
+    try:
+        content = f"""
+NOUVEAU MESSAGE CLIENT
+
+Nom: {name}
+Email: {email}
+
+Message:
+{message}
+"""
+
+        params = {
+            "from": EMAIL_FROM,
+            "to": [EMAIL_TO],
+            "subject": f"Contact site - {name}",
+            "text": content,
+        }
+
+        resend.Emails.send(params)
+
+        return jsonify({"status": "ok"})
+
+    except Exception as e:
+        print("Erreur contact:", e)
+        return jsonify({"status": "error"}), 500
+
+@app.route("/webhook", methods=["POST"])
+def stripe_webhook():
+    payload = request.data
+    sig_header = request.headers.get("Stripe-Signature")
+    endpoint_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")  # 👉 lấy từ Stripe
+    
+    if not endpoint_secret:
+      print("⚠️ Missing webhook secret")
+      return "", 400
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, endpoint_secret
+        )
+    except Exception as e:
+        print("Webhook error:", e)
+        return "", 400
+
+    # 🎯 PAYMENT SUCCESS
+    if event["type"] == "checkout.session.completed":
+         
+
+        session = event["data"]["object"]
+
+        items = json.loads(session["metadata"]["items"])
+        client = json.loads(session["metadata"]["client"])
+
+        print("💰 PAIEMENT CONFIRMÉ")
+
+        # 👉 GỌI HÀM ORDER CỦA BẠN
+        amount_total = session["amount_total"] / 100  # €
+        create_order_from_webhook(items, client, amount_total)
+
+    return "", 200
+# =========================
+# LOGIN ADMIN
+# =========================
+@app.route("/admin/login", methods=["POST"])
+def admin_login():
+    data = request.json or {}
+    password = data.get("password")
+
+    if password == ADMIN_PASSWORD:
+        return jsonify({"token": ADMIN_TOKEN})
+
+    return jsonify({"error": "wrong password"}), 403
+
+# =========================
+# ADMIN ROUTES
+# =========================
+@app.route("/admin/products", methods=["GET"])
+def get_products():
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM products")
+        rows = cur.fetchall()
+
+    result = []
+    for row in rows:
+        result.append({
+            "id": row[0],
+            "name": row[1],
+            "price": row[2],
+            "category": row[3],
+            "tva": row[4],
+            "img": row[5]
+        })
+
+    return jsonify(result)
+
+@app.route("/admin/orders", methods=["GET"])
+def get_orders():
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    with conn.cursor() as cur:
+        cur.execute("""
+        SELECT * FROM orders
+        ORDER BY id DESC
+        """)
+        rows = cur.fetchall()
+
+    result = []
+    for row in rows:
+        items = row[8]
+        if isinstance(items, str):
+            items = json.loads(items)
+
+        result.append({
+            "id": row[0],
+            "date": row[1],
+            "nom": row[2],
+            "prenom": row[3],
+            "tel": row[4],
+            "adresse": row[5],
+            "pickup_time": row[6],
+            "note": row[7],
+            "items": items,
+            "total": row[9],
+            "printed": row[10]
+        })
+
+    return jsonify(result)
+
+@app.route("/admin/stats", methods=["GET"])
+def get_stats():
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    today = datetime.now(paris_tz).strftime("%d/%m/%Y")
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM orders")
+        rows = cur.fetchall()
+
+    total_today = 0
+    orders_today = 0
+    product_count = {}
+
+    for row in rows:
+        order_date = datetime.strptime(row[1], "%d/%m/%Y %H:%M:%S")
+
+        if order_date.strftime("%d/%m/%Y") == today:
+            orders_today += 1
+            total_today += row[9]
+
+            items = row[8]
+            if isinstance(items, str):
+                items = json.loads(items)
+
+            for item in items:
+                name = item["name"]
+                qty = item["qty"]
+                product_count[name] = product_count.get(name, 0) + qty
+
+    top_products = sorted(product_count.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    return jsonify({
+        "total_today": total_today,
+        "orders_today": orders_today,
+        "top_products": top_products
+    })
+
+@app.route("/admin/products/update", methods=["POST"])
+def update_product():
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json
+    product_id = str(data.get("id"))
+
+    with conn.cursor() as cur:
+        cur.execute("""
+        UPDATE products
+        SET name = %s, price = %s, category = %s, tva = %s, img = %s
+        WHERE id = %s
+        """, (
+            data.get("name"),
+            float(data.get("price")),
+            data.get("category"),
+            float(data.get("tva", 10)),
+            data.get("img"),
+            product_id
+        ))
+
+    return jsonify({"status": "ok"})
+
+@app.route("/admin/products/create", methods=["POST"])
+def create_product():
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json
+
+    with conn.cursor() as cur:
+        cur.execute("""
+        INSERT INTO products (id, name, price, category, tva, img, active)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (
+            str(data.get("id")),
+            data.get("name"),
+            float(data.get("price")),
+            data.get("category"),
+            float(data.get("tva", 10)),
+            data.get("img"),
+            True
+        ))
+
+    return jsonify({"status": "created"})
+
+@app.route("/admin/images", methods=["GET"])
+def get_images():
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    folder = "images"
+
+    try:
+        files = os.listdir(folder)
+        images = [f for f in files if f.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))]
+        return jsonify(images)
+    except:
+        return jsonify([])
+    
+@app.route('/images/<path:filename>')
+def get_image(filename):
+    return send_from_directory('images', filename)
+
+# =========================
+# RUN SERVER
+# =========================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)

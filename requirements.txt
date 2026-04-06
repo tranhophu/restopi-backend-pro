@@ -1,0 +1,8 @@
+flask
+flask-cors
+stripe
+python-dotenv
+gunicorn
+resend
+pytz
+psycopg2-binary
