@@ -654,6 +654,16 @@ def update_product():
         if not img and old_img:
             img = old_img[0]
 
+        # 🔥 lấy tva cũ
+        cur.execute("SELECT tva FROM products WHERE id = %s", (product_id,))
+        old_tva = cur.fetchone()
+
+        tva = data.get("tva")
+
+        # 🔥 FIX QUAN TRỌNG
+        if tva == "" or tva is None:
+            tva = old_tva[0] if old_tva else 10
+
         # 🔥 UPDATE
         cur.execute("""
         UPDATE products
@@ -663,8 +673,8 @@ def update_product():
             data.get("name"),
             float(data.get("price")),
             category,
-            float(data.get("tva", 10)),
-            img,   # ✅ dùng img đã xử lý
+            float(tva),   # ✅ FIX CHÍNH
+            img,
             data.get("featured", False),
             product_id
         ))
@@ -687,7 +697,7 @@ def create_product():
             data.get("name"),
             float(data.get("price")),
             data.get("category"),
-            float(data.get("tva", 10)),
+            float(data.get("tva") or 10),
             data.get("img"),
             True,
             data.get("featured", False)
