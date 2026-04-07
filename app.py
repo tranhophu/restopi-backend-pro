@@ -758,7 +758,7 @@ def top_products():
 
     top = sorted(product_count.items(), key=lambda x: x[1], reverse=True)
 
-    top_ids = [p[0] for p in top[:5]]
+    top_ids = [str(p[0]) for p in top[:5]]
 
     return jsonify(top_ids)
 # =========================
