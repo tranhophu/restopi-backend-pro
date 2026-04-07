@@ -656,21 +656,21 @@ def create_product():
 
 @app.route("/admin/products/delete", methods=["POST"])
 def delete_product():
-    token = request.headers.get("Authorization")
-
-    if token != os.environ.get("ADMIN_TOKEN"):
-        return jsonify({"error": "Unauthorized"}), 403
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
 
     data = request.json
     product_id = str(data.get("id"))
 
-    products = load_products()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM products WHERE id = %s", (product_id,))
 
-    if product_id in products:
-        del products[product_id]
-        save_products(products)
+        return jsonify({"success": True})
 
-    return jsonify({"success": True})
+    except Exception as e:
+        print("DELETE ERROR:", e)
+        return jsonify({"error": "delete failed"}), 500
 
 @app.route("/admin/images", methods=["GET"])
 def get_images():
