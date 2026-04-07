@@ -7,6 +7,7 @@ import json
 from datetime import datetime
 import pytz
 import psycopg2
+import random
 from dotenv import load_dotenv
 from flask import send_from_directory
 
@@ -186,46 +187,97 @@ init_products()
 def create_checkout_session():
     data = request.json or {}
     items = data.get("items", [])
-    client = data.get("client", {})  # 🔥 NEW
+    client = data.get("client", {})
+    points_used = int(data.get("points_used", 0))
 
-    line_items = []
-    
     products = load_products()
+
+    # =========================
+    # 🔥 CALCUL TOTAL
+    # =========================
+    total_eur = 0
+
     for item in items:
-      product_id = int(item.get("id"))
-      qty = int(item.get("qty", 1))
+        product_id = int(item.get("id"))
+        qty = int(item.get("qty", 1))
 
-      
-      product = products.get(str(product_id))
-      if not product:
-        continue
+        product = products.get(str(product_id))
+        if not product:
+            continue
 
-      line_items.append({
-        "price_data": {
-            "currency": "eur",
-            "product_data": {
-                "name": product["name"],
+        total_eur += product["price"] * qty
+
+    # 🔥 sécurité total
+    if total_eur <= 0:
+        return jsonify({"error": "total invalid"}), 400
+
+    # =========================
+    # 🎁 DISCOUNT
+    # =========================
+    valid_points = (points_used // 100) * 100
+    discount_eur = (valid_points / 100) * 10
+
+    # 🔥 LIMIT DISCOUNT
+    if discount_eur >= total_eur:
+        discount_eur = max(0, total_eur - 0.5)
+
+    # =========================
+    # 🧾 LINE ITEMS
+    # =========================
+    line_items = []
+
+    for item in items:
+        product_id = int(item.get("id"))
+        qty = int(item.get("qty", 1))
+
+        product = products.get(str(product_id))
+        if not product:
+            continue
+
+        line_items.append({
+            "price_data": {
+                "currency": "eur",
+                "product_data": {
+                    "name": product["name"],
+                },
+                "unit_amount": int(round(product["price"] * 100)),
             },
-            "unit_amount": int(round(product["price"] * 100)),
-        },
-        "quantity": qty,
-    })
+            "quantity": qty,
+        })
+
+    # 🎁 ADD DISCOUNT
+    print(f"💳 Stripe total: {total_eur}€ | Discount: {discount_eur}€")
+    if discount_eur > 0:
+        line_items.append({
+            "price_data": {
+                "currency": "eur",
+                "product_data": {
+                    "name": "Réduction fidélité"
+                },
+                "unit_amount": -int(discount_eur * 100),
+            },
+            "quantity": 1,
+        })
+
     if not line_items:
-      return jsonify({"error": "no valid items"}), 400
-    success_url = data.get("success_url") or "https://pierregroupe.com/success.html"
-    cancel_url = data.get("cancel_url") or "https://pierregroupe.com"
+        return jsonify({"error": "no valid items"}), 400
+
+    # =========================
+    # 💳 STRIPE
+    # =========================
+    success_url = data.get("success_url") or "https://aupetitvietnam.com/success.html"
+    cancel_url = data.get("cancel_url") or "https://aupetitvietnam.com"
+
     session = stripe.checkout.Session.create(
         payment_method_types=["card"],
         line_items=line_items,
         mode="payment",
-
         success_url=success_url,
         cancel_url=cancel_url,
-
-        # 🔥 TRÈS IMPORTANT
         metadata={
             "client": json.dumps(client),
-            "items": json.dumps(items)
+            "items": json.dumps(items),
+            "points_used": str(valid_points)
         }
     )
 
@@ -241,7 +293,7 @@ def create_order_from_webhook(items, client, stripe_total):
     note = client.get("note", "")
 
     now = datetime.now(paris_tz)
-    order_id = int(now.timestamp())
+    order_id = int(now.timestamp() * 1000) + random.randint(0, 999)
 
     # ✅ TOTAL = STRIPE (QUAN TRỌNG)
     total = stripe_total
@@ -341,6 +393,57 @@ COMMANDE:
 
     except Exception as e:
         print("❌ Erreur email Resend:", e)
+
+    # =========================
+    # 🎯 LOYALTY POINTS
+    # =========================
+
+    email = client.get("email")
+
+    if email:
+        points_used = int(client.get("points_used", 0))
+
+        # 🔥 VERIFY với DB
+        with conn.cursor() as cur:
+            cur.execute("SELECT points FROM customers WHERE email = %s", (email,))
+            row = cur.fetchone()
+
+            real_points = row[0] if row else 0
+
+        # không cho dùng quá số point thật
+        if points_used > real_points:
+            points_used = real_points
+
+        # luôn round đúng
+        points_used = (points_used // 100) * 100
+
+        # 🔥 LIMIT SECURITY
+        if points_used < 0:
+            points_used = 0
+
+        if points_used > 10000:
+            points_used = 0
+
+        # 🔥 tính lại total gốc
+        original_total = total + (points_used / 100 * 10)
+
+        points_earned = int(original_total)
+        with conn.cursor() as cur:
+            # check customer tồn tại chưa
+            cur.execute("SELECT points FROM customers WHERE email = %s", (email,))
+            row = cur.fetchone()
+
+            if row:
+                new_points = row[0] + points_earned - points_used
+                if new_points < 0:
+                    new_points = 0
+                cur.execute("UPDATE customers SET points = %s WHERE email = %s",
+                            (new_points, email))
+            else:
+                cur.execute("INSERT INTO customers (email, points) VALUES (%s, %s)",
+                            (email, points_earned))
+
+        print(f"🎁 Points ajoutés: {points_earned}")
 
 @app.route("/next-order", methods=["GET"])
 def next_order():
@@ -509,6 +612,9 @@ def stripe_webhook():
 
         items = json.loads(session["metadata"]["items"])
         client = json.loads(session["metadata"]["client"])
+        points_used = int(session["metadata"].get("points_used", 0))
+        client["points_used"] = points_used
+
 
         print("💰 PAIEMENT CONFIRMÉ")
 
@@ -771,6 +877,31 @@ def top_products():
     top_ids = [str(p[0]) for p in top[:5]]
 
     return jsonify(top_ids)
+
+def init_customers():
+    with conn.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS customers (
+            id SERIAL PRIMARY KEY,
+            email TEXT UNIQUE,
+            points INTEGER DEFAULT 0
+        );
+        """)
+
+init_customers()
+
+@app.route("/points", methods=["POST"])
+def get_points():
+    data = request.json
+    email = data.get("email")
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT points FROM customers WHERE email = %s", (email,))
+        row = cur.fetchone()
+
+    return jsonify({
+        "points": row[0] if row else 0
+    })
 # =========================
 # RUN SERVER
 # =========================
