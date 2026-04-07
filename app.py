@@ -103,7 +103,8 @@ def load_products():
             "category": row[3],
             "tva": row[4],
             "img": row[5],
-            "active": row[6]
+            "active": row[6],
+            "featured": row[7]
         }
 
     return result
@@ -121,7 +122,8 @@ def public_products():
             "price": row[2],
             "category": row[3],
             "tva": row[4],
-            "img": row[5]
+            "img": row[5],
+            "featured": row[7]
         })
 
     return jsonify(result)
@@ -156,7 +158,8 @@ def init_products():
             category TEXT,
             tva FLOAT,
             img TEXT,
-            active BOOLEAN
+            active BOOLEAN,
+            featured BOOLEAN DEFAULT FALSE
         );
         """)
 
@@ -529,7 +532,8 @@ def get_products():
             "price": row[2],
             "category": row[3],
             "tva": row[4],
-            "img": row[5]
+            "img": row[5],
+            "featured": row[7]
         })
 
     return jsonify(result)
@@ -618,14 +622,14 @@ def update_product():
     with conn.cursor() as cur:
         cur.execute("""
         UPDATE products
-        SET name = %s, price = %s, category = %s, tva = %s, img = %s
+        SET name = %s, price = %s, category = %s, tva = %s, img = %s, featured = %s
         WHERE id = %s
         """, (
             data.get("name"),
             float(data.get("price")),
             data.get("category"),
             float(data.get("tva", 10)),
-            data.get("img"),
+            data.get("img"),data.get("featured", False),
             product_id
         ))
 
@@ -640,8 +644,8 @@ def create_product():
 
     with conn.cursor() as cur:
         cur.execute("""
-        INSERT INTO products (id, name, price, category, tva, img, active)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO products (id, name, price, category, tva, img, active, featured)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             str(data.get("id")),
             data.get("name"),
@@ -649,7 +653,8 @@ def create_product():
             data.get("category"),
             float(data.get("tva", 10)),
             data.get("img"),
-            True
+            True,
+            data.get("featured", False)
         ))
 
     return jsonify({"status": "created"})
