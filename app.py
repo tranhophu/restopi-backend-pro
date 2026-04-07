@@ -654,6 +654,24 @@ def create_product():
 
     return jsonify({"status": "created"})
 
+@app.route("/admin/products/delete", methods=["POST"])
+def delete_product():
+    token = request.headers.get("Authorization")
+
+    if token != os.environ.get("ADMIN_TOKEN"):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.json
+    product_id = str(data.get("id"))
+
+    products = load_products()
+
+    if product_id in products:
+        del products[product_id]
+        save_products(products)
+
+    return jsonify({"success": True})
+
 @app.route("/admin/images", methods=["GET"])
 def get_images():
     if not check_admin(request):
