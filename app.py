@@ -638,6 +638,15 @@ def update_product():
     product_id = str(data.get("id"))
 
     with conn.cursor() as cur:
+
+        # 🔥 LẤY CATEGORY CŨ
+        cur.execute("SELECT category FROM products WHERE id = %s", (product_id,))
+        old = cur.fetchone()
+
+        # 🔥 FALLBACK nếu frontend không gửi
+        category = data.get("category", old[0] if old else None)
+
+        # 🔥 UPDATE
         cur.execute("""
         UPDATE products
         SET name = %s, price = %s, category = %s, tva = %s, img = %s, featured = %s
@@ -645,9 +654,10 @@ def update_product():
         """, (
             data.get("name"),
             float(data.get("price")),
-            data.get("category"),
+            category,
             float(data.get("tva", 10)),
-            data.get("img"),data.get("featured", False),
+            data.get("img"),
+            data.get("featured", False),
             product_id
         ))
 
