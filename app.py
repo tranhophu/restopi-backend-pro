@@ -639,12 +639,20 @@ def update_product():
 
     with conn.cursor() as cur:
 
-        # 🔥 LẤY CATEGORY CŨ
+        # 🔥 lấy category cũ
         cur.execute("SELECT category FROM products WHERE id = %s", (product_id,))
         old = cur.fetchone()
-
-        # 🔥 FALLBACK nếu frontend không gửi
         category = data.get("category", old[0] if old else None)
+
+        # 🔥 lấy img cũ
+        cur.execute("SELECT img FROM products WHERE id = %s", (product_id,))
+        old_img = cur.fetchone()
+
+        img = data.get("img")
+
+        # 🔥 nếu frontend gửi rỗng → giữ ảnh cũ
+        if not img and old_img:
+            img = old_img[0]
 
         # 🔥 UPDATE
         cur.execute("""
@@ -656,7 +664,7 @@ def update_product():
             float(data.get("price")),
             category,
             float(data.get("tva", 10)),
-            data.get("img"),
+            img,   # ✅ dùng img đã xử lý
             data.get("featured", False),
             product_id
         ))
@@ -739,8 +747,12 @@ def top_products():
             items = json.loads(items)
 
         for item in items:
-            product_id = item["id"]
-            qty = item["qty"]
+            product_id = item.get("id")
+            qty = item.get("qty", 0)
+
+            # 🔥 nếu order cũ không có id → bỏ qua
+            if not product_id:
+                continue
 
             product_count[product_id] = product_count.get(product_id, 0) + qty
 
