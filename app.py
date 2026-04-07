@@ -150,6 +150,8 @@ init_db()
 
 def init_products():
     with conn.cursor() as cur:
+
+        # 1. CREATE TABLE nếu chưa có
         cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id TEXT PRIMARY KEY,
@@ -158,9 +160,24 @@ def init_products():
             category TEXT,
             tva FLOAT,
             img TEXT,
-            active BOOLEAN,
-            featured BOOLEAN DEFAULT FALSE
+            active BOOLEAN
         );
+        """)
+
+        # 2. ADD COLUMN featured nếu chưa có
+        cur.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 
+                FROM information_schema.columns 
+                WHERE table_name='products' 
+                AND column_name='featured'
+            ) THEN
+                ALTER TABLE products ADD COLUMN featured BOOLEAN DEFAULT FALSE;
+            END IF;
+        END
+        $$;
         """)
 
 init_products()
@@ -242,9 +259,10 @@ def create_order_from_webhook(items, client, stripe_total):
         continue
 
       clean_items.append({
+        "id": int(product_id),
         "name": product["name"],
         "qty": qty,
-        "price": product["price"]   # 🔥 đổi từ unit_price → price
+        "price": product["price"]
       })
 
     order_data = {
@@ -695,6 +713,32 @@ def get_images():
 def get_image(filename):
     return send_from_directory('images', filename)
 
+@app.route("/top-products", methods=["GET"])
+def top_products():
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM orders")
+        rows = cur.fetchall()
+
+    product_count = {}
+
+    for row in rows:
+        items = row[8]
+
+        if isinstance(items, str):
+            items = json.loads(items)
+
+        for item in items:
+            product_id = item["id"]
+            qty = item["qty"]
+
+            product_count[product_id] = product_count.get(product_id, 0) + qty
+
+    top = sorted(product_count.items(), key=lambda x: x[1], reverse=True)
+
+    top_ids = [p[0] for p in top[:5]]
+
+    return jsonify(top_ids)
 # =========================
 # RUN SERVER
 # =========================
