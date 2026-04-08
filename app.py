@@ -97,7 +97,7 @@ def load_products():
 
     result = {}
     for row in rows:
-        result[row[0]] = {
+        result[str(row[0])] = {
             "id": row[0],
             "name": row[1],
             "price": row[2],
@@ -155,13 +155,14 @@ def init_products():
         # 1. CREATE TABLE nếu chưa có
         cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
-            id TEXT PRIMARY KEY,
-            name TEXT,
-            price FLOAT,
-            category TEXT,
-            tva FLOAT,
-            img TEXT,
-            active BOOLEAN
+           id SERIAL PRIMARY KEY,
+           name TEXT,
+           price FLOAT,
+           category TEXT,
+           tva FLOAT,
+           img TEXT,
+           active BOOLEAN DEFAULT TRUE,
+           featured BOOLEAN DEFAULT FALSE
         );
         """)
 
@@ -214,8 +215,30 @@ def create_checkout_session():
     # =========================
     # 🎁 DISCOUNT
     # =========================
+    # 🔥 lấy email
+    email = client.get("email")
+
+    real_points = 0
+
+    if email:
+        with conn.cursor() as cur:
+            cur.execute("SELECT points FROM customers WHERE email = %s", (email,))
+            row = cur.fetchone()
+            real_points = row[0] if row else 0
+
+    # 🔥 không cho dùng quá số point thật
+    points_used = min(points_used, real_points)
+
+    # 🔥 round chuẩn
     valid_points = (points_used // 100) * 100
+
     discount_eur = (valid_points / 100) * 10
+
+    # 🔥 LIMIT theo total
+    discount_eur = min(discount_eur, total_eur - 0.5)
+
+    if discount_eur < 0:
+        discount_eur = 0
 
     # 🔥 LIMIT DISCOUNT
     if discount_eur >= total_eur:
@@ -247,17 +270,26 @@ def create_checkout_session():
 
     # 🎁 ADD DISCOUNT
     print(f"💳 Stripe total: {total_eur}€ | Discount: {discount_eur}€")
-    if discount_eur > 0:
-        line_items.append({
-            "price_data": {
-                "currency": "eur",
-                "product_data": {
-                    "name": "Réduction fidélité"
-                },
-                "unit_amount": -int(discount_eur * 100),
+   # 🎁 APPLY DISCOUNT DIRECTLY
+    final_total = total_eur - discount_eur
+
+    # sécurité
+    if final_total <= 0:
+        final_total = 0.5
+
+    # ⚠️ Stripe veut centimes
+    amount_cents = int(round(final_total * 100))
+
+    line_items = [{
+        "price_data": {
+            "currency": "eur",
+            "product_data": {
+                "name": "Commande Restopi"
             },
-            "quantity": 1,
-        })
+            "unit_amount": amount_cents,
+        },
+        "quantity": 1,
+    }]
 
     if not line_items:
         return jsonify({"error": "no valid items"}), 400
@@ -796,10 +828,9 @@ def create_product():
 
     with conn.cursor() as cur:
         cur.execute("""
-        INSERT INTO products (id, name, price, category, tva, img, active, featured)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO products (name, price, category, tva, img, active, featured)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (
-            str(data.get("id")),
             data.get("name"),
             float(data.get("price")),
             data.get("category"),
