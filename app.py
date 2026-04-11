@@ -933,6 +933,41 @@ def get_points():
     return jsonify({
         "points": row[0] if row else 0
     })
+
+@app.route("/pending-orders", methods=["GET"])
+def pending_orders():
+    limit = request.args.get("limit", 20, type=int)
+
+    with conn.cursor() as cur:
+        cur.execute("""
+        SELECT * FROM orders
+        WHERE printed = FALSE
+        ORDER BY id ASC
+        LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall()
+
+    result = []
+    for row in rows:
+        items = row[8]
+        if isinstance(items, str):
+            items = json.loads(items)
+
+        result.append({
+            "id": row[0],
+            "date": row[1],
+            "nom": row[2],
+            "prenom": row[3],
+            "tel": row[4],
+            "adresse": row[5],
+            "pickup_time": row[6],
+            "note": row[7],
+            "items": items,
+            "total": row[9],
+            "printed": row[10]
+        })
+
+    return jsonify(result)
 # =========================
 # RUN SERVER
 # =========================
