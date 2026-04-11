@@ -622,11 +622,11 @@ Message:
 def stripe_webhook():
     payload = request.data
     sig_header = request.headers.get("Stripe-Signature")
-    endpoint_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")  # 👉 lấy từ Stripe
+    endpoint_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
     
     if not endpoint_secret:
-      print("⚠️ Missing webhook secret")
-      return "", 400
+        print("⚠️ Missing webhook secret")
+        return "", 400
 
     try:
         event = stripe.Webhook.construct_event(
@@ -636,22 +636,22 @@ def stripe_webhook():
         print("Webhook error:", e)
         return "", 400
 
-    # 🎯 PAYMENT SUCCESS
     if event["type"] == "checkout.session.completed":
-         
-
         session = event["data"]["object"]
+        metadata = session["metadata"]
 
-        items = json.loads(session["metadata"]["items"])
-        client = json.loads(session["metadata"]["client"])
-        points_used = int(session["metadata"].get("points_used", 0))
+        items_raw = metadata["items"] if "items" in metadata else "[]"
+        client_raw = metadata["client"] if "client" in metadata else "{}"
+        points_raw = metadata["points_used"] if "points_used" in metadata else "0"
+
+        items = json.loads(items_raw)
+        client = json.loads(client_raw)
+        points_used = int(points_raw or 0)
         client["points_used"] = points_used
-
 
         print("💰 PAIEMENT CONFIRMÉ")
 
-        # 👉 GỌI HÀM ORDER CỦA BẠN
-        amount_total = session["amount_total"] / 100  # €
+        amount_total = session["amount_total"] / 100
         create_order_from_webhook(items, client, amount_total)
 
     return "", 200
