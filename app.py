@@ -84,7 +84,18 @@ def home():
 # =========================
 def check_admin(req):
     token = req.headers.get("Authorization")
-    return token == ADMIN_TOKEN
+
+    # 🔥 check vide
+    if not token:
+        print("❌ No token provided")
+        return False
+
+    # 🔥 check match
+    if token != ADMIN_TOKEN:
+        print("❌ Invalid token:", token)
+        return False
+
+    return True
 
 # =========================
 # PRODUCTS DATABASE
@@ -663,10 +674,15 @@ def admin_login():
     data = request.json or {}
     password = data.get("password")
 
-    if password == ADMIN_PASSWORD:
-        return jsonify({"token": ADMIN_TOKEN})
+    if not password:
+        return jsonify({"error": "missing password"}), 400
 
-    return jsonify({"error": "wrong password"}), 403
+    if password != ADMIN_PASSWORD:
+        print("❌ Wrong admin password attempt")
+        return jsonify({"error": "wrong password"}), 403
+
+    print("✅ Admin login success")
+    return jsonify({"token": ADMIN_TOKEN})
 
 # =========================
 # ADMIN ROUTES
