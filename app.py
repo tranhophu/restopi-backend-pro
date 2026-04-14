@@ -354,7 +354,7 @@ def request_pin_reset():
         return jsonify({"error": "Email manquant"}), 400
 
     token = secrets.token_urlsafe(32)
-    expiry = datetime.now(paris_tz) + timedelta(minutes=15)
+    expiry = datetime.now() + timedelta(minutes=30)
 
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM customers WHERE email = %s", (email,))
@@ -422,7 +422,7 @@ def check_reset_token():
     if expiry and expiry.tzinfo is None:
         expiry = paris_tz.localize(expiry)
 
-    now = datetime.now(paris_tz)
+    now = datetime.now()
 
     if not expiry or now > expiry:
         return jsonify({"error": "Token expiré"}), 400
@@ -461,7 +461,7 @@ def reset_pin():
         if expiry and expiry.tzinfo is None:
             expiry = paris_tz.localize(expiry)
 
-        now = datetime.now(paris_tz)
+        now = datetime.now()
 
         if not expiry or now > expiry:
             return jsonify({"error": "Token expiré"}), 400
