@@ -4,12 +4,14 @@ import stripe
 import os
 import resend
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import psycopg2
 import random
 from dotenv import load_dotenv
 from flask import send_from_directory
+from werkzeug.security import generate_password_hash, check_password_hash
+import secrets
 
 paris_tz = pytz.timezone("Europe/Paris")
 
@@ -27,6 +29,40 @@ print("Using DB:", DATABASE_URL)
 conn = psycopg2.connect(DATABASE_URL)
 conn.autocommit = True
 
+def get_customer_by_email(email):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, email, phone, pin_hash, points, reset_token, reset_token_expiry
+            FROM customers
+            WHERE email = %s
+        """, (email.lower(),))
+        return cur.fetchone()
+
+
+def add_points_to_customer(email, phone, amount_eur):
+    if not email:
+        return
+
+    email = email.strip().lower()
+    phone = (phone or "").strip()
+    points_to_add = int(amount_eur)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM customers WHERE email = %s", (email,))
+        row = cur.fetchone()
+
+        if row:
+            cur.execute("""
+                UPDATE customers
+                SET points = points + %s,
+                    phone = COALESCE(NULLIF(%s, ''), phone)
+                WHERE email = %s
+            """, (points_to_add, phone, email))
+        else:
+            cur.execute("""
+                INSERT INTO customers (email, phone, points)
+                VALUES (%s, %s, %s)
+            """, (email, phone, points_to_add))
 # =========================
 # CONFIG
 # =========================
@@ -195,12 +231,256 @@ def init_products():
 
 init_products()
 
+@app.route("/customer/set-pin", methods=["POST"])
+def customer_set_pin():
+    data = request.get_json()
+    email = (data.get("email") or "").strip().lower()
+    phone = (data.get("phone") or "").strip()
+    pin = (data.get("pin") or "").strip()
+
+    if not email:
+        return jsonify({"error": "Email manquant"}), 400
+
+    if not pin or len(pin) != 4 or not pin.isdigit():
+        return jsonify({"error": "Le PIN doit contenir exactement 4 chiffres"}), 400
+
+    pin_hash = generate_password_hash(pin)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, pin_hash FROM customers WHERE email = %s", (email,))
+        row = cur.fetchone()
+
+        if row:
+            cur.execute("""
+                UPDATE customers
+                SET phone = COALESCE(NULLIF(%s, ''), phone),
+                    pin_hash = %s
+                WHERE email = %s
+            """, (phone, pin_hash, email))
+        else:
+            cur.execute("""
+                INSERT INTO customers (email, phone, pin_hash, points)
+                VALUES (%s, %s, %s, 0)
+            """, (email, phone, pin_hash))
+
+    return jsonify({
+        "success": True,
+        "message": "PIN enregistré avec succès"
+    })
+
+@app.route("/customer/verify-pin", methods=["POST"])
+def customer_verify_pin():
+    data = request.get_json()
+    email = (data.get("email") or "").strip().lower()
+    pin = (data.get("pin") or "").strip()
+
+    if not email or not pin:
+        return jsonify({"error": "Email ou PIN manquant"}), 400
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT pin_hash, points FROM customers WHERE email = %s", (email,))
+        row = cur.fetchone()
+
+    if not row:
+        return jsonify({"error": "Client introuvable"}), 404
+
+    pin_hash, points = row
+
+    if not pin_hash:
+        return jsonify({"error": "Aucun PIN défini pour ce client"}), 400
+
+    if not check_password_hash(pin_hash, pin):
+        return jsonify({"error": "PIN incorrect"}), 401
+
+    return jsonify({
+        "success": True,
+        "points": points
+    })
+
+@app.route("/customer/redeem-points", methods=["POST"])
+def customer_redeem_points():
+    data = request.get_json()
+    email = (data.get("email") or "").strip().lower()
+    pin = (data.get("pin") or "").strip()
+    points_to_use = int(data.get("points_to_use", 0))
+
+    if not email or not pin:
+        return jsonify({"error": "Email ou PIN manquant"}), 400
+
+    if points_to_use <= 0:
+        return jsonify({"error": "Nombre de points invalide"}), 400
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, pin_hash, points
+            FROM customers
+            WHERE email = %s
+        """, (email,))
+        row = cur.fetchone()
+
+        if not row:
+            return jsonify({"error": "Client introuvable"}), 404
+
+        customer_id, pin_hash, current_points = row
+
+        if not pin_hash or not check_password_hash(pin_hash, pin):
+            return jsonify({"error": "PIN incorrect"}), 401
+
+        if current_points < points_to_use:
+            return jsonify({"error": "Points insuffisants"}), 400
+
+        new_points = current_points - points_to_use
+
+        cur.execute("""
+            UPDATE customers
+            SET points = %s
+            WHERE id = %s
+        """, (new_points, customer_id))
+
+    discount_eur = points_to_use / 10
+
+    return jsonify({
+        "success": True,
+        "points_restants": new_points,
+        "discount_eur": discount_eur
+    })
+
+@app.route("/customer/request-pin-reset", methods=["POST"])
+def request_pin_reset():
+    data = request.get_json()
+    email = (data.get("email") or "").strip().lower()
+
+    if not email:
+        return jsonify({"error": "Email manquant"}), 400
+
+    token = secrets.token_urlsafe(32)
+    expiry = datetime.now(paris_tz) + timedelta(minutes=15)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM customers WHERE email = %s", (email,))
+        row = cur.fetchone()
+
+        if row:
+            cur.execute("""
+                UPDATE customers
+                SET reset_token = %s,
+                    reset_token_expiry = %s
+                WHERE email = %s
+            """, (token, expiry, email))
+
+            reset_link = f"https://aupetitvietnam.com/reset-pin.html?token={token}"
+
+            try:
+                resend.api_key = RESEND_API_KEY
+                resend.Emails.send({
+                    "from": "Au P'tit Vietnam <contact@pierregroupe.com>",
+                    "to": [email],
+                    "subject": "Réinitialisation de votre PIN fidélité",
+                    "html": f"""
+                        <p>Bonjour,</p>
+                        <p>Vous avez demandé la réinitialisation de votre PIN fidélité.</p>
+                        <p>
+                          <a href="{reset_link}" style="display:inline-block;padding:10px 18px;background:#00cdbd;color:#fff;text-decoration:none;border-radius:8px;">
+                            Réinitialiser mon PIN
+                          </a>
+                        </p>
+                        <p>Ce lien expire dans 15 minutes.</p>
+                        <p>Si vous n'êtes pas à l'origine de cette demande, ignorez cet email.</p>
+                    """
+                })
+            except Exception as e:
+                print("Erreur email reset PIN:", e)
+                return jsonify({"error": "Impossible d'envoyer l'email"}), 500
+
+    return jsonify({
+        "success": True,
+        "message": "Si cet email existe, un lien de réinitialisation a été envoyé."
+    })
+
+@app.route("/customer/check-reset-token", methods=["POST"])
+def check_reset_token():
+    data = request.get_json()
+    token = (data.get("token") or "").strip()
+
+    if not token:
+        return jsonify({"error": "Token manquant"}), 400
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT email, reset_token_expiry
+            FROM customers
+            WHERE reset_token = %s
+        """, (token,))
+        row = cur.fetchone()
+
+    if not row:
+        return jsonify({"error": "Token invalide"}), 400
+
+    email, expiry = row
+    now = datetime.now(paris_tz)
+
+    if not expiry or now > expiry:
+        return jsonify({"error": "Token expiré"}), 400
+
+    return jsonify({
+        "success": True,
+        "email": email
+    })
+
+@app.route("/customer/reset-pin", methods=["POST"])
+def reset_pin():
+    data = request.get_json()
+    token = (data.get("token") or "").strip()
+    new_pin = (data.get("new_pin") or "").strip()
+
+    if not token:
+        return jsonify({"error": "Token manquant"}), 400
+
+    if not new_pin or len(new_pin) != 4 or not new_pin.isdigit():
+        return jsonify({"error": "Le PIN doit contenir exactement 4 chiffres"}), 400
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, reset_token_expiry
+            FROM customers
+            WHERE reset_token = %s
+        """, (token,))
+        row = cur.fetchone()
+
+        if not row:
+            return jsonify({"error": "Token invalide"}), 400
+
+        customer_id, expiry = row
+        now = datetime.now(paris_tz)
+
+        if not expiry or now > expiry:
+            return jsonify({"error": "Token expiré"}), 400
+
+        new_pin_hash = generate_password_hash(new_pin)
+
+        cur.execute("""
+            UPDATE customers
+            SET pin_hash = %s,
+                reset_token = NULL,
+                reset_token_expiry = NULL
+            WHERE id = %s
+        """, (new_pin_hash, customer_id))
+
+    return jsonify({
+        "success": True,
+        "message": "PIN réinitialisé avec succès"
+    })
+
 @app.route("/create-checkout-session", methods=["POST"])
 def create_checkout_session():
     data = request.json or {}
     items = data.get("items", [])
-    client = data.get("client", {})
-    points_used = int(data.get("points_used", 0))
+    client = data.get("client", {}) or {}
+    points_used = int(data.get("points_used", 0) or 0)
+
+    # ✅ normaliser client
+    client["email"] = (client.get("email") or "").strip().lower()
+    client["tel"] = (client.get("tel") or "").strip()
 
     products = load_products()
 
@@ -227,21 +507,35 @@ def create_checkout_session():
     # 🎁 DISCOUNT
     # =========================
     # 🔥 lấy email
-    email = client.get("email")
+    email = (client.get("email") or "").strip().lower()
+    pin = (data.get("pin") or "").strip()
 
     real_points = 0
+    pin_hash = None
 
     if email:
         with conn.cursor() as cur:
-            cur.execute("SELECT points FROM customers WHERE email = %s", (email,))
+            cur.execute("SELECT pin_hash, points FROM customers WHERE email = %s", (email,))
             row = cur.fetchone()
-            real_points = row[0] if row else 0
+            if row:
+                pin_hash, real_points = row
 
-    # 🔥 không cho dùng quá số point thật
+    # không cho dùng quá số point thật
     points_used = min(points_used, real_points)
 
-    # 🔥 round chuẩn
+    # round chuẩn
     valid_points = (points_used // 100) * 100
+
+    # ✅ nếu có dùng điểm thì bắt buộc check PIN
+    if valid_points > 0:
+        if not pin_hash:
+            return jsonify({"error": "Aucun PIN défini pour ce client"}), 400
+
+        if not pin:
+            return jsonify({"error": "PIN manquant"}), 400
+
+        if not check_password_hash(pin_hash, pin):
+            return jsonify({"error": "PIN incorrect"}), 401
 
     discount_eur = (valid_points / 100) * 10
 
@@ -318,8 +612,8 @@ def create_checkout_session():
         success_url=success_url,
         cancel_url=cancel_url,
         metadata={
-            "client": json.dumps(client),
-            "items": json.dumps(items),
+            "client": json.dumps(client, ensure_ascii=False),
+            "items": json.dumps(items, ensure_ascii=False),
             "points_used": str(valid_points)
         }
     )
@@ -665,6 +959,7 @@ def stripe_webhook():
         amount_total = session["amount_total"] / 100
         create_order_from_webhook(items, client, amount_total)
 
+
     return "", 200
 # =========================
 # LOGIN ADMIN
@@ -930,9 +1225,24 @@ def init_customers():
         cur.execute("""
         CREATE TABLE IF NOT EXISTS customers (
             id SERIAL PRIMARY KEY,
-            email TEXT UNIQUE,
-            points INTEGER DEFAULT 0
+            email TEXT UNIQUE NOT NULL,
+            phone TEXT,
+            pin_hash TEXT,
+            points INTEGER DEFAULT 0,
+            reset_token TEXT,
+            reset_token_expiry TIMESTAMP,
+            created_at TIMESTAMP DEFAULT NOW()
         );
+        """)
+
+        cur.execute("""
+        ALTER TABLE customers
+        ADD COLUMN IF NOT EXISTS phone TEXT,
+        ADD COLUMN IF NOT EXISTS pin_hash TEXT,
+        ADD COLUMN IF NOT EXISTS points INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS reset_token TEXT,
+        ADD COLUMN IF NOT EXISTS reset_token_expiry TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
         """)
 
 init_customers()
