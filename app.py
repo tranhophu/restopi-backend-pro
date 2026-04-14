@@ -620,7 +620,7 @@ def create_checkout_session():
 
     return jsonify({"id": session.id})
 
-def create_order_from_webhook(items, client, stripe_total):
+def create_order_from_webhook(items, client, stripe_total, points_used=0):
        
     nom = client.get("nom", "").strip()
     prenom = client.get("prenom", "").strip()
@@ -738,7 +738,7 @@ COMMANDE:
     email = client.get("email")
 
     if email:
-        points_used = int(client.get("points_used", 0))
+        points_used = int(points_used or 0)
 
         # 🔥 VERIFY với DB
         with conn.cursor() as cur:
@@ -952,12 +952,10 @@ def stripe_webhook():
         items = json.loads(items_raw)
         client = json.loads(client_raw)
         points_used = int(points_raw or 0)
-        client["points_used"] = points_used
-
         print("💰 PAIEMENT CONFIRMÉ")
 
         amount_total = session["amount_total"] / 100
-        create_order_from_webhook(items, client, amount_total)
+        create_order_from_webhook(items, client, amount_total, points_used)
 
 
     return "", 200
