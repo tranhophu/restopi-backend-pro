@@ -417,6 +417,11 @@ def check_reset_token():
         return jsonify({"error": "Token invalide"}), 400
 
     email, expiry = row
+
+    # 🔥 FIX TIMEZONE BUG
+    if expiry and expiry.tzinfo is None:
+        expiry = paris_tz.localize(expiry)
+
     now = datetime.now(paris_tz)
 
     if not expiry or now > expiry:
@@ -451,6 +456,11 @@ def reset_pin():
             return jsonify({"error": "Token invalide"}), 400
 
         customer_id, expiry = row
+
+        # 🔥 FIX TIMEZONE BUG
+        if expiry and expiry.tzinfo is None:
+            expiry = paris_tz.localize(expiry)
+
         now = datetime.now(paris_tz)
 
         if not expiry or now > expiry:
