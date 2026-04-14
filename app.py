@@ -384,7 +384,7 @@ def request_pin_reset():
                             Réinitialiser mon PIN
                           </a>
                         </p>
-                        <p>Ce lien expire dans 15 minutes.</p>
+                        <p>Ce lien expire dans 30 minutes.</p>
                         <p>Si vous n'êtes pas à l'origine de cette demande, ignorez cet email.</p>
                     """
                 })
@@ -419,9 +419,6 @@ def check_reset_token():
     email, expiry = row
 
     # 🔥 FIX TIMEZONE BUG
-    if expiry and expiry.tzinfo is None:
-        expiry = paris_tz.localize(expiry)
-
     now = datetime.now()
 
     if not expiry or now > expiry:
@@ -458,9 +455,7 @@ def reset_pin():
         customer_id, expiry = row
 
         # 🔥 FIX TIMEZONE BUG
-        if expiry and expiry.tzinfo is None:
-            expiry = paris_tz.localize(expiry)
-
+        
         now = datetime.now()
 
         if not expiry or now > expiry:
