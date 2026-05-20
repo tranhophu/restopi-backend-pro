@@ -100,11 +100,11 @@ def sync_stock():
         rows = sheet.get_all_records()
 
         stock_date = parse_sheet_date(
-            sheet.acell("E2").value
+            sheet.acell("D2").value
         )
 
         order_date = parse_sheet_date(
-            sheet.acell("F2").value
+            sheet.acell("E2").value
         )
 
 
