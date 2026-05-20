@@ -12,6 +12,10 @@ from dotenv import load_dotenv
 from flask import send_from_directory
 from werkzeug.security import generate_password_hash, check_password_hash
 import secrets
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import json
+from sync_stock import sync_stock
 
 paris_tz = pytz.timezone("Europe/Paris")
 
@@ -26,17 +30,61 @@ else:
 
 print("Using DB:", DATABASE_URL)
 
-conn = psycopg2.connect(DATABASE_URL)
-conn.autocommit = True
+def get_conn():
 
+    conn = psycopg2.connect(DATABASE_URL)
+
+    conn.autocommit = True
+
+    return conn
+
+# =========================
+# GOOGLE SHEET STOCK
+# =========================
+
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
+
+# =========================
+# GOOGLE AUTH
+# =========================
+
+if os.environ.get("RAILWAY_ENVIRONMENT"):
+
+    google_json = json.loads(
+        os.environ.get(
+            "GOOGLE_SERVICE_ACCOUNT_JSON"
+        )
+    )
+
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(
+        google_json,
+        scope
+    )
+
+else:
+
+    creds = ServiceAccountCredentials.from_json_keyfile_name(
+        "restopi-stock-sync.json",
+        scope
+    )
+
+gclient = gspread.authorize(creds)
+
+SHEET_ID = "1LUG-_t_H4Ol4QCUZX0lDTdQa3ISWB5m6qUDhXa4LxU0"
+
+spreadsheet = gclient.open_by_key(SHEET_ID)
 def get_customer_by_email(email):
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, email, phone, pin_hash, points, reset_token, reset_token_expiry
-            FROM customers
-            WHERE email = %s
-        """, (email.lower(),))
-        return cur.fetchone()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, email, phone, pin_hash, points, reset_token, reset_token_expiry
+                FROM customers
+                WHERE email = %s
+            """, (email.lower(),))
+            return cur.fetchone()
 
 
 def add_points_to_customer(email, phone, amount_eur):
@@ -47,22 +95,23 @@ def add_points_to_customer(email, phone, amount_eur):
     phone = (phone or "").strip()
     points_to_add = int(amount_eur)
 
-    with conn.cursor() as cur:
-        cur.execute("SELECT id FROM customers WHERE email = %s", (email,))
-        row = cur.fetchone()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM customers WHERE email = %s", (email,))
+            row = cur.fetchone()
 
-        if row:
-            cur.execute("""
-                UPDATE customers
-                SET points = points + %s,
-                    phone = COALESCE(NULLIF(%s, ''), phone)
-                WHERE email = %s
-            """, (points_to_add, phone, email))
-        else:
-            cur.execute("""
-                INSERT INTO customers (email, phone, points)
-                VALUES (%s, %s, %s)
-            """, (email, phone, points_to_add))
+            if row:
+                cur.execute("""
+                    UPDATE customers
+                    SET points = points + %s,
+                        phone = COALESCE(NULLIF(%s, ''), phone)
+                    WHERE email = %s
+                """, (points_to_add, phone, email))
+            else:
+                cur.execute("""
+                    INSERT INTO customers (email, phone, points)
+                    VALUES (%s, %s, %s)
+                """, (email, phone, points_to_add))
 # =========================
 # CONFIG
 # =========================
@@ -86,26 +135,27 @@ CORS(app)
 app.config['JSON_AS_ASCII'] = False
 
 def save_order(order):
-    with conn.cursor() as cur:
-        cur.execute("""
-        INSERT INTO orders (
-            id, date, nom, prenom, tel, adresse,
-            pickup_time, note, items, total, printed
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-          ON CONFLICT (id) DO NOTHING
-        """, (
-            order["id"],
-            order["date"],
-            order["nom"],
-            order["prenom"],
-            order["tel"],
-            order["adresse"],
-            order["pickup_time"],
-            order["note"],
-            json.dumps(order["items"], ensure_ascii=False),
-            order["total"],
-            order["printed"]
-        ))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO orders (
+                id, date, nom, prenom, tel, adresse,
+                pickup_time, note, items, total, printed
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (id) DO NOTHING
+            """, (
+                order["id"],
+                order["date"],
+                order["nom"],
+                order["prenom"],
+                order["tel"],
+                order["adresse"],
+                order["pickup_time"],
+                order["note"],
+                json.dumps(order["items"], ensure_ascii=False),
+                order["total"],
+                order["printed"]
+            ))
 
 # =========================
 # MEMORY (FIX CRASH)
@@ -138,9 +188,10 @@ def check_admin(req):
 # =========================
 
 def load_products():
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM products WHERE active = TRUE")
-        rows = cur.fetchall()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM products WHERE active = TRUE")
+            rows = cur.fetchall()
 
     result = {}
     for row in rows:
@@ -158,9 +209,10 @@ def load_products():
     return result
 @app.route("/products", methods=["GET"])
 def public_products():
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM products WHERE active = TRUE")
-        rows = cur.fetchall()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM products WHERE active = TRUE")
+            rows = cur.fetchall()
 
     result = []
     for row in rows:
@@ -177,59 +229,172 @@ def public_products():
     return jsonify(result)
 
 def init_db():
-    with conn.cursor() as cur:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id BIGINT PRIMARY KEY,
-            date TEXT,
-            nom TEXT,
-            prenom TEXT,
-            tel TEXT,
-            adresse TEXT,
-            pickup_time TEXT,
-            note TEXT,
-            items JSONB,
-            total FLOAT,
-            printed BOOLEAN DEFAULT FALSE
-        );
-        """)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id BIGINT PRIMARY KEY,
+                date TEXT,
+                nom TEXT,
+                prenom TEXT,
+                tel TEXT,
+                adresse TEXT,
+                pickup_time TEXT,
+                note TEXT,
+                items JSONB,
+                total FLOAT,
+                printed BOOLEAN DEFAULT FALSE
+            );
+            """)
 
 init_db()
 
 def init_products():
-    with conn.cursor() as cur:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
 
-        # 1. CREATE TABLE nếu chưa có
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-           id SERIAL PRIMARY KEY,
-           name TEXT,
-           price FLOAT,
-           category TEXT,
-           tva FLOAT,
-           img TEXT,
-           active BOOLEAN DEFAULT TRUE,
-           featured BOOLEAN DEFAULT FALSE
-        );
-        """)
+            # 1. CREATE TABLE nếu chưa có
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+            id SERIAL PRIMARY KEY,
+            name TEXT,
+            price FLOAT,
+            category TEXT,
+            tva FLOAT,
+            img TEXT,
+            active BOOLEAN DEFAULT TRUE,
+            featured BOOLEAN DEFAULT FALSE
+            );
+            """)
 
-        # 2. ADD COLUMN featured nếu chưa có
-        cur.execute("""
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 
-                FROM information_schema.columns 
-                WHERE table_name='products' 
-                AND column_name='featured'
-            ) THEN
-                ALTER TABLE products ADD COLUMN featured BOOLEAN DEFAULT FALSE;
-            END IF;
-        END
-        $$;
-        """)
+            # 2. ADD COLUMN featured nếu chưa có
+            cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 
+                    FROM information_schema.columns 
+                    WHERE table_name='products' 
+                    AND column_name='featured'
+                ) THEN
+                    ALTER TABLE products ADD COLUMN featured BOOLEAN DEFAULT FALSE;
+                END IF;
+            END
+            $$;
+            """)
 
 init_products()
+
+# =========================
+# STOCK DATABASE
+# =========================
+
+def init_stock():
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            # fournisseurs
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_suppliers (
+                id SERIAL PRIMARY KEY,
+                name TEXT UNIQUE
+            );
+            """)
+
+            # produits stock
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_products (
+                id SERIAL PRIMARY KEY,
+
+                name TEXT,
+                supplier TEXT,
+
+                stock_quantity FLOAT DEFAULT 0,
+
+                ordered_quantity FLOAT DEFAULT 0,
+                
+
+                stock_date DATE,
+                order_date DATE,
+          
+
+                unit TEXT,
+
+                average_price FLOAT DEFAULT 0,
+                last_purchase_price FLOAT DEFAULT 0,
+                min_stock FLOAT DEFAULT 0,
+
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+            """)
+
+            # mouvements
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_movements (
+                id SERIAL PRIMARY KEY,
+                product_name TEXT,
+                supplier TEXT,
+                movement_type TEXT,
+                quantity FLOAT,
+                unit TEXT,
+                total_price FLOAT,
+                unit_price FLOAT,
+                note TEXT,
+                purchase_date DATE,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            """)
+
+            cur.execute("""
+            ALTER TABLE stock_movements
+            ADD COLUMN IF NOT EXISTS purchase_date DATE;
+            """)
+            cur.execute("""
+            ALTER TABLE stock_products
+
+            ADD COLUMN IF NOT EXISTS ordered_quantity FLOAT DEFAULT 0,
+
+            ADD COLUMN IF NOT EXISTS stock_date DATE,
+            ADD COLUMN IF NOT EXISTS order_date DATE,
+      
+
+            ADD COLUMN IF NOT EXISTS average_price FLOAT DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS last_purchase_price FLOAT DEFAULT 0;
+            """)
+            # snapshots hebdomadaires
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_snapshots (
+                id SERIAL PRIMARY KEY,
+                snapshot_date DATE,
+                product_name TEXT,
+                supplier TEXT,
+                stock_quantity FLOAT,
+                unit TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            """)
+
+            # prix référence
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_reference_prices (
+
+                id SERIAL PRIMARY KEY,
+
+                product_name TEXT,
+                supplier TEXT,
+
+                reference_year INTEGER,
+
+                reference_price FLOAT,
+
+                note TEXT,
+
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            """)
+
+init_stock()
 
 @app.route("/customer/set-pin", methods=["POST"])
 def customer_set_pin():
@@ -246,22 +411,23 @@ def customer_set_pin():
 
     pin_hash = generate_password_hash(pin)
 
-    with conn.cursor() as cur:
-        cur.execute("SELECT id, pin_hash FROM customers WHERE email = %s", (email,))
-        row = cur.fetchone()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, pin_hash FROM customers WHERE email = %s", (email,))
+            row = cur.fetchone()
 
-        if row:
-            cur.execute("""
-                UPDATE customers
-                SET phone = COALESCE(NULLIF(%s, ''), phone),
-                    pin_hash = %s
-                WHERE email = %s
-            """, (phone, pin_hash, email))
-        else:
-            cur.execute("""
-                INSERT INTO customers (email, phone, pin_hash, points)
-                VALUES (%s, %s, %s, 0)
-            """, (email, phone, pin_hash))
+            if row:
+                cur.execute("""
+                    UPDATE customers
+                    SET phone = COALESCE(NULLIF(%s, ''), phone),
+                        pin_hash = %s
+                    WHERE email = %s
+                """, (phone, pin_hash, email))
+            else:
+                cur.execute("""
+                    INSERT INTO customers (email, phone, pin_hash, points)
+                    VALUES (%s, %s, %s, 0)
+                """, (email, phone, pin_hash))
 
     return jsonify({
         "success": True,
@@ -277,9 +443,10 @@ def customer_verify_pin():
     if not email or not pin:
         return jsonify({"error": "Email ou PIN manquant"}), 400
 
-    with conn.cursor() as cur:
-        cur.execute("SELECT pin_hash, points FROM customers WHERE email = %s", (email,))
-        row = cur.fetchone()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pin_hash, points FROM customers WHERE email = %s", (email,))
+            row = cur.fetchone()
 
     if not row:
         return jsonify({"error": "Client introuvable"}), 404
@@ -310,32 +477,33 @@ def customer_redeem_points():
     if points_to_use <= 0:
         return jsonify({"error": "Nombre de points invalide"}), 400
 
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, pin_hash, points
-            FROM customers
-            WHERE email = %s
-        """, (email,))
-        row = cur.fetchone()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, pin_hash, points
+                FROM customers
+                WHERE email = %s
+            """, (email,))
+            row = cur.fetchone()
 
-        if not row:
-            return jsonify({"error": "Client introuvable"}), 404
+            if not row:
+                return jsonify({"error": "Client introuvable"}), 404
 
-        customer_id, pin_hash, current_points = row
+            customer_id, pin_hash, current_points = row
 
-        if not pin_hash or not check_password_hash(pin_hash, pin):
-            return jsonify({"error": "PIN incorrect"}), 401
+            if not pin_hash or not check_password_hash(pin_hash, pin):
+                return jsonify({"error": "PIN incorrect"}), 401
 
-        if current_points < points_to_use:
-            return jsonify({"error": "Points insuffisants"}), 400
+            if current_points < points_to_use:
+                return jsonify({"error": "Points insuffisants"}), 400
 
-        new_points = current_points - points_to_use
+            new_points = current_points - points_to_use
 
-        cur.execute("""
-            UPDATE customers
-            SET points = %s
-            WHERE id = %s
-        """, (new_points, customer_id))
+            cur.execute("""
+                UPDATE customers
+                SET points = %s
+                WHERE id = %s
+            """, (new_points, customer_id))
 
     discount_eur = points_to_use / 10
 
@@ -356,41 +524,42 @@ def request_pin_reset():
     token = secrets.token_urlsafe(32)
     expiry = datetime.now() + timedelta(minutes=30)
 
-    with conn.cursor() as cur:
-        cur.execute("SELECT id FROM customers WHERE email = %s", (email,))
-        row = cur.fetchone()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM customers WHERE email = %s", (email,))
+            row = cur.fetchone()
 
-        if row:
-            cur.execute("""
-                UPDATE customers
-                SET reset_token = %s,
-                    reset_token_expiry = %s
-                WHERE email = %s
-            """, (token, expiry, email))
+            if row:
+                cur.execute("""
+                    UPDATE customers
+                    SET reset_token = %s,
+                        reset_token_expiry = %s
+                    WHERE email = %s
+                """, (token, expiry, email))
 
-            reset_link = f"https://aupetitvietnam.com/reset-pin.html?token={token}"
+                reset_link = f"https://aupetitvietnam.com/reset-pin.html?token={token}"
 
-            try:
-                resend.api_key = RESEND_API_KEY
-                resend.Emails.send({
-                    "from": "Au P'tit Vietnam <contact@pierregroupe.com>",
-                    "to": [email],
-                    "subject": "Réinitialisation de votre PIN fidélité",
-                    "html": f"""
-                        <p>Bonjour,</p>
-                        <p>Vous avez demandé la réinitialisation de votre PIN fidélité.</p>
-                        <p>
-                          <a href="{reset_link}" style="display:inline-block;padding:10px 18px;background:#00cdbd;color:#fff;text-decoration:none;border-radius:8px;">
-                            Réinitialiser mon PIN
-                          </a>
-                        </p>
-                        <p>Ce lien expire dans 30 minutes.</p>
-                        <p>Si vous n'êtes pas à l'origine de cette demande, ignorez cet email.</p>
-                    """
-                })
-            except Exception as e:
-                print("Erreur email reset PIN:", e)
-                return jsonify({"error": "Impossible d'envoyer l'email"}), 500
+                try:
+                    resend.api_key = RESEND_API_KEY
+                    resend.Emails.send({
+                        "from": "Au P'tit Vietnam <contact@pierregroupe.com>",
+                        "to": [email],
+                        "subject": "Réinitialisation de votre PIN fidélité",
+                        "html": f"""
+                            <p>Bonjour,</p>
+                            <p>Vous avez demandé la réinitialisation de votre PIN fidélité.</p>
+                            <p>
+                            <a href="{reset_link}" style="display:inline-block;padding:10px 18px;background:#00cdbd;color:#fff;text-decoration:none;border-radius:8px;">
+                                Réinitialiser mon PIN
+                            </a>
+                            </p>
+                            <p>Ce lien expire dans 30 minutes.</p>
+                            <p>Si vous n'êtes pas à l'origine de cette demande, ignorez cet email.</p>
+                        """
+                    })
+                except Exception as e:
+                    print("Erreur email reset PIN:", e)
+                    return jsonify({"error": "Impossible d'envoyer l'email"}), 500
 
     return jsonify({
         "success": True,
@@ -405,13 +574,14 @@ def check_reset_token():
     if not token:
         return jsonify({"error": "Token manquant"}), 400
 
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT email, reset_token_expiry
-            FROM customers
-            WHERE reset_token = %s
-        """, (token,))
-        row = cur.fetchone()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT email, reset_token_expiry
+                FROM customers
+                WHERE reset_token = %s
+            """, (token,))
+            row = cur.fetchone()
 
     if not row:
         return jsonify({"error": "Token invalide"}), 400
@@ -441,35 +611,36 @@ def reset_pin():
     if not new_pin or len(new_pin) != 4 or not new_pin.isdigit():
         return jsonify({"error": "Le PIN doit contenir exactement 4 chiffres"}), 400
 
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, reset_token_expiry
-            FROM customers
-            WHERE reset_token = %s
-        """, (token,))
-        row = cur.fetchone()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, reset_token_expiry
+                FROM customers
+                WHERE reset_token = %s
+            """, (token,))
+            row = cur.fetchone()
 
-        if not row:
-            return jsonify({"error": "Token invalide"}), 400
+            if not row:
+                return jsonify({"error": "Token invalide"}), 400
 
-        customer_id, expiry = row
+            customer_id, expiry = row
 
-        # 🔥 FIX TIMEZONE BUG
-        
-        now = datetime.now()
+            # 🔥 FIX TIMEZONE BUG
+            
+            now = datetime.now()
 
-        if not expiry or now > expiry:
-            return jsonify({"error": "Token expiré"}), 400
+            if not expiry or now > expiry:
+                return jsonify({"error": "Token expiré"}), 400
 
-        new_pin_hash = generate_password_hash(new_pin)
+            new_pin_hash = generate_password_hash(new_pin)
 
-        cur.execute("""
-            UPDATE customers
-            SET pin_hash = %s,
-                reset_token = NULL,
-                reset_token_expiry = NULL
-            WHERE id = %s
-        """, (new_pin_hash, customer_id))
+            cur.execute("""
+                UPDATE customers
+                SET pin_hash = %s,
+                    reset_token = NULL,
+                    reset_token_expiry = NULL
+                WHERE id = %s
+            """, (new_pin_hash, customer_id))
 
     return jsonify({
         "success": True,
@@ -519,11 +690,13 @@ def create_checkout_session():
     pin_hash = None
 
     if email:
-        with conn.cursor() as cur:
-            cur.execute("SELECT pin_hash, points FROM customers WHERE email = %s", (email,))
-            row = cur.fetchone()
-            if row:
-                pin_hash, real_points = row
+        with get_conn() as conn:
+   
+            with conn.cursor() as cur:
+                cur.execute("SELECT pin_hash, points FROM customers WHERE email = %s", (email,))
+                row = cur.fetchone()
+                if row:
+                    pin_hash, real_points = row
 
     # không cho dùng quá số point thật
     points_used = min(points_used, real_points)
@@ -746,11 +919,13 @@ COMMANDE:
         points_used = int(points_used or 0)
 
         # 🔥 VERIFY với DB
-        with conn.cursor() as cur:
-            cur.execute("SELECT points FROM customers WHERE email = %s", (email,))
-            row = cur.fetchone()
+        with get_conn() as conn:
+   
+            with conn.cursor() as cur:
+                cur.execute("SELECT points FROM customers WHERE email = %s", (email,))
+                row = cur.fetchone()
 
-            real_points = row[0] if row else 0
+                real_points = row[0] if row else 0
 
         # không cho dùng quá số point thật
         if points_used > real_points:
@@ -770,64 +945,69 @@ COMMANDE:
         original_total = total + (points_used / 100 * 10)
 
         points_earned = int(original_total)
-        with conn.cursor() as cur:
-            # check customer tồn tại chưa
-            cur.execute("SELECT points FROM customers WHERE email = %s", (email,))
-            row = cur.fetchone()
+        with get_conn() as conn:
+    
+            with conn.cursor() as cur:
+                # check customer tồn tại chưa
+                cur.execute("SELECT points FROM customers WHERE email = %s", (email,))
+                row = cur.fetchone()
 
-            if row:
-                new_points = row[0] + points_earned - points_used
-                if new_points < 0:
-                    new_points = 0
-                cur.execute("UPDATE customers SET points = %s WHERE email = %s",
-                            (new_points, email))
-            else:
-                cur.execute("INSERT INTO customers (email, points) VALUES (%s, %s)",
-                            (email, points_earned))
+                if row:
+                    new_points = row[0] + points_earned - points_used
+                    if new_points < 0:
+                        new_points = 0
+                    cur.execute("UPDATE customers SET points = %s WHERE email = %s",
+                                (new_points, email))
+                else:
+                    cur.execute("INSERT INTO customers (email, points) VALUES (%s, %s)",
+                                (email, points_earned))
 
         print(f"🎁 Points ajoutés: {points_earned}")
 
 @app.route("/next-order", methods=["GET"])
 def next_order():
-    with conn.cursor() as cur:
-        cur.execute("""
-        SELECT * FROM orders
-        WHERE printed = FALSE
-        ORDER BY id ASC
-        LIMIT 1
-        """)
-        row = cur.fetchone()
+    with get_conn() as conn:
+   
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT * FROM orders
+            WHERE printed = FALSE
+            ORDER BY id ASC
+            LIMIT 1
+            """)
+            row = cur.fetchone()
 
-        if not row:
-            return jsonify({"message": "no order"})
+            if not row:
+                return jsonify({"message": "no order"})
 
-        items = row[8]
-        if isinstance(items, str):
-            items = json.loads(items)
+            items = row[8]
+            if isinstance(items, str):
+                items = json.loads(items)
 
-        return jsonify({
-            "id": row[0],
-            "date": row[1],
-            "nom": row[2],
-            "prenom": row[3],
-            "tel": row[4],
-            "adresse": row[5],
-            "pickup_time": row[6],
-            "note": row[7],
-            "items": items,
-            "total": row[9],
-            "printed": row[10]
-        })
+            return jsonify({
+                "id": row[0],
+                "date": row[1],
+                "nom": row[2],
+                "prenom": row[3],
+                "tel": row[4],
+                "adresse": row[5],
+                "pickup_time": row[6],
+                "note": row[7],
+                "items": items,
+                "total": row[9],
+                "printed": row[10]
+            })
 
 @app.route("/last-order", methods=["GET"])
 def last_order():
-    with conn.cursor() as cur:
-        cur.execute("""
-        SELECT * FROM orders
-        ORDER BY id DESC
-        LIMIT 1
-        """)
-        row = cur.fetchone()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT * FROM orders
+            ORDER BY id DESC
+            LIMIT 1
+            """)
+            row = cur.fetchone()
 
     if not row:
         return jsonify({"message": "no order"})
@@ -852,13 +1032,14 @@ def last_order():
 
 @app.route("/orders-history", methods=["GET"])
 def orders_history():
-    with conn.cursor() as cur:
-        cur.execute("""
-        SELECT * FROM orders
-        ORDER BY id DESC
-        LIMIT 20
-        """)
-        rows = cur.fetchall()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT * FROM orders
+            ORDER BY id DESC
+            LIMIT 20
+            """)
+            rows = cur.fetchall()
 
     result = []
     for row in rows:
@@ -887,10 +1068,11 @@ def mark_printed():
     data = request.json
     order_id = data.get("id")
 
-    with conn.cursor() as cur:
-        cur.execute("""
-        UPDATE orders SET printed = TRUE WHERE id = %s
-        """, (order_id,))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            UPDATE orders SET printed = TRUE WHERE id = %s
+            """, (order_id,))
 
     return jsonify({"status": "ok"})
 
@@ -990,9 +1172,10 @@ def get_products():
     if not check_admin(request):
         return jsonify({"error": "unauthorized"}), 403
 
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM products")
-        rows = cur.fetchall()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM products")
+            rows = cur.fetchall()
 
     result = []
     for row in rows:
@@ -1013,12 +1196,13 @@ def get_orders():
     if not check_admin(request):
         return jsonify({"error": "unauthorized"}), 403
 
-    with conn.cursor() as cur:
-        cur.execute("""
-        SELECT * FROM orders
-        ORDER BY id DESC
-        """)
-        rows = cur.fetchall()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT * FROM orders
+            ORDER BY id DESC
+            """)
+            rows = cur.fetchall()
 
     result = []
     for row in rows:
@@ -1049,9 +1233,10 @@ def get_stats():
 
     today = datetime.now(paris_tz).strftime("%d/%m/%Y")
 
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM orders")
-        rows = cur.fetchall()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM orders")
+            rows = cur.fetchall()
 
     total_today = 0
     orders_today = 0
@@ -1089,47 +1274,48 @@ def update_product():
     data = request.json
     product_id = str(data.get("id"))
 
-    with conn.cursor() as cur:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
 
-        # 🔥 lấy category cũ
-        cur.execute("SELECT category FROM products WHERE id = %s", (product_id,))
-        old = cur.fetchone()
-        category = data.get("category", old[0] if old else None)
+            # 🔥 lấy category cũ
+            cur.execute("SELECT category FROM products WHERE id = %s", (product_id,))
+            old = cur.fetchone()
+            category = data.get("category", old[0] if old else None)
 
-        # 🔥 lấy img cũ
-        cur.execute("SELECT img FROM products WHERE id = %s", (product_id,))
-        old_img = cur.fetchone()
+            # 🔥 lấy img cũ
+            cur.execute("SELECT img FROM products WHERE id = %s", (product_id,))
+            old_img = cur.fetchone()
 
-        img = data.get("img")
+            img = data.get("img")
 
-        # 🔥 nếu frontend gửi rỗng → giữ ảnh cũ
-        if not img and old_img:
-            img = old_img[0]
+            # 🔥 nếu frontend gửi rỗng → giữ ảnh cũ
+            if not img and old_img:
+                img = old_img[0]
 
-        # 🔥 lấy tva cũ
-        cur.execute("SELECT tva FROM products WHERE id = %s", (product_id,))
-        old_tva = cur.fetchone()
+            # 🔥 lấy tva cũ
+            cur.execute("SELECT tva FROM products WHERE id = %s", (product_id,))
+            old_tva = cur.fetchone()
 
-        tva = data.get("tva")
+            tva = data.get("tva")
 
-        # 🔥 FIX QUAN TRỌNG
-        if tva == "" or tva is None:
-            tva = old_tva[0] if old_tva else 10
+            # 🔥 FIX QUAN TRỌNG
+            if tva == "" or tva is None:
+                tva = old_tva[0] if old_tva else 10
 
-        # 🔥 UPDATE
-        cur.execute("""
-        UPDATE products
-        SET name = %s, price = %s, category = %s, tva = %s, img = %s, featured = %s
-        WHERE id = %s
-        """, (
-            data.get("name"),
-            float(data.get("price")),
-            category,
-            float(tva),   # ✅ FIX CHÍNH
-            img,
-            data.get("featured", False),
-            product_id
-        ))
+            # 🔥 UPDATE
+            cur.execute("""
+            UPDATE products
+            SET name = %s, price = %s, category = %s, tva = %s, img = %s, featured = %s
+            WHERE id = %s
+            """, (
+                data.get("name"),
+                float(data.get("price")),
+                category,
+                float(tva),   # ✅ FIX CHÍNH
+                img,
+                data.get("featured", False),
+                product_id
+            ))
 
     return jsonify({"status": "ok"})
 
@@ -1140,19 +1326,20 @@ def create_product():
 
     data = request.json
 
-    with conn.cursor() as cur:
-        cur.execute("""
-        INSERT INTO products (name, price, category, tva, img, active, featured)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (
-            data.get("name"),
-            float(data.get("price")),
-            data.get("category"),
-            float(data.get("tva") or 10),
-            data.get("img"),
-            True,
-            data.get("featured", False)
-        ))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO products (name, price, category, tva, img, active, featured)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (
+                data.get("name"),
+                float(data.get("price")),
+                data.get("category"),
+                float(data.get("tva") or 10),
+                data.get("img"),
+                True,
+                data.get("featured", False)
+            ))
 
     return jsonify({"status": "created"})
 
@@ -1165,8 +1352,9 @@ def delete_product():
     product_id = str(data.get("id"))
 
     try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM products WHERE id = %s", (product_id,))
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM products WHERE id = %s", (product_id,))
 
         return jsonify({"success": True})
 
@@ -1195,9 +1383,10 @@ def get_image(filename):
 @app.route("/top-products", methods=["GET"])
 def top_products():
 
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM orders")
-        rows = cur.fetchall()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM orders")
+            rows = cur.fetchall()
 
     product_count = {}
 
@@ -1224,29 +1413,30 @@ def top_products():
     return jsonify(top_ids)
 
 def init_customers():
-    with conn.cursor() as cur:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS customers (
-            id SERIAL PRIMARY KEY,
-            email TEXT UNIQUE NOT NULL,
-            phone TEXT,
-            pin_hash TEXT,
-            points INTEGER DEFAULT 0,
-            reset_token TEXT,
-            reset_token_expiry TIMESTAMP,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-        """)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS customers (
+                id SERIAL PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                phone TEXT,
+                pin_hash TEXT,
+                points INTEGER DEFAULT 0,
+                reset_token TEXT,
+                reset_token_expiry TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            """)
 
-        cur.execute("""
-        ALTER TABLE customers
-        ADD COLUMN IF NOT EXISTS phone TEXT,
-        ADD COLUMN IF NOT EXISTS pin_hash TEXT,
-        ADD COLUMN IF NOT EXISTS points INTEGER DEFAULT 0,
-        ADD COLUMN IF NOT EXISTS reset_token TEXT,
-        ADD COLUMN IF NOT EXISTS reset_token_expiry TIMESTAMP,
-        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
-        """)
+            cur.execute("""
+            ALTER TABLE customers
+            ADD COLUMN IF NOT EXISTS phone TEXT,
+            ADD COLUMN IF NOT EXISTS pin_hash TEXT,
+            ADD COLUMN IF NOT EXISTS points INTEGER DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS reset_token TEXT,
+            ADD COLUMN IF NOT EXISTS reset_token_expiry TIMESTAMP,
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+            """)
 
 init_customers()
 
@@ -1255,9 +1445,10 @@ def get_points():
     data = request.json
     email = data.get("email")
 
-    with conn.cursor() as cur:
-        cur.execute("SELECT points FROM customers WHERE email = %s", (email,))
-        row = cur.fetchone()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT points FROM customers WHERE email = %s", (email,))
+            row = cur.fetchone()
 
     return jsonify({
         "points": row[0] if row else 0
@@ -1267,14 +1458,15 @@ def get_points():
 def pending_orders():
     limit = request.args.get("limit", 20, type=int)
 
-    with conn.cursor() as cur:
-        cur.execute("""
-        SELECT * FROM orders
-        WHERE printed = FALSE
-        ORDER BY id ASC
-        LIMIT %s
-        """, (limit,))
-        rows = cur.fetchall()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT * FROM orders
+            WHERE printed = FALSE
+            ORDER BY id ASC
+            LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
 
     result = []
     for row in rows:
@@ -1295,6 +1487,541 @@ def pending_orders():
             "total": row[9],
             "printed": row[10]
         })
+
+    return jsonify(result)
+
+# =========================
+# STOCK API
+# =========================
+
+@app.route("/admin/stock/products", methods=["GET"])
+def stock_products():
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+            SELECT id,
+                name,
+                supplier,
+
+                stock_quantity,
+
+                ordered_quantity,
+              
+
+                stock_date,
+                order_date,
+             
+
+                unit,
+
+                average_price,
+                last_purchase_price,
+
+                min_stock
+            FROM stock_products
+            ORDER BY name ASC
+            """)
+
+            rows = cur.fetchall()
+
+    result = []
+
+    for r in rows:
+        result.append({
+
+            "id": r[0],
+            "name": r[1],
+            "supplier": r[2],
+
+            "stock_quantity": r[3],
+
+            "ordered_quantity": r[4],
+
+            "stock_date": str(r[5]) if r[5] else "",
+            "order_date": str(r[6]) if r[6] else "",
+
+            "unit": r[7],
+
+            "average_price": r[8],
+            "last_purchase_price": r[9],
+
+            "min_stock": r[10]
+
+        })
+
+    return jsonify(result)
+
+
+@app.route("/admin/stock/create", methods=["POST"])
+def create_stock_product():
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json
+
+    sheet = spreadsheet.worksheet(
+        data.get("supplier")
+    )
+
+    sheet.append_row([
+
+        data.get("name"),
+        data.get("unit"),
+        data.get("unit_price"),
+        data.get("min_stock"),
+        data.get("stock_quantity"),
+        "",
+        ""
+
+    ])
+    sync_stock()
+
+    return jsonify({"success": True})
+
+
+@app.route("/admin/stock/update", methods=["POST"])
+def update_stock_product():
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+            UPDATE stock_products
+            SET name=%s,
+                supplier=%s,
+                unit=%s,
+                min_stock=%s,
+                updated_at=NOW()
+            WHERE id=%s
+            """, (
+                data.get("name"),
+                data.get("supplier"),
+                data.get("unit"),
+                float(data.get("min_stock")),
+                int(data.get("id"))
+            ))
+
+    return jsonify({"success": True})
+
+
+@app.route("/admin/stock/delete", methods=["POST"])
+def delete_stock_product():
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json
+
+    product_id = int(data.get("id"))
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            # lấy produit
+            cur.execute("""
+            SELECT name,
+                supplier,
+                stock_quantity,
+                unit,
+                average_price
+            FROM stock_products
+            WHERE id=%s
+            """, (product_id,))
+
+            row = cur.fetchone()
+
+            if not row:
+                return jsonify({"error":"not found"}), 404
+
+            name = row[0]
+            supplier = row[1]
+            sheet = spreadsheet.worksheet(supplier)
+
+            all_rows = sheet.get_all_values()
+
+            for idx, r in enumerate(all_rows):
+
+                if len(r) == 0:
+                    continue
+
+                if r[0].strip() == name:
+
+                    sheet.delete_rows(idx + 1)
+                    sync_stock()
+
+                    break
+            qty = float(row[2])
+            unit = row[3]
+            unit_price = float(row[4])
+
+            # historique annulation
+            cur.execute("""
+            INSERT INTO stock_movements
+            (
+                product_name,
+                supplier,
+                movement_type,
+                quantity,
+                unit,
+                total_price,
+                unit_price,
+                note
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                name,
+                supplier,
+                "ANNULATION",
+                -qty,
+                unit,
+                -(qty * unit_price),
+                unit_price,
+                "Suppression produit"
+            ))
+
+            # delete produit
+            cur.execute("""
+            DELETE FROM stock_products
+            WHERE id=%s
+            """, (product_id,))
+
+    return jsonify({"success": True})
+
+
+@app.route("/admin/stock/history", methods=["GET"])
+def stock_history():
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    search = request.args.get("search", "").lower()
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+            SELECT product_name,
+                supplier,
+                movement_type,
+                quantity,
+                unit,
+                total_price,
+                unit_price,
+                note,
+                purchase_date,
+                created_at
+            FROM stock_movements
+            ORDER BY created_at DESC
+            """)
+
+            rows = cur.fetchall()
+
+    result = []
+
+    for r in rows:
+
+        row_text = f"""
+        {r[0]} {r[1]} {r[2]}
+        {r[3]} {r[5]} {r[8]}
+        """.lower()
+
+        if search and search not in row_text:
+            continue
+
+        result.append({
+            "product_name": r[0],
+            "supplier": r[1],
+            "movement_type": r[2],
+            "quantity": r[3],
+            "unit": r[4],
+            "total_price": r[5],
+            "unit_price": r[6],
+            "note": r[7],
+            "purchase_date": str(r[8]),
+            "created_at": str(r[9])
+        })
+
+    return jsonify(result)
+
+@app.route("/admin/stock/dashboard")
+def stock_dashboard():
+
+    if not check_admin(request):
+        return jsonify({"error":"unauthorized"}), 403
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            # total produits
+            cur.execute("""
+            SELECT COUNT(*)
+            FROM stock_products
+            """)
+
+            total_products = cur.fetchone()[0]
+
+            # stock faible
+            cur.execute("""
+            SELECT COUNT(*)
+            FROM stock_products
+            WHERE stock_quantity <= min_stock
+            """)
+
+            low_stock = cur.fetchone()[0]
+
+            # valeur stock
+            cur.execute("""
+            SELECT COALESCE(
+                SUM(stock_quantity * average_price),
+                0
+            )
+            FROM stock_products
+            """)
+
+            stock_value = cur.fetchone()[0]
+
+            # fournisseurs
+            cur.execute("""
+            SELECT COUNT(DISTINCT supplier)
+            FROM stock_products
+            """)
+
+            suppliers = cur.fetchone()[0]
+
+    return jsonify({
+
+        "total_products": total_products,
+        "low_stock": low_stock,
+        "stock_value": float(stock_value),
+        "suppliers": suppliers
+
+    })
+
+@app.route("/admin/stock/reference-prices")
+def get_reference_prices():
+
+    if not check_admin(request):
+        return jsonify({
+            "error":"unauthorized"
+        }), 403
+
+    year = int(
+        request.args.get("year", 2025)
+    )
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+            SELECT
+                product_name,
+                supplier,
+                reference_price
+            FROM stock_reference_prices
+            WHERE reference_year=%s
+            """, (year,))
+
+            rows = cur.fetchall()
+
+    result = {}
+
+    for r in rows:
+
+        key = f"{r[0]}__{r[1]}"
+
+        result[key] = r[2]
+
+    return jsonify(result)
+
+@app.route(
+    "/admin/stock/save-reference",
+    methods=["POST"]
+)
+def save_reference_price():
+
+    if not check_admin(request):
+        return jsonify({
+            "error":"unauthorized"
+        }), 403
+
+    data = request.json
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+            DELETE FROM stock_reference_prices
+            WHERE product_name=%s
+            AND supplier=%s
+            AND reference_year=%s
+            """, (
+                data["product_name"],
+                data["supplier"],
+                int(data["year"])
+            ))
+
+            cur.execute("""
+            INSERT INTO stock_reference_prices
+            (
+                product_name,
+                supplier,
+                reference_year,
+                reference_price
+            )
+            VALUES (%s,%s,%s,%s)
+            """, (
+                data["product_name"],
+                data["supplier"],
+                int(data["year"]),
+                float(data["price"])
+            ))
+
+    return jsonify({
+        "success":True
+    })
+
+@app.route("/admin/stock/add-deliveries", methods=["POST"])
+def add_deliveries():
+
+    if not check_admin(request):
+        return jsonify({"error":"unauthorized"}), 403
+
+    data = request.json
+
+    deliveries = data.get("deliveries", [])
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            for d in deliveries:
+
+                product_name = d.get("product_name")
+                supplier = d.get("supplier")
+
+                quantity = float(
+                    d.get("quantity") or 0
+                )
+
+                unit_price = float(
+                    d.get("unit_price") or 0
+                )
+
+                purchase_date = d.get(
+                    "purchase_date"
+                )
+
+                cur.execute("""
+                SELECT stock_quantity,
+                       average_price,
+                       unit
+                FROM stock_products
+                WHERE name=%s
+                AND supplier=%s
+                """, (
+                    product_name,
+                    supplier
+                ))
+
+                row = cur.fetchone()
+
+                if not row:
+                    continue
+
+                old_stock = float(row[0] or 0)
+                old_avg = float(row[1] or 0)
+                last_price = old_avg
+
+                price_variation = 0
+
+                if last_price > 0:
+                    price_variation = (
+                        (
+                            unit_price - last_price
+                        ) / last_price
+                    ) * 100
+                unit = row[2]
+
+                new_stock = (
+                    old_stock + quantity
+                )
+
+                if new_stock <= 0:
+                    new_avg = unit_price
+                else:
+                    new_avg = (
+                        (
+                            old_stock * old_avg
+                        )
+                        +
+                        (
+                            quantity * unit_price
+                        )
+                    ) / new_stock
+
+                cur.execute("""
+                UPDATE stock_products
+                SET stock_quantity=%s,
+                    average_price=%s,
+                    last_purchase_price=%s,
+                    updated_at=NOW()
+                WHERE name=%s
+                AND supplier=%s
+                """, (
+                    new_stock,
+                    new_avg,
+                    unit_price,
+                    product_name,
+                    supplier
+                ))
+
+                cur.execute("""
+                INSERT INTO stock_movements
+                (
+                    product_name,
+                    supplier,
+                    movement_type,
+                    quantity,
+                    unit,
+                    total_price,
+                    unit_price,
+                    purchase_date,
+                    note
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (
+                    product_name,
+                    supplier,
+                    "LIVRAISON",
+                    quantity,
+                    unit,
+                    quantity * unit_price,
+                    unit_price,
+                    purchase_date,
+                    f"Variation prix: {round(price_variation, 2)}%"
+                ))
+
+    return jsonify({"success":True})
+
+@app.route("/admin/stock/refresh", methods=["POST"])
+def refresh_stock():
+
+    if not check_admin(request):
+        return jsonify({
+            "error":"unauthorized"
+        }), 403
+
+    result = sync_stock()
 
     return jsonify(result)
 # =========================
