@@ -25,7 +25,7 @@ if os.environ.get("RAILWAY_ENVIRONMENT"):
     # chạy trên Railway → dùng internal
     DATABASE_URL = os.environ.get("DATABASE_URL")
 else:
-    # chạy local → dùng public
+    # chạy local → dùng public   ggggg
     DATABASE_URL = os.environ.get("DATABASE_PUBLIC_URL")
 
 print("Using DB:", DATABASE_URL)
