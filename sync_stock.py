@@ -92,7 +92,9 @@ def sync_stock():
     synced = 0
 
     for sheet in worksheets:
-
+        # bỏ qua sheet Infos
+        if sheet.title.strip().lower() == "infos":
+            continue
         supplier = sheet.title
 
         rows = sheet.get_all_records()
