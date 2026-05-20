@@ -6,3 +6,5 @@ gunicorn
 resend
 pytz
 psycopg2-binary
+gspread
+oauth2client
