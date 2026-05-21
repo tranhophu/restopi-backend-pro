@@ -86,11 +86,36 @@ def sync_stock():
 
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = True
+    
+    with conn.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS stock_snapshots (
+            id SERIAL PRIMARY KEY,
+            snapshot_date DATE,
+            product_name TEXT,
+            supplier TEXT,
+            stock_quantity FLOAT,
+            unit TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        """)
+        
+        
+        
+        cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_snapshots_unique
+        ON stock_snapshots (
+            snapshot_date,
+            LOWER(product_name),
+            LOWER(supplier)
+        );
+        """)
 
     worksheets = spreadsheet.worksheets()
 
     synced = 0
     sheet_products = set()
+
 
     for sheet in worksheets:
 
@@ -131,9 +156,8 @@ def sync_stock():
                 0
             ) or 0
 
-            stock_reel = extract_number(
-                row.get("Stock Réel", 0)
-            )
+            stock_reel = extract_number(row.get("Stock Réel", 0))
+            
 
             ordered_quantity = extract_number(
                 row.get("Commander", 0)
@@ -142,7 +166,7 @@ def sync_stock():
             with conn.cursor() as cur:
 
                 cur.execute("""
-                SELECT id, stock_quantity
+                SELECT id, stock_quantity, stock_date
                 FROM stock_products
                 WHERE LOWER(name)=%s
                 AND LOWER(supplier)=%s
@@ -157,59 +181,123 @@ def sync_stock():
 
                     product_id = existing[0]
                     old_stock = float(existing[1] or 0)
+                    old_stock_date = existing[2]
+
                     new_stock = float(stock_reel or 0)
-                    delta = new_stock - old_stock
 
-                    cur.execute("""
-                    UPDATE stock_products
-                    SET stock_quantity=%s,
-                        ordered_quantity=%s,
-                        stock_date=%s,
-                        order_date=%s,
-                        unit=%s,
-                        min_stock=%s,
-                        updated_at=NOW()
-                    WHERE id=%s
-                    """, (
-                        stock_reel,
-                        ordered_quantity,
-                        stock_date,
-                        order_date,
-                        unit,
-                        min_stock,
-                        product_id
-                    ))
+                    # Chỉ update stock_quantity nếu Google Sheet có ngày kiểm kho mới hơn
+                    should_update_stock = False
 
-                    if delta != 0:
+                    if stock_date and not old_stock_date:
+                        should_update_stock = True
 
-                        movement_type = (
-                            "CONSUMPTION"
-                            if delta < 0
-                            else "INVENTORY_ADJUSTMENT"
-                        )
+                    elif stock_date and old_stock_date and stock_date > old_stock_date:
+                        should_update_stock = True
+
+                    if should_update_stock:
+                        # =========================
+                        # SAVE SNAPSHOT
+                        # =========================
 
                         cur.execute("""
-                        INSERT INTO stock_movements
+                        INSERT INTO stock_snapshots
                         (
+                            snapshot_date,
                             product_name,
                             supplier,
-                            movement_type,
-                            quantity,
-                            total_price,
-                            purchase_date,
-                            unit,
-                            note
+                            stock_quantity,
+                            unit
                         )
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                        VALUES (%s,%s,%s,%s,%s)
+                        ON CONFLICT (
+                            snapshot_date,
+                            LOWER(product_name),
+                            LOWER(supplier)
+                        )
+                        DO UPDATE SET
+                            stock_quantity = EXCLUDED.stock_quantity,
+                            unit = EXCLUDED.unit,
+                            created_at = NOW()
                         """, (
+                            stock_date,
                             product_name,
                             supplier,
-                            movement_type,
-                            delta,
-                            0,
-                            stock_date or today,
+                            new_stock,
+                            unit
+                        ))
+                        delta = new_stock - old_stock
+
+                        cur.execute("""
+                        UPDATE stock_products
+                        SET stock_quantity=%s,
+                            ordered_quantity=%s,
+                            stock_date=%s,
+                            order_date=%s,
+                            unit=%s,
+                            min_stock=%s,
+                            updated_at=NOW()
+                        WHERE id=%s
+                        """, (
+                            stock_reel,
+                            ordered_quantity,
+                            stock_date,
+                            order_date,
                             unit,
-                            "Sync Google Sheet"
+                            min_stock,
+                            product_id
+                        ))
+
+                        if delta != 0:
+
+                            movement_type = (
+                                "CONSUMPTION"
+                                if delta < 0
+                                else "INVENTORY_ADJUSTMENT"
+                            )
+
+                            cur.execute("""
+                            INSERT INTO stock_movements
+                            (
+                                product_name,
+                                supplier,
+                                movement_type,
+                                quantity,
+                                total_price,
+                                purchase_date,
+                                unit,
+                                note
+                            )
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                            """, (
+                                product_name,
+                                supplier,
+                                movement_type,
+                                delta,
+                                0,
+                                stock_date or today,
+                                unit,
+                                "Nouveau contrôle stock Google Sheet"
+                            ))
+
+                    else:
+
+                        # Même ancienne date de contrôle:
+                        # on met à jour seulement commander / unité / min,
+                        # mais PAS stock_quantity
+                        cur.execute("""
+                        UPDATE stock_products
+                        SET ordered_quantity=%s,
+                            order_date=%s,
+                            unit=%s,
+                            min_stock=%s,
+                            updated_at=NOW()
+                        WHERE id=%s
+                        """, (
+                            ordered_quantity,
+                            order_date,
+                            unit,
+                            min_stock,
+                            product_id
                         ))
 
                 else:
@@ -238,8 +326,39 @@ def sync_stock():
                         min_stock
                     ))
 
-                synced += 1
+                    if stock_date:
 
+                        cur.execute("""
+                        INSERT INTO stock_snapshots
+                        (
+                            snapshot_date,
+                            product_name,
+                            supplier,
+                            stock_quantity,
+                            unit
+                        )
+                        VALUES (%s,%s,%s,%s,%s)
+                        ON CONFLICT (
+                            snapshot_date,
+                            LOWER(product_name),
+                            LOWER(supplier)
+                        )
+                        DO UPDATE SET
+                            stock_quantity = EXCLUDED.stock_quantity,
+                            unit = EXCLUDED.unit,
+                            created_at = NOW()
+                        """, (
+                            stock_date,
+                            product_name,
+                            supplier,
+                            stock_reel,
+                            unit
+                        ))
+
+                synced += 1
+    
+
+   
     # =========================
     # DELETE PRODUITS ABSENTS GOOGLE SHEET
     # =========================

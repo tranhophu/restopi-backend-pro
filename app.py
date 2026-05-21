@@ -328,7 +328,21 @@ def init_stock():
                 updated_at TIMESTAMP DEFAULT NOW()
             );
             """)
-
+            
+            cur.execute("""
+            DELETE FROM stock_products a
+            USING stock_products b
+            WHERE a.id < b.id
+            AND LOWER(a.name) = LOWER(b.name)
+            AND LOWER(a.supplier) = LOWER(b.supplier);
+            """)
+            cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_products_unique
+            ON stock_products (
+                LOWER(name),
+                LOWER(supplier)
+            );
+            """)
             # mouvements
             cur.execute("""
             CREATE TABLE IF NOT EXISTS stock_movements (
@@ -372,6 +386,23 @@ def init_stock():
                 stock_quantity FLOAT,
                 unit TEXT,
                 created_at TIMESTAMP DEFAULT NOW()
+            );
+            """)
+            
+            cur.execute("""
+            DELETE FROM stock_snapshots a
+            USING stock_snapshots b
+            WHERE a.id < b.id
+            AND a.snapshot_date = b.snapshot_date
+            AND LOWER(a.product_name) = LOWER(b.product_name)
+            AND LOWER(a.supplier) = LOWER(b.supplier);
+            """)
+            cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_snapshots_unique
+            ON stock_snapshots (
+                snapshot_date,
+                LOWER(product_name),
+                LOWER(supplier)
             );
             """)
 
