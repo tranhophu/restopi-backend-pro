@@ -1798,13 +1798,46 @@ def stock_dashboard():
             """)
 
             suppliers = cur.fetchone()[0]
+            # =========================
+            # PRODUITS DORMANTS
+            # =========================
+
+            cur.execute("""
+            SELECT COUNT(*)
+            FROM stock_products sp
+
+            WHERE NOT EXISTS (
+
+                SELECT 1
+                FROM stock_movements sm
+
+                WHERE sm.product_name = sp.name
+                AND sm.supplier = sp.supplier
+
+                AND sm.created_at >=
+                    NOW() - INTERVAL '30 days'
+
+                AND sm.movement_type IN (
+                    'CONSUMPTION',
+                    'LIVRAISON'
+                )
+            )
+            """)
+
+            dormant_products =cur.fetchone()[0]
 
     return jsonify({
 
         "total_products": total_products,
+
         "low_stock": low_stock,
+
         "stock_value": float(stock_value),
-        "suppliers": suppliers
+
+        "suppliers": suppliers,
+
+        "dormant_products":
+            dormant_products
 
     })
 

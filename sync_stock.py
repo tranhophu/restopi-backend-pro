@@ -151,6 +151,31 @@ def sync_stock():
 
                 if existing:
 
+                    product_id = existing[0]
+
+                    # =========================
+                    # LAY STOCK CU
+                    # =========================
+
+                    cur.execute("""
+                    SELECT
+                        stock_quantity
+                    FROM stock_products
+                    WHERE id=%s
+                    """, (product_id,))
+
+                    old_product = cur.fetchone()
+
+                    old_stock =float(old_product[0] or 0)
+
+                    new_stock =float(stock_reel or 0)
+
+                    delta =new_stock - old_stock
+
+                    # =========================
+                    # UPDATE PRODUIT
+                    # =========================
+
                     cur.execute("""
                     UPDATE stock_products
                     SET stock_quantity=%s,
@@ -173,13 +198,59 @@ def sync_stock():
 
                         stock_date,
                         order_date,
-            
 
                         unit,
                         min_stock,
 
-                        existing[0]
+                        product_id
                     ))
+
+                    # =========================
+                    # HISTORIQUE AUTO
+                    # =========================
+
+                    if delta != 0:
+
+                        if delta < 0:
+
+                            movement_type ="CONSUMPTION"
+
+                        else:
+
+                            movement_type ="INVENTORY_ADJUSTMENT"
+
+                        cur.execute("""
+                        INSERT INTO stock_movements
+                        (
+                            product_name,
+                            supplier,
+
+                            movement_type,
+
+                            quantity,
+
+                            total_price,
+
+                            purchase_date,
+
+                            unit
+                        )
+                        VALUES (%s,%s,%s,%s,%s,%s,%s)
+                        """, (
+
+                            product_name,
+                            supplier,
+
+                            movement_type,
+
+                            delta,
+
+                            0,
+
+                            today,
+
+                            unit
+                        ))
 
                 else:
 
