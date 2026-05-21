@@ -90,13 +90,14 @@ def sync_stock():
     worksheets = spreadsheet.worksheets()
 
     synced = 0
+    sheet_products = set()
 
     for sheet in worksheets:
-        # bỏ qua sheet Infos
+
         if sheet.title.strip().lower() == "infos":
             continue
-        supplier = sheet.title
 
+        supplier = sheet.title
         rows = sheet.get_all_records()
 
         stock_date = parse_sheet_date(
@@ -107,7 +108,6 @@ def sync_stock():
             sheet.acell("E2").value
         )
 
-
         for row in rows:
 
             product_name = str(
@@ -116,6 +116,11 @@ def sync_stock():
 
             if not product_name:
                 continue
+
+            sheet_products.add((
+                product_name.strip().lower(),
+                supplier.strip().lower()
+            ))
 
             unit = str(
                 row.get("Unité", "")
@@ -134,17 +139,16 @@ def sync_stock():
                 row.get("Commander", 0)
             )
 
-
             with conn.cursor() as cur:
 
                 cur.execute("""
-                SELECT id
+                SELECT id, stock_quantity
                 FROM stock_products
-                WHERE name=%s
-                AND supplier=%s
+                WHERE LOWER(name)=%s
+                AND LOWER(supplier)=%s
                 """, (
-                    product_name,
-                    supplier
+                    product_name.strip().lower(),
+                    supplier.strip().lower()
                 ))
 
                 existing = cur.fetchone()
@@ -152,104 +156,60 @@ def sync_stock():
                 if existing:
 
                     product_id = existing[0]
-
-                    # =========================
-                    # LAY STOCK CU
-                    # =========================
-
-                    cur.execute("""
-                    SELECT
-                        stock_quantity
-                    FROM stock_products
-                    WHERE id=%s
-                    """, (product_id,))
-
-                    old_product = cur.fetchone()
-
-                    old_stock =float(old_product[0] or 0)
-
-                    new_stock =float(stock_reel or 0)
-
-                    delta =new_stock - old_stock
-
-                    # =========================
-                    # UPDATE PRODUIT
-                    # =========================
+                    old_stock = float(existing[1] or 0)
+                    new_stock = float(stock_reel or 0)
+                    delta = new_stock - old_stock
 
                     cur.execute("""
                     UPDATE stock_products
                     SET stock_quantity=%s,
-
                         ordered_quantity=%s,
-
                         stock_date=%s,
                         order_date=%s,
-
                         unit=%s,
                         min_stock=%s,
-
                         updated_at=NOW()
-
                     WHERE id=%s
                     """, (
                         stock_reel,
-
                         ordered_quantity,
-
                         stock_date,
                         order_date,
-
                         unit,
                         min_stock,
-
                         product_id
                     ))
 
-                    # =========================
-                    # HISTORIQUE AUTO
-                    # =========================
-
                     if delta != 0:
 
-                        if delta < 0:
-
-                            movement_type ="CONSUMPTION"
-
-                        else:
-
-                            movement_type ="INVENTORY_ADJUSTMENT"
+                        movement_type = (
+                            "CONSUMPTION"
+                            if delta < 0
+                            else "INVENTORY_ADJUSTMENT"
+                        )
 
                         cur.execute("""
                         INSERT INTO stock_movements
                         (
                             product_name,
                             supplier,
-
                             movement_type,
-
                             quantity,
-
                             total_price,
-
                             purchase_date,
-
-                            unit
+                            unit,
+                            note
                         )
-                        VALUES (%s,%s,%s,%s,%s,%s,%s)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                         """, (
-
                             product_name,
                             supplier,
-
                             movement_type,
-
                             delta,
-
                             0,
-
-                            today,
-
-                            unit
+                            stock_date or today,
+                            unit,
+                            "Sync Google Sheet"
                         ))
 
                 else:
@@ -259,16 +219,10 @@ def sync_stock():
                     (
                         name,
                         supplier,
-
                         stock_quantity,
-
                         ordered_quantity,
-    
-
                         stock_date,
                         order_date,
-                 
-
                         unit,
                         min_stock
                     )
@@ -276,20 +230,75 @@ def sync_stock():
                     """, (
                         product_name,
                         supplier,
-
                         stock_reel,
-
                         ordered_quantity,
-
                         stock_date,
                         order_date,
-               
-
                         unit,
                         min_stock
                     ))
 
                 synced += 1
+
+    # =========================
+    # DELETE PRODUITS ABSENTS GOOGLE SHEET
+    # =========================
+
+    with conn.cursor() as cur:
+
+        cur.execute("""
+        SELECT id, name, supplier, stock_quantity, unit, average_price
+        FROM stock_products
+        """)
+
+        db_products = cur.fetchall()
+
+        for p in db_products:
+
+            product_id = p[0]
+            name = p[1]
+            supplier = p[2]
+            qty = float(p[3] or 0)
+            unit = p[4]
+            avg_price = float(p[5] or 0)
+
+            key = (
+                name.strip().lower(),
+                supplier.strip().lower()
+            )
+
+            if key not in sheet_products:
+
+                cur.execute("""
+                INSERT INTO stock_movements
+                (
+                    product_name,
+                    supplier,
+                    movement_type,
+                    quantity,
+                    unit,
+                    total_price,
+                    unit_price,
+                    purchase_date,
+                    note
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (
+                    name,
+                    supplier,
+                    "DELETED_FROM_SHEET",
+                    -qty,
+                    unit,
+                    -(qty * avg_price),
+                    avg_price,
+                    today,
+                    "Produit supprimé car absent du Google Sheet"
+                ))
+
+                cur.execute("""
+                DELETE FROM stock_products
+                WHERE id=%s
+                """, (product_id,))
 
     conn.close()
 
