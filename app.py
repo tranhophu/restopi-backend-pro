@@ -1868,9 +1868,34 @@ def stock_dashboard():
             # valeur stock
             cur.execute("""
             SELECT COALESCE(
-                SUM(stock_quantity * last_purchase_price),
-                0
-            )
+
+                SUM(
+
+                    CASE
+
+                        WHEN conversion_factor IS NOT NULL
+                        AND conversion_factor > 0
+
+                        THEN
+                            stock_quantity
+                            *
+                            (
+                                last_purchase_price
+                                /
+                                conversion_factor
+                            )
+
+                        ELSE
+                            stock_quantity
+                            *
+                            last_purchase_price
+
+                    END
+
+                ),
+
+            0)
+
             FROM stock_products
             """)
 
@@ -1894,7 +1919,26 @@ def stock_dashboard():
 
                 COALESCE(
                     SUM(
-                        stock_quantity * last_purchase_price
+                        CASE
+
+                            WHEN conversion_factor IS NOT NULL
+                            AND conversion_factor > 0
+
+                            THEN
+                                stock_quantity
+                                *
+                                (
+                                    last_purchase_price
+                                    /
+                                    conversion_factor
+                                )
+
+                            ELSE
+                                stock_quantity
+                                *
+                                last_purchase_price
+
+                        END
                     ),
                     0
                 ) as supplier_value
