@@ -376,6 +376,48 @@ def init_stock():
             ADD COLUMN IF NOT EXISTS average_price FLOAT DEFAULT 0,
             ADD COLUMN IF NOT EXISTS last_purchase_price FLOAT DEFAULT 0;
             """)
+
+            # =========================
+            # UNIT CONVERSIONS ERP
+            # =========================
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_units (
+
+                id SERIAL PRIMARY KEY,
+
+                product_name TEXT,
+                supplier TEXT,
+
+                purchase_unit TEXT,
+                stock_unit TEXT,
+
+                conversion_factor FLOAT DEFAULT 1
+            );
+            """)
+
+            # stock_products → unité interne
+
+            cur.execute("""
+            ALTER TABLE stock_products
+
+            ADD COLUMN IF NOT EXISTS stock_unit TEXT;
+            """)
+            
+            cur.execute("""
+            ALTER TABLE stock_products
+
+            ADD COLUMN IF NOT EXISTS conversion_factor FLOAT DEFAULT 1;
+            """)
+            # historique achat réel
+
+            cur.execute("""
+            ALTER TABLE stock_movements
+
+            ADD COLUMN IF NOT EXISTS purchase_quantity FLOAT,
+
+            ADD COLUMN IF NOT EXISTS purchase_unit TEXT;
+            """)
             # snapshots hebdomadaires
             cur.execute("""
             CREATE TABLE IF NOT EXISTS stock_snapshots (
@@ -1549,6 +1591,8 @@ def stock_products():
              
 
                 unit,
+                stock_unit,
+                conversion_factor,
 
                 average_price,
                 last_purchase_price,
@@ -1577,11 +1621,12 @@ def stock_products():
             "order_date": str(r[6]) if r[6] else "",
 
             "unit": r[7],
+            "stock_unit": r[8],
+            "conversion_factor": r[9],
 
-            "average_price": r[8],
-            "last_purchase_price": r[9],
-
-            "min_stock": r[10]
+            "average_price": r[10],
+            "last_purchase_price": r[11],
+            "min_stock": r[12]
 
         })
 
@@ -1631,14 +1676,23 @@ def update_stock_product():
             UPDATE stock_products
             SET name=%s,
                 supplier=%s,
+
                 unit=%s,
+                stock_unit=%s,
+
+                conversion_factor=%s,
+
                 min_stock=%s,
                 updated_at=NOW()
             WHERE id=%s
             """, (
                 data.get("name"),
                 data.get("supplier"),
+
                 data.get("unit"),
+                data.get("stock_unit"),
+                float(data.get("conversion_factor") or 1),
+
                 float(data.get("min_stock")),
                 int(data.get("id"))
             ))
@@ -1814,7 +1868,7 @@ def stock_dashboard():
             # valeur stock
             cur.execute("""
             SELECT COALESCE(
-                SUM(stock_quantity * average_price),
+                SUM(stock_quantity * last_purchase_price),
                 0
             )
             FROM stock_products
@@ -1829,6 +1883,42 @@ def stock_dashboard():
             """)
 
             suppliers = cur.fetchone()[0]
+
+            # =========================
+            # VALEUR STOCK PAR FOURNISSEUR
+            # =========================
+
+            cur.execute("""
+            SELECT
+                supplier,
+
+                COALESCE(
+                    SUM(
+                        stock_quantity * last_purchase_price
+                    ),
+                    0
+                ) as supplier_value
+
+            FROM stock_products
+
+            GROUP BY supplier
+
+            ORDER BY supplier_value DESC
+            """)
+
+            supplier_values_rows = cur.fetchall()
+
+            supplier_values = []
+
+            for r in supplier_values_rows:
+
+                supplier_values.append({
+
+                    "supplier": r[0],
+
+                    "value": float(r[1] or 0)
+
+                })
             # =========================
             # PRODUITS DORMANTS
             # =========================
@@ -1850,7 +1940,7 @@ def stock_dashboard():
 
                 AND sm.movement_type IN (
                     'CONSUMPTION',
-                    'LIVRAISON'
+                    'ACHAT'
                 )
             )
             """)
@@ -1868,7 +1958,10 @@ def stock_dashboard():
         "suppliers": suppliers,
 
         "dormant_products":
-            dormant_products
+            dormant_products,
+
+        "supplier_values":
+            supplier_values
 
     })
 
@@ -1987,11 +2080,14 @@ def add_deliveries():
 
                 cur.execute("""
                 SELECT stock_quantity,
-                       average_price,
-                       unit
+                        average_price,
+                        last_purchase_price,
+                        unit,
+                        stock_unit,
+                        conversion_factor
                 FROM stock_products
-                WHERE name=%s
-                AND supplier=%s
+                WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+                AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
                 """, (
                     product_name,
                     supplier
@@ -2004,7 +2100,7 @@ def add_deliveries():
 
                 old_stock = float(row[0] or 0)
                 old_avg = float(row[1] or 0)
-                last_price = old_avg
+                last_price = float(row[2] or 0)
 
                 price_variation = 0
 
@@ -2014,35 +2110,55 @@ def add_deliveries():
                             unit_price - last_price
                         ) / last_price
                     ) * 100
-                unit = row[2]
+                purchase_unit = row[3]
+                stock_unit = row[4]
+                conversion_factor = row[5]
 
-                new_stock = (
-                    old_stock + quantity
+                unit = stock_unit or purchase_unit
+
+                quantity_mode = d.get(
+                    "quantity_mode",
+                    "purchase"
                 )
 
-                if new_stock <= 0:
-                    new_avg = unit_price
+                if quantity_mode == "stock":
+
+                    stock_added = quantity
+
                 else:
+
+                    stock_added = (
+                        quantity * conversion_factor
+                    )
+
+                # =========================
+                # NO STOCK UPDATE
+                # Livraison = historique achat uniquement
+                # =========================
+
+                if old_avg <= 0:
+
                     new_avg = (
+                        unit_price / conversion_factor
+                    )
+
+                else:
+
+                    new_avg = (
+                        old_avg +
                         (
-                            old_stock * old_avg
+                            unit_price / conversion_factor
                         )
-                        +
-                        (
-                            quantity * unit_price
-                        )
-                    ) / new_stock
+                    ) / 2
 
                 cur.execute("""
                 UPDATE stock_products
-                SET stock_quantity=%s,
-                    average_price=%s,
+                SET average_price=%s,
                     last_purchase_price=%s,
                     updated_at=NOW()
-                WHERE name=%s
-                AND supplier=%s
+                WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+                AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
                 """, (
-                    new_stock,
                     new_avg,
                     unit_price,
                     product_name,
@@ -2054,25 +2170,52 @@ def add_deliveries():
                 (
                     product_name,
                     supplier,
+
                     movement_type,
+
                     quantity,
                     unit,
+
+                    purchase_quantity,
+                    purchase_unit,
+
                     total_price,
                     unit_price,
+
                     purchase_date,
                     note
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, (
+
                     product_name,
                     supplier,
-                    "LIVRAISON",
-                    quantity,
+
+                    "ACHAT",
+
+                    stock_added,
                     unit,
+
+                    quantity,
+                    purchase_unit,
+
                     quantity * unit_price,
                     unit_price,
+
                     purchase_date,
-                    f"Variation prix: {round(price_variation, 2)}%"
+
+                    f"""
+                Livraison ERP
+
+                Achat:
+                {quantity} {purchase_unit}
+
+                Ajout stock:
+                {stock_added} {unit}
+
+                Variation prix:
+                {round(price_variation, 2)}%
+                """
                 ))
 
     return jsonify({"success":True})

@@ -233,16 +233,35 @@ def sync_stock():
                             ordered_quantity=%s,
                             stock_date=%s,
                             order_date=%s,
+
                             unit=%s,
+
+                            stock_unit =
+                                CASE
+
+                                    WHEN stock_unit IS NULL
+                                    OR TRIM(stock_unit) = ''
+                                    OR LOWER(TRIM(stock_unit)) = 'stock'
+
+                                    THEN %s
+
+                                    ELSE stock_unit
+
+                                END,
+
                             min_stock=%s,
                             updated_at=NOW()
+
                         WHERE id=%s
                         """, (
                             stock_reel,
                             ordered_quantity,
                             stock_date,
                             order_date,
+
                             unit,
+                            unit,
+
                             min_stock,
                             product_id
                         ))
@@ -288,14 +307,33 @@ def sync_stock():
                         UPDATE stock_products
                         SET ordered_quantity=%s,
                             order_date=%s,
+
                             unit=%s,
+
+                            stock_unit =
+                                CASE
+
+                                    WHEN stock_unit IS NULL
+                                    OR TRIM(stock_unit) = ''
+                                    OR LOWER(TRIM(stock_unit)) = 'stock'
+
+                                    THEN %s
+
+                                    ELSE stock_unit
+
+                                END,
+
                             min_stock=%s,
                             updated_at=NOW()
+
                         WHERE id=%s
                         """, (
                             ordered_quantity,
                             order_date,
+
                             unit,
+                            unit,
+
                             min_stock,
                             product_id
                         ))
@@ -307,22 +345,32 @@ def sync_stock():
                     (
                         name,
                         supplier,
+
                         stock_quantity,
                         ordered_quantity,
+
                         stock_date,
                         order_date,
+
                         unit,
+                        stock_unit,
+
                         min_stock
                     )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """, (
                         product_name,
                         supplier,
+
                         stock_reel,
                         ordered_quantity,
+
                         stock_date,
                         order_date,
+
                         unit,
+                        unit,
+
                         min_stock
                     ))
 
