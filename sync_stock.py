@@ -249,7 +249,6 @@ def sync_stock():
 
                                 END,
 
-                            min_stock=%s,
                             updated_at=NOW()
 
                         WHERE id=%s
@@ -262,7 +261,6 @@ def sync_stock():
                             unit,
                             unit,
 
-                            min_stock,
                             product_id
                         ))
 
@@ -323,7 +321,6 @@ def sync_stock():
 
                                 END,
 
-                            min_stock=%s,
                             updated_at=NOW()
 
                         WHERE id=%s
@@ -334,7 +331,6 @@ def sync_stock():
                             unit,
                             unit,
 
-                            min_stock,
                             product_id
                         ))
 
@@ -370,8 +366,9 @@ def sync_stock():
 
                         unit,
                         unit,
-
                         min_stock
+
+                    
                     ))
 
                     if stock_date:
