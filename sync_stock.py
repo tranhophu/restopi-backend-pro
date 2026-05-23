@@ -234,8 +234,6 @@ def sync_stock():
                             stock_date=%s,
                             order_date=%s,
 
-                            unit=%s,
-
                             stock_unit =
                                 CASE
 
@@ -257,10 +255,7 @@ def sync_stock():
                             ordered_quantity,
                             stock_date,
                             order_date,
-
                             unit,
-                            unit,
-
                             product_id
                         ))
 
@@ -305,9 +300,6 @@ def sync_stock():
                         UPDATE stock_products
                         SET ordered_quantity=%s,
                             order_date=%s,
-
-                            unit=%s,
-
                             stock_unit =
                                 CASE
 
@@ -327,10 +319,7 @@ def sync_stock():
                         """, (
                             ordered_quantity,
                             order_date,
-
                             unit,
-                            unit,
-
                             product_id
                         ))
 
