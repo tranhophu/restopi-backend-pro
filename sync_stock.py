@@ -283,15 +283,15 @@ def sync_stock():
                     else:
 
                         # Même ancienne date de contrôle:
-                        # on met à jour seulement commander / unité / min,
-                        # mais PAS stock_quantity
+                        # update seulement commander + unité achat
+                        # NE PAS écraser unité stock manager
+
                         cur.execute("""
                         UPDATE stock_products
                         SET ordered_quantity=%s,
                             order_date=%s,
 
                             purchase_unit=%s,
-                            stock_unit=%s,
 
                             updated_at=NOW()
                         WHERE id=%s
@@ -299,7 +299,6 @@ def sync_stock():
                             ordered_quantity,
                             order_date,
 
-                            purchase_unit,
                             purchase_unit,
 
                             product_id
@@ -336,7 +335,9 @@ def sync_stock():
                         order_date,
 
                         purchase_unit,
-                        purchase_unit,
+
+                        "kg" if purchase_unit == "kg" else "pce",
+
                         min_stock
 
                     
