@@ -336,7 +336,7 @@ def sync_stock():
 
                         purchase_unit,
 
-                        "kg" if purchase_unit == "kg" else "pce",
+                        purchase_unit,
 
                         min_stock
 

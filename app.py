@@ -1688,6 +1688,70 @@ def update_stock_product():
 
     return jsonify({"success": True})
 
+@app.route(
+    "/admin/stock/bulk-update",
+    methods=["POST"]
+)
+def bulk_update_stock_products():
+
+    if not check_admin(request):
+        return jsonify({
+            "error":"unauthorized"
+        }), 403
+
+    data = request.json
+
+    updates = data.get("updates", [])
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            for p in updates:
+
+                cur.execute("""
+                UPDATE stock_products
+                SET
+
+                    name=%s,
+                    supplier=%s,
+
+                    stock_quantity=%s,
+
+                    stock_unit=%s,
+
+                    conversion_factor=%s,
+
+                    min_stock=%s,
+
+                    updated_at=NOW()
+
+                WHERE id=%s
+                """, (
+
+                    p.get("name"),
+
+                    p.get("supplier"),
+
+                    float(
+                        p.get("stock_quantity") or 0
+                    ),
+
+                    p.get("stock_unit"),
+
+                    float(
+                        p.get("conversion_factor") or 1
+                    ),
+
+                    float(
+                        p.get("min_stock") or 0
+                    ),
+
+                    int(p.get("id"))
+                ))
+
+    return jsonify({
+        "success": True
+    })
 
 @app.route("/admin/stock/delete", methods=["POST"])
 def delete_stock_product():
