@@ -319,7 +319,7 @@ def init_stock():
                 order_date DATE,
           
 
-                unit TEXT,
+                purchase_unit TEXT,
 
                 average_price FLOAT DEFAULT 0,
                 last_purchase_price FLOAT DEFAULT 0,
@@ -329,13 +329,7 @@ def init_stock():
             );
             """)
             
-            cur.execute("""
-            DELETE FROM stock_products a
-            USING stock_products b
-            WHERE a.id < b.id
-            AND LOWER(a.name) = LOWER(b.name)
-            AND LOWER(a.supplier) = LOWER(b.supplier);
-            """)
+            
             cur.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_products_unique
             ON stock_products (
@@ -351,7 +345,7 @@ def init_stock():
                 supplier TEXT,
                 movement_type TEXT,
                 quantity FLOAT,
-                unit TEXT,
+                purchase_unit TEXT,
                 total_price FLOAT,
                 unit_price FLOAT,
                 note TEXT,
@@ -413,10 +407,7 @@ def init_stock():
 
             cur.execute("""
             ALTER TABLE stock_movements
-
-            ADD COLUMN IF NOT EXISTS purchase_quantity FLOAT,
-
-            ADD COLUMN IF NOT EXISTS purchase_unit TEXT;
+            ADD COLUMN IF NOT EXISTS purchase_quantity FLOAT;
             """)
             # snapshots hebdomadaires
             cur.execute("""
@@ -426,19 +417,12 @@ def init_stock():
                 product_name TEXT,
                 supplier TEXT,
                 stock_quantity FLOAT,
-                unit TEXT,
+                purchase_unit TEXT,
                 created_at TIMESTAMP DEFAULT NOW()
             );
             """)
             
-            cur.execute("""
-            DELETE FROM stock_snapshots a
-            USING stock_snapshots b
-            WHERE a.id < b.id
-            AND a.snapshot_date = b.snapshot_date
-            AND LOWER(a.product_name) = LOWER(b.product_name)
-            AND LOWER(a.supplier) = LOWER(b.supplier);
-            """)
+            
             cur.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_snapshots_unique
             ON stock_snapshots (
@@ -1584,13 +1568,11 @@ def stock_products():
                 stock_quantity,
 
                 ordered_quantity,
-              
 
                 stock_date,
                 order_date,
-             
 
-                unit,
+                purchase_unit,
                 stock_unit,
                 conversion_factor,
 
@@ -1648,7 +1630,7 @@ def create_stock_product():
     sheet.append_row([
 
         data.get("name"),
-        data.get("unit"),
+        data.get("purchase_unit"),
         data.get("unit_price"),
         data.get("min_stock"),
         data.get("stock_quantity"),
@@ -1676,21 +1658,24 @@ def update_stock_product():
             UPDATE stock_products
             SET name=%s,
                 supplier=%s,
-
+                stock_quantity=%s,
                 stock_unit=%s,
-
                 conversion_factor=%s,
-
                 min_stock=%s,
                 updated_at=NOW()
             WHERE id=%s
             """, (
                 data.get("name"),
                 data.get("supplier"),
+
+                float(data.get("stock_quantity") or 0),
+
                 data.get("stock_unit"),
+
                 float(data.get("conversion_factor") or 1),
 
-                float(data.get("min_stock")),
+                float(data.get("min_stock") or 0),
+
                 int(data.get("id"))
             ))
 
@@ -1715,7 +1700,7 @@ def delete_stock_product():
             SELECT name,
                 supplier,
                 stock_quantity,
-                unit,
+                purchase_unit,
                 average_price
             FROM stock_products
             WHERE id=%s
@@ -1755,7 +1740,7 @@ def delete_stock_product():
                 supplier,
                 movement_type,
                 quantity,
-                unit,
+                purchase_unit,
                 total_price,
                 unit_price,
                 note
@@ -1797,7 +1782,7 @@ def stock_history():
                 supplier,
                 movement_type,
                 quantity,
-                unit,
+                purchase_unit,
                 total_price,
                 unit_price,
                 note,
@@ -1826,7 +1811,7 @@ def stock_history():
             "supplier": r[1],
             "movement_type": r[2],
             "quantity": r[3],
-            "unit": r[4],
+            "purchase_unit": r[4],
             "total_price": r[5],
             "unit_price": r[6],
             "note": r[7],
@@ -2123,7 +2108,7 @@ def add_deliveries():
                 SELECT stock_quantity,
                         average_price,
                         last_purchase_price,
-                        unit,
+                        purchase_unit,
                         stock_unit,
                         conversion_factor
                 FROM stock_products
@@ -2202,7 +2187,6 @@ def add_deliveries():
                     movement_type,
 
                     quantity,
-                    unit,
 
                     purchase_quantity,
                     purchase_unit,
@@ -2213,7 +2197,7 @@ def add_deliveries():
                     purchase_date,
                     note
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, (
 
                     product_name,
@@ -2222,7 +2206,6 @@ def add_deliveries():
                     "ACHAT",
 
                     stock_added,
-                    unit,
 
                     quantity,
                     purchase_unit,

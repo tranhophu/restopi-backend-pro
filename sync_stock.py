@@ -95,7 +95,7 @@ def sync_stock():
             product_name TEXT,
             supplier TEXT,
             stock_quantity FLOAT,
-            unit TEXT,
+            purchase_unit TEXT,
             created_at TIMESTAMP DEFAULT NOW()
         );
         """)
@@ -216,7 +216,7 @@ def sync_stock():
                         )
                         DO UPDATE SET
                             stock_quantity = EXCLUDED.stock_quantity,
-                            unit = EXCLUDED.unit,
+                            purchase_unit = EXCLUDED.purchase_unit,
                             created_at = NOW()
                         """, (
                             stock_date,
@@ -276,7 +276,7 @@ def sync_stock():
                                 quantity,
                                 total_price,
                                 purchase_date,
-                                unit,
+                                purchase_unit,
                                 note
                             )
                             VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
@@ -287,7 +287,7 @@ def sync_stock():
                                 delta,
                                 0,
                                 stock_date or today,
-                                unit,
+                                purchase_unit,
                                 "Nouveau contrôle stock Google Sheet"
                             ))
 
@@ -337,7 +337,7 @@ def sync_stock():
                         stock_date,
                         order_date,
 
-                        unit,
+                        purchase_unit,
                         stock_unit,
 
                         min_stock
@@ -369,7 +369,7 @@ def sync_stock():
                             product_name,
                             supplier,
                             stock_quantity,
-                            unit
+                            purchase_unit
                         )
                         VALUES (%s,%s,%s,%s,%s)
                         ON CONFLICT (
@@ -379,7 +379,7 @@ def sync_stock():
                         )
                         DO UPDATE SET
                             stock_quantity = EXCLUDED.stock_quantity,
-                            unit = EXCLUDED.unit,
+                            purchase_unit = EXCLUDED.purchase_unit,
                             created_at = NOW()
                         """, (
                             stock_date,
@@ -400,7 +400,7 @@ def sync_stock():
     with conn.cursor() as cur:
 
         cur.execute("""
-        SELECT id, name, supplier, stock_quantity, unit, average_price
+        SELECT id, name, supplier, stock_quantity, purchase_unit, average_price
         FROM stock_products
         """)
 
@@ -429,7 +429,7 @@ def sync_stock():
                     supplier,
                     movement_type,
                     quantity,
-                    unit,
+                    purchase_unit,
                     total_price,
                     unit_price,
                     purchase_date,
