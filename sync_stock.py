@@ -147,8 +147,8 @@ def sync_stock():
                 supplier.strip().lower()
             ))
 
-            unit = str(
-                row.get("Unité", "")
+            purchase_unit = str(
+                row.get("Unité achat", "")
             ).strip()
 
             min_stock = row.get(
@@ -206,7 +206,7 @@ def sync_stock():
                             product_name,
                             supplier,
                             stock_quantity,
-                            unit
+                            purchase_unit
                         )
                         VALUES (%s,%s,%s,%s,%s)
                         ON CONFLICT (
@@ -223,7 +223,7 @@ def sync_stock():
                             product_name,
                             supplier,
                             new_stock,
-                            unit
+                            purchase_unit
                         ))
                         delta = new_stock - old_stock
 
@@ -255,7 +255,7 @@ def sync_stock():
                             ordered_quantity,
                             stock_date,
                             order_date,
-                            unit,
+                            purchase_unit,
                             product_id
                         ))
 
@@ -319,7 +319,7 @@ def sync_stock():
                         """, (
                             ordered_quantity,
                             order_date,
-                            unit,
+                            purchase_unit,
                             product_id
                         ))
 
@@ -353,8 +353,8 @@ def sync_stock():
                         stock_date,
                         order_date,
 
-                        unit,
-                        unit,
+                        purchase_unit,
+                        purchase_unit,
                         min_stock
 
                     
@@ -386,7 +386,7 @@ def sync_stock():
                             product_name,
                             supplier,
                             stock_reel,
-                            unit
+                            purchase_unit
                         ))
 
                 synced += 1

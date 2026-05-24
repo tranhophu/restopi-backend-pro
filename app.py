@@ -1620,7 +1620,7 @@ def stock_products():
             "stock_date": str(r[5]) if r[5] else "",
             "order_date": str(r[6]) if r[6] else "",
 
-            "unit": r[7],
+            "purchase_unit": r[7],
             "stock_unit": r[8],
             "conversion_factor": r[9],
 
@@ -1677,7 +1677,6 @@ def update_stock_product():
             SET name=%s,
                 supplier=%s,
 
-                unit=%s,
                 stock_unit=%s,
 
                 conversion_factor=%s,
@@ -1688,8 +1687,6 @@ def update_stock_product():
             """, (
                 data.get("name"),
                 data.get("supplier"),
-
-                data.get("unit"),
                 data.get("stock_unit"),
                 float(data.get("conversion_factor") or 1),
 
@@ -2154,26 +2151,13 @@ def add_deliveries():
                             unit_price - last_price
                         ) / last_price
                     ) * 100
-                purchase_unit = row[3]
-                stock_unit = row[4]
-                conversion_factor = row[5]
+                purchase_unit = d.get("purchase_unit")
 
-                unit = stock_unit or purchase_unit
+                stock_added = quantity
 
-                quantity_mode = d.get(
-                    "quantity_mode",
-                    "purchase"
-                )
+                unit = purchase_unit
 
-                if quantity_mode == "stock":
-
-                    stock_added = quantity
-
-                else:
-
-                    stock_added = (
-                        quantity * conversion_factor
-                    )
+                conversion_factor = row[5] or 1
 
                 # =========================
                 # NO STOCK UPDATE
