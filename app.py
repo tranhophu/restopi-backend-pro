@@ -422,7 +422,10 @@ def init_stock():
             );
             """)
             
-            
+            cur.execute("""
+            ALTER TABLE stock_snapshots
+            ADD COLUMN IF NOT EXISTS purchase_unit TEXT;
+            """)
             cur.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_snapshots_unique
             ON stock_snapshots (
