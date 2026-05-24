@@ -57,7 +57,7 @@ today = datetime.now().date()
 
 def extract_number(value):
 
-    raw = str(value).strip().lower()
+    raw = str(value).strip().lower().replace(",", ".")
 
     match = re.search(r"[\d\.]+", raw)
 
