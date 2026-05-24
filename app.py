@@ -1629,13 +1629,17 @@ def create_stock_product():
 
     sheet.append_row([
 
-        data.get("name"),
-        data.get("purchase_unit"),
-        data.get("unit_price"),
-        data.get("min_stock"),
-        data.get("stock_quantity"),
-        "",
-        ""
+        data.get("name"),           # Produit
+
+        data.get("purchase_unit"),  # Unité achat
+
+        data.get("min_stock"),      # Stock min
+
+        data.get("stock_quantity"), # Stock Réel
+
+        "",                         # Commander
+
+        ""                          # Note
 
     ])
     sync_stock()
@@ -2143,6 +2147,9 @@ def add_deliveries():
                 unit = purchase_unit
 
                 conversion_factor = row[5] or 1
+
+                if purchase_unit == row[4]:
+                    conversion_factor = 1
 
                 # =========================
                 # NO STOCK UPDATE

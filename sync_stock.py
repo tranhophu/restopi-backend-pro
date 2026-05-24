@@ -234,18 +234,7 @@ def sync_stock():
                             stock_date=%s,
                             order_date=%s,
 
-                            stock_unit =
-                                CASE
-
-                                    WHEN stock_unit IS NULL
-                                    OR TRIM(stock_unit) = ''
-                                    OR LOWER(TRIM(stock_unit)) = 'stock'
-
-                                    THEN %s
-
-                                    ELSE stock_unit
-
-                                END,
+                            purchase_unit=%s,
 
                             updated_at=NOW()
 
@@ -300,21 +289,8 @@ def sync_stock():
                         UPDATE stock_products
                         SET ordered_quantity=%s,
                             order_date=%s,
-                            stock_unit =
-                                CASE
-
-                                    WHEN stock_unit IS NULL
-                                    OR TRIM(stock_unit) = ''
-                                    OR LOWER(TRIM(stock_unit)) = 'stock'
-
-                                    THEN %s
-
-                                    ELSE stock_unit
-
-                                END,
-
+                            purchase_unit=%s,
                             updated_at=NOW()
-
                         WHERE id=%s
                         """, (
                             ordered_quantity,
