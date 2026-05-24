@@ -289,13 +289,19 @@ def sync_stock():
                         UPDATE stock_products
                         SET ordered_quantity=%s,
                             order_date=%s,
+
                             purchase_unit=%s,
+                            stock_unit=%s,
+
                             updated_at=NOW()
                         WHERE id=%s
                         """, (
                             ordered_quantity,
                             order_date,
+
                             purchase_unit,
+                            purchase_unit,
+
                             product_id
                         ))
 
