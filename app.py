@@ -4,6 +4,8 @@ import stripe
 import os
 import resend
 import json
+import io
+import re
 from datetime import datetime, timedelta
 import pytz
 import psycopg2
@@ -2208,6 +2210,7 @@ def add_deliveries():
                         ) / last_price
                     ) * 100
                 purchase_unit = d.get("purchase_unit")
+                invoice_ref = d.get("invoice_ref", "")
 
                 stock_added = quantity
 
@@ -2289,21 +2292,191 @@ def add_deliveries():
 
                     purchase_date,
 
-                    f"""
-                Livraison ERP
+                    f"""{"Facture " + invoice_ref if invoice_ref else "Livraison ERP"}
 
-                Achat:
-                {quantity} {purchase_unit}
+Achat:
+{quantity} {purchase_unit}
 
-                Ajout stock:
-                {stock_added} {unit}
+Ajout stock:
+{stock_added} {unit}
 
-                Variation prix:
-                {round(price_variation, 2)}%
-                """
+Variation prix:
+{round(price_variation, 2)}%
+"""
                 ))
 
     return jsonify({"success":True})
+
+@app.route("/admin/stock/parse-invoice", methods=["POST"])
+def parse_invoice():
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    if 'file' not in request.files:
+        return jsonify({"error": "Aucun fichier fourni"}), 400
+
+    file = request.files['file']
+    if not file.filename.lower().endswith('.pdf'):
+        return jsonify({"error": "Le fichier doit être un PDF"}), 400
+
+    try:
+        import pdfplumber
+        pdf_bytes = file.read()
+        result = _parse_invoice_pdf(pdf_bytes)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": f"Erreur parsing: {str(e)}"}), 500
+
+
+def _parse_invoice_pdf(pdf_bytes):
+    import pdfplumber
+
+    result = {
+        "supplier": "",
+        "invoice_number": "",
+        "invoice_date": "",
+        "total": 0.0,
+        "items": []
+    }
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        full_text = ""
+        all_tables = []
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            full_text += text + "\n"
+            tables = page.extract_tables()
+            if tables:
+                all_tables.extend(tables)
+
+    # Supplier name: line before "Adresse:"
+    m = re.search(r'([^\n]+)\nAdresse\s*:', full_text)
+    if m:
+        result['supplier'] = m.group(1).strip()
+
+    # Invoice number
+    m = re.search(r'Facture\s+(E?\w+)', full_text)
+    if m:
+        result['invoice_number'] = m.group(1)
+
+    # Date DD/MM/YYYY → YYYY-MM-DD
+    m = re.search(r'Date\s*[:\s]+(\d{2}/\d{2}/\d{4})', full_text)
+    if m:
+        d = m.group(1).split('/')
+        result['invoice_date'] = f"{d[2]}-{d[1]}-{d[0]}"
+
+    # Total TTC
+    m = re.search(r'Total\s+T\.T\.C\s+€?([\d]+[,\.][\d]+)', full_text)
+    if m:
+        result['total'] = float(m.group(1).replace(',', '.'))
+
+    # Try table-based item extraction first
+    items = _parse_items_from_tables(all_tables)
+    if not items:
+        items = _parse_items_from_text(full_text)
+
+    result['items'] = items
+    return result
+
+
+def _parse_items_from_tables(tables):
+    items = []
+    for table in tables:
+        for row in table:
+            if not row or not row[0]:
+                continue
+            cell = str(row[0]).strip()
+            if 'SKU:' not in cell:
+                continue
+
+            name_parts = []
+            sku = ''
+            for line in cell.split('\n'):
+                line = line.strip()
+                sku_m = re.match(r'SKU:\s*(\d+)', line)
+                if sku_m:
+                    sku = sku_m.group(1)
+                elif line.startswith('Variante:') or not line:
+                    pass
+                else:
+                    name_parts.append(line)
+
+            name = ' '.join(name_parts).strip()
+            qty = 0
+            unit_price = 0.0
+
+            for val in row[1:]:
+                if not val:
+                    continue
+                clean = str(val).strip().replace('€', '').replace(',', '.').strip()
+                try:
+                    num = float(clean)
+                    if not qty and float(clean) == int(float(clean)):
+                        qty = int(float(clean))
+                    elif qty and not unit_price:
+                        unit_price = num
+                except (ValueError, TypeError):
+                    pass
+
+            if name and qty:
+                items.append({
+                    'name': name,
+                    'sku': sku,
+                    'qty': qty,
+                    'unit_price': unit_price,
+                    'total': round(qty * unit_price, 2)
+                })
+    return items
+
+
+def _parse_items_from_text(full_text):
+    items = []
+    lines = [l.strip() for l in full_text.split('\n')]
+    in_items = False
+    current = None
+
+    for line in lines:
+        if not line:
+            continue
+
+        if re.match(r'Articles\s+Quantit', line, re.IGNORECASE):
+            in_items = True
+            current = {'name_parts': []}
+            continue
+
+        if not in_items:
+            continue
+
+        if re.match(r'(Remise|Total Produits|Expédition|Total T)', line, re.IGNORECASE):
+            break
+
+        sku_m = re.match(r'SKU:\s*(\d+)', line)
+        if sku_m and current is not None:
+            current['sku'] = sku_m.group(1)
+            current['name'] = ' '.join(current['name_parts']).strip()
+            continue
+
+        if line.startswith('Variante:'):
+            continue
+
+        qp_m = re.match(r'^(\d+)\s+€?([\d\.]+)\s+€?([\d\.]+)$', line)
+        if qp_m and current is not None and current.get('sku'):
+            items.append({
+                'name': current.get('name', ''),
+                'sku': current.get('sku', ''),
+                'qty': int(qp_m.group(1)),
+                'unit_price': float(qp_m.group(2)),
+                'total': float(qp_m.group(3))
+            })
+            current = {'name_parts': []}
+            continue
+
+        if current is not None and 'sku' not in current:
+            current['name_parts'].append(line)
+
+    return items
+
 
 @app.route("/admin/stock/refresh", methods=["POST"])
 def refresh_stock():
