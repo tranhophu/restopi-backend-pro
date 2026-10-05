@@ -411,6 +411,13 @@ def init_stock():
             ALTER TABLE stock_movements
             ADD COLUMN IF NOT EXISTS purchase_quantity FLOAT;
             """)
+
+            # DLC par lot d'achat
+            cur.execute("""
+            ALTER TABLE stock_movements
+            ADD COLUMN IF NOT EXISTS expiry_date DATE,
+            ADD COLUMN IF NOT EXISTS lot_status TEXT DEFAULT 'ACTIF';
+            """)
             # snapshots hebdomadaires
             cur.execute("""
             CREATE TABLE IF NOT EXISTS stock_snapshots (
@@ -2177,6 +2184,8 @@ def add_deliveries():
                     "purchase_date"
                 )
 
+                expiry_date = d.get("expiry_date") or None
+
                 cur.execute("""
                 SELECT stock_quantity,
                         average_price,
@@ -2272,9 +2281,10 @@ def add_deliveries():
                     unit_price,
 
                     purchase_date,
+                    expiry_date,
                     note
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, (
 
                     product_name,
@@ -2291,6 +2301,7 @@ def add_deliveries():
                     unit_price,
 
                     purchase_date,
+                    expiry_date,
 
                     f"""{"Facture " + invoice_ref if invoice_ref else "Livraison ERP"}
 
@@ -2304,6 +2315,189 @@ Variation prix:
 {round(price_variation, 2)}%
 """
                 ))
+
+    return jsonify({"success":True})
+
+# =========================
+# DLC / LOTS
+# =========================
+
+def _lot_conversion_factor(lot_unit, stock_unit, conversion_factor):
+    # même règle que add_deliveries : unité achat == unité stock → facteur 1
+    if (lot_unit or "").strip().lower() == (stock_unit or "").strip().lower():
+        return 1
+    return float(conversion_factor or 1) or 1
+
+
+def _remaining_by_lot(lots, stock_quantity, stock_date, stock_unit, conversion_factor):
+    """
+    Estime la quantité restante de chaque lot (FIFO) à partir du dernier inventaire.
+
+    - Lots achetés APRÈS le dernier inventaire : pas encore comptés → entiers.
+    - Lots achetés AVANT/LE JOUR de l'inventaire : le stock compté est attribué
+      aux lots les plus récents d'abord, les plus anciens sont considérés consommés.
+
+    lots : liste de dict {id, purchase_date, purchase_quantity, purchase_unit}
+    Retourne {lot_id: quantité restante en unité d'achat}
+    """
+    remaining = {}
+    counted = []
+
+    for lot in lots:
+        factor = _lot_conversion_factor(lot["purchase_unit"], stock_unit, conversion_factor)
+        qty_stock_unit = float(lot["purchase_quantity"] or 0) * factor
+
+        if stock_date is None or (lot["purchase_date"] and lot["purchase_date"] > stock_date):
+            remaining[lot["id"]] = qty_stock_unit / factor
+        else:
+            counted.append((lot, qty_stock_unit, factor))
+
+    left = max(float(stock_quantity or 0), 0)
+
+    # plus récent d'abord
+    counted.sort(key=lambda x: (x[0]["purchase_date"] or datetime.min.date(), x[0]["id"]), reverse=True)
+
+    for lot, qty_stock_unit, factor in counted:
+        allocated = min(left, qty_stock_unit)
+        left -= allocated
+        remaining[lot["id"]] = allocated / factor
+
+    return remaining
+
+
+@app.route("/admin/stock/expiring", methods=["GET"])
+def stock_expiring():
+
+    if not check_admin(request):
+        return jsonify({"error":"unauthorized"}), 403
+
+    days = int(request.args.get("days", 1))
+
+    today = datetime.now(paris_tz).date()
+    limit_date = today + timedelta(days=days)
+
+    result = []
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            # produits ayant au moins un lot actif qui expire bientôt
+            cur.execute("""
+            SELECT DISTINCT LOWER(TRIM(product_name)), LOWER(TRIM(supplier))
+            FROM stock_movements
+            WHERE movement_type = 'ACHAT'
+            AND COALESCE(lot_status, 'ACTIF') = 'ACTIF'
+            AND expiry_date IS NOT NULL
+            AND expiry_date <= %s
+            """, (limit_date,))
+
+            candidates = cur.fetchall()
+
+            for name_key, supplier_key in candidates:
+
+                cur.execute("""
+                SELECT stock_quantity,
+                       stock_date,
+                       stock_unit,
+                       conversion_factor
+                FROM stock_products
+                WHERE LOWER(TRIM(name)) = %s
+                AND LOWER(TRIM(supplier)) = %s
+                """, (name_key, supplier_key))
+
+                product = cur.fetchone()
+
+                cur.execute("""
+                SELECT id,
+                       product_name,
+                       supplier,
+                       COALESCE(purchase_date, created_at::date),
+                       COALESCE(purchase_quantity, quantity),
+                       purchase_unit,
+                       expiry_date
+                FROM stock_movements
+                WHERE movement_type = 'ACHAT'
+                AND COALESCE(lot_status, 'ACTIF') = 'ACTIF'
+                AND LOWER(TRIM(product_name)) = %s
+                AND LOWER(TRIM(supplier)) = %s
+                """, (name_key, supplier_key))
+
+                lots = [
+                    {
+                        "id": r[0],
+                        "product_name": r[1],
+                        "supplier": r[2],
+                        "purchase_date": r[3],
+                        "purchase_quantity": r[4],
+                        "purchase_unit": r[5],
+                        "expiry_date": r[6],
+                    }
+                    for r in cur.fetchall()
+                ]
+
+                if product:
+                    remaining = _remaining_by_lot(
+                        lots,
+                        product[0],
+                        product[1],
+                        product[2],
+                        product[3]
+                    )
+                else:
+                    remaining = {
+                        lot["id"]: float(lot["purchase_quantity"] or 0)
+                        for lot in lots
+                    }
+
+                for lot in lots:
+
+                    if not lot["expiry_date"] or lot["expiry_date"] > limit_date:
+                        continue
+
+                    left = remaining.get(lot["id"], 0)
+
+                    if left <= 0:
+                        continue
+
+                    result.append({
+                        "id": lot["id"],
+                        "product_name": lot["product_name"],
+                        "supplier": lot["supplier"],
+                        "purchase_date": lot["purchase_date"].isoformat() if lot["purchase_date"] else None,
+                        "purchase_quantity": float(lot["purchase_quantity"] or 0),
+                        "remaining_quantity": round(left, 2),
+                        "purchase_unit": lot["purchase_unit"],
+                        "expiry_date": lot["expiry_date"].isoformat(),
+                        "days_left": (lot["expiry_date"] - today).days,
+                    })
+
+    result.sort(key=lambda x: x["expiry_date"])
+
+    return jsonify(result)
+
+
+@app.route("/admin/stock/lot-status", methods=["POST"])
+def stock_lot_status():
+
+    if not check_admin(request):
+        return jsonify({"error":"unauthorized"}), 403
+
+    data = request.json
+
+    lot_id = int(data.get("id"))
+    status = (data.get("status") or "").upper()
+
+    if status not in ("ACTIF", "CONSOMME", "JETE"):
+        return jsonify({"error":"invalid status"}), 400
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            UPDATE stock_movements
+            SET lot_status = %s
+            WHERE id = %s
+            AND movement_type = 'ACHAT'
+            """, (status, lot_id))
 
     return jsonify({"success":True})
 
