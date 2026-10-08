@@ -1911,32 +1911,48 @@ def stock_history():
 @app.route("/admin/stock/delete-movement", methods=["POST"])
 def stock_delete_movement():
     """
-    Supprime une ligne d'historique (saisie erronée).
-    Si c'est un ACHAT, recalcule prix moyen + dernier prix d'achat du produit.
+    Supprime une ou plusieurs lignes d'historique (saisie erronée).
+    Body : {"id": 12} ou {"ids": [12, 13, ...]}
+    Pour les ACHAT, recalcule prix moyen + dernier prix d'achat des produits concernés.
     """
 
     if not check_admin(request):
         return jsonify({"error":"unauthorized"}), 403
 
-    movement_id = int(request.json.get("id"))
+    data = request.json or {}
+
+    ids = data.get("ids")
+    if ids is None and data.get("id") is not None:
+        ids = [data.get("id")]
+
+    try:
+        ids = [int(i) for i in (ids or [])]
+    except (TypeError, ValueError):
+        return jsonify({"error":"invalid ids"}), 400
+
+    if not ids:
+        return jsonify({"error":"no ids"}), 400
 
     with get_conn() as conn:
         with conn.cursor() as cur:
 
             cur.execute("""
             DELETE FROM stock_movements
-            WHERE id = %s
+            WHERE id = ANY(%s)
             RETURNING product_name, supplier, movement_type
-            """, (movement_id,))
+            """, (ids,))
 
-            row = cur.fetchone()
+            rows = cur.fetchall()
 
-            if not row:
+            if not rows:
                 return jsonify({"error":"not found"}), 404
 
-            product_name, supplier, movement_type = row
+            # un seul recalcul par produit
+            achat_products = {
+                (r[0], r[1]) for r in rows if r[2] == "ACHAT"
+            }
 
-            if movement_type == "ACHAT":
+            for product_name, supplier in achat_products:
 
                 cur.execute("""
                 SELECT stock_unit, conversion_factor
@@ -1984,7 +2000,7 @@ def stock_delete_movement():
                         supplier
                     ))
 
-    return jsonify({"success": True})
+    return jsonify({"success": True, "deleted": len(rows)})
 
 @app.route("/admin/stock/dashboard")
 def stock_dashboard():
