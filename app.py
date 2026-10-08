@@ -18,6 +18,9 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
 from sync_stock import sync_stock
+from invoice_parsers import parse_supplier_invoice
+import difflib
+import unicodedata
 
 paris_tz = pytz.timezone("Europe/Paris")
 
@@ -461,6 +464,32 @@ def init_stock():
 
                 created_at TIMESTAMP DEFAULT NOW()
             );
+            """)
+
+            # import factures PDF : n° facture sur chaque ligne d'achat (anti-doublon)
+            cur.execute("""
+            ALTER TABLE stock_movements
+            ADD COLUMN IF NOT EXISTS invoice_ref TEXT;
+            """)
+
+            # code article fournisseur → produit stock (mémorisé au 1er import)
+            # product_name NULL = article à ignorer
+            # factor = nb d'unités achat du produit pour 1 article facturé
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_supplier_codes (
+                id SERIAL PRIMARY KEY,
+                supplier TEXT NOT NULL,
+                code TEXT NOT NULL,
+                description TEXT,
+                product_name TEXT,
+                factor FLOAT DEFAULT 1,
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+            """)
+
+            cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_supplier_codes_unique
+            ON stock_supplier_codes (LOWER(supplier), code);
             """)
 
 init_stock()
@@ -1953,54 +1982,60 @@ def stock_delete_movement():
             }
 
             for product_name, supplier in achat_products:
-
-                cur.execute("""
-                SELECT stock_unit, conversion_factor
-                FROM stock_products
-                WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
-                AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
-                """, (product_name, supplier))
-
-                product = cur.fetchone()
-
-                if product:
-
-                    new_avg = _weighted_avg_price(
-                        cur,
-                        product_name,
-                        supplier,
-                        product[0],
-                        product[1]
-                    )
-
-                    cur.execute("""
-                    SELECT unit_price
-                    FROM stock_movements
-                    WHERE movement_type = 'ACHAT'
-                    AND LOWER(TRIM(product_name)) = LOWER(TRIM(%s))
-                    AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
-                    AND COALESCE(unit_price, 0) > 0
-                    ORDER BY COALESCE(purchase_date, created_at::date) DESC, id DESC
-                    LIMIT 1
-                    """, (product_name, supplier))
-
-                    last = cur.fetchone()
-
-                    cur.execute("""
-                    UPDATE stock_products
-                    SET average_price=%s,
-                        last_purchase_price=%s,
-                        updated_at=NOW()
-                    WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
-                    AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
-                    """, (
-                        new_avg,
-                        float(last[0]) if last else 0,
-                        product_name,
-                        supplier
-                    ))
+                _refresh_product_prices(cur, product_name, supplier)
 
     return jsonify({"success": True, "deleted": len(rows)})
+
+
+def _refresh_product_prices(cur, product_name, supplier):
+    """Recalcule prix moyen (12 mois) + dernier prix d'achat depuis l'historique ACHAT."""
+
+    cur.execute("""
+    SELECT stock_unit, conversion_factor
+    FROM stock_products
+    WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+    AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+    """, (product_name, supplier))
+
+    product = cur.fetchone()
+
+    if not product:
+        return
+
+    new_avg = _weighted_avg_price(
+        cur,
+        product_name,
+        supplier,
+        product[0],
+        product[1]
+    )
+
+    cur.execute("""
+    SELECT unit_price
+    FROM stock_movements
+    WHERE movement_type = 'ACHAT'
+    AND LOWER(TRIM(product_name)) = LOWER(TRIM(%s))
+    AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+    AND COALESCE(unit_price, 0) > 0
+    ORDER BY COALESCE(purchase_date, created_at::date) DESC, id DESC
+    LIMIT 1
+    """, (product_name, supplier))
+
+    last = cur.fetchone()
+
+    cur.execute("""
+    UPDATE stock_products
+    SET average_price=%s,
+        last_purchase_price=%s,
+        updated_at=NOW()
+    WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+    AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+    """, (
+        new_avg,
+        float(last[0]) if last else 0,
+        product_name,
+        supplier
+    ))
 
 @app.route("/admin/stock/dashboard")
 def stock_dashboard():
@@ -2952,6 +2987,484 @@ def _parse_items_from_text(full_text):
             current['name_parts'].append(line)
 
     return items
+
+
+# =========================
+# IMPORT FACTURES PDF (historique achats)
+# =========================
+
+def _norm_product_name(s):
+    s = unicodedata.normalize("NFKD", str(s or ""))
+    s = "".join(c for c in s if not unicodedata.combining(c)).upper()
+    s = re.sub(r"[^A-Z0-9/.,%]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip(" .")
+
+
+def _pack_factor(invoice_desc, product_name, conversion_factor=1):
+    """
+    Devine le nb d'unités achat du produit pour 1 article facturé
+    à partir des conditionnements "6/50P" :
+      facture "NEM CREVETTE 6/50P"  / produit "NEM CREVETTE 50P"      → 6
+      facture "SILACHA 516G"        / produit "SILACHA 12/516G"       → 1/12
+        (seulement si le produit est acheté au carton : conversion = 12)
+    """
+    inv = _norm_product_name(invoice_desc)
+    prod = _norm_product_name(product_name)
+    inv_tokens = set(inv.split())
+    prod_tokens = set(prod.split())
+
+    for n, inner in re.findall(r"\b(\d+)/(\d+[A-Z]*)\b", inv):
+        if inner in prod_tokens and f"{n}/{inner}" not in prod_tokens and int(n) > 1:
+            return float(n)
+
+    for n, inner in re.findall(r"\b(\d+)/(\d+[A-Z]*)\b", prod):
+        if (
+            inner in inv_tokens
+            and f"{n}/{inner}" not in inv_tokens
+            and int(n) > 1
+            and float(conversion_factor or 1) == int(n)
+        ):
+            return round(1 / int(n), 6)
+
+    return 1.0
+
+
+def _canonical_supplier(cur, supplier):
+    cur.execute("""
+    SELECT supplier
+    FROM stock_products
+    WHERE LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+    LIMIT 1
+    """, (supplier,))
+    row = cur.fetchone()
+    return row[0] if row else supplier
+
+
+def _match_article(code, description, products, codes):
+    """
+    products : {nom_normalisé: produit}
+    codes    : {code: (product_name, factor)} pour ce fournisseur
+    """
+    if code in codes:
+        product_name, factor = codes[code]
+
+        if product_name is None:
+            return {"status": "ignored", "product_name": None, "factor": 1, "candidates": []}
+
+        if _norm_product_name(product_name) in products:
+            return {"status": "code", "product_name": product_name, "factor": factor or 1, "candidates": []}
+
+    norm = _norm_product_name(description)
+
+    if norm in products:
+        return {"status": "exact", "product_name": products[norm]["name"], "factor": 1, "candidates": []}
+
+    candidates = difflib.get_close_matches(norm, list(products.keys()), n=3, cutoff=0.6)
+    names = [products[c]["name"] for c in candidates]
+
+    if names:
+        return {
+            "status": "fuzzy",
+            "product_name": names[0],
+            "factor": _pack_factor(
+                description,
+                names[0],
+                products[candidates[0]]["conversion_factor"]
+            ),
+            "candidates": names
+        }
+
+    return {"status": "none", "product_name": None, "factor": 1, "candidates": []}
+
+
+@app.route("/admin/stock/invoices/parse", methods=["POST"])
+def stock_invoices_parse():
+    """
+    Lit plusieurs factures PDF et propose l'association article → produit.
+    Rien n'est enregistré ici : l'utilisateur vérifie puis appelle /invoices/import.
+    """
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    files = request.files.getlist("files")
+
+    if not files:
+        return jsonify({"error": "Aucun fichier fourni"}), 400
+
+    invoices = []
+
+    for f in files:
+        try:
+            parsed = parse_supplier_invoice(f.read())
+        except Exception as e:
+            parsed = {
+                "format": None, "supplier": "", "invoice_number": "",
+                "invoice_date": "", "delivery_number": "", "delivery_date": "",
+                "total_ttc": None, "lines": [], "lines_total": 0,
+                "warnings": [f"Lecture PDF impossible : {e}"]
+            }
+
+        parsed["file"] = f.filename
+        invoices.append(parsed)
+
+    articles = {}
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            supplier_cache = {}
+
+            for inv in invoices:
+
+                if not inv["format"]:
+                    inv["duplicate"] = False
+                    inv["nearby_manual"] = []
+                    inv["purchase_date"] = ""
+                    continue
+
+                supplier = _canonical_supplier(cur, inv["supplier"])
+                inv["supplier"] = supplier
+
+                # date d'achat = date de livraison (BL), sinon date facture
+                inv["purchase_date"] = inv["delivery_date"] or inv["invoice_date"]
+
+                # facture déjà importée ?
+                cur.execute("""
+                SELECT COUNT(*)
+                FROM stock_movements
+                WHERE LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                AND (
+                    invoice_ref = %s
+                    OR note ILIKE %s
+                )
+                """, (supplier, inv["invoice_number"], f"%Facture {inv['invoice_number']}%"))
+
+                inv["duplicate"] = cur.fetchone()[0] > 0
+
+                # achats saisis à la main autour de cette date → risque de doublon
+                inv["nearby_manual"] = []
+
+                if inv["purchase_date"]:
+                    cur.execute("""
+                    SELECT COALESCE(purchase_date, created_at::date) AS d, COUNT(*)
+                    FROM stock_movements
+                    WHERE movement_type = 'ACHAT'
+                    AND invoice_ref IS NULL
+                    AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                    AND COALESCE(purchase_date, created_at::date)
+                        BETWEEN %s::date - 3 AND %s::date + 3
+                    GROUP BY d
+                    ORDER BY d
+                    """, (supplier, inv["purchase_date"], inv["purchase_date"]))
+
+                    inv["nearby_manual"] = [
+                        {"date": r[0].isoformat(), "count": r[1]}
+                        for r in cur.fetchall()
+                    ]
+
+                # produits + codes mémorisés du fournisseur
+                if supplier.lower() not in supplier_cache:
+
+                    cur.execute("""
+                    SELECT name, purchase_unit, stock_unit, conversion_factor, last_purchase_price
+                    FROM stock_products
+                    WHERE LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                    """, (supplier,))
+
+                    products = {
+                        _norm_product_name(r[0]): {"name": r[0], "conversion_factor": r[3]}
+                        for r in cur.fetchall()
+                    }
+
+                    cur.execute("""
+                    SELECT code, product_name, factor
+                    FROM stock_supplier_codes
+                    WHERE LOWER(supplier) = LOWER(%s)
+                    """, (supplier,))
+
+                    codes = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+
+                    supplier_cache[supplier.lower()] = (products, codes)
+
+                products, codes = supplier_cache[supplier.lower()]
+
+                for line in inv["lines"]:
+
+                    key = f"{supplier.lower()}__{line['code']}"
+
+                    art = articles.get(key)
+
+                    if not art:
+                        art = articles[key] = {
+                            "key": key,
+                            "supplier": supplier,
+                            "code": line["code"],
+                            "description": line["description"],
+                            "occurrences": 0,
+                            "total_quantity": 0,
+                            "last_unit_price": line["unit_price"],
+                            "last_date": "",
+                            **_match_article(line["code"], line["description"], products, codes)
+                        }
+
+                    art["occurrences"] += 1
+                    art["total_quantity"] += line["quantity"]
+
+                    if line["quantity"] > 0 and inv["purchase_date"] >= art["last_date"]:
+                        art["last_date"] = inv["purchase_date"]
+                        art["last_unit_price"] = line["unit_price"]
+
+    return jsonify({
+        "invoices": invoices,
+        "articles": list(articles.values())
+    })
+
+
+@app.route("/admin/stock/invoices/import", methods=["POST"])
+def stock_invoices_import():
+    """
+    Body :
+    {
+      "invoices": [{supplier, invoice_number, purchase_date, lines: [{code, description, quantity, unit_price, total}]}],
+      "articles": [{supplier, code, description, action: map|create|ignore,
+                    product_name, factor, purchase_unit, stock_unit, conversion_factor}]
+    }
+    """
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json or {}
+
+    invoices = data.get("invoices") or []
+    articles = {
+        f"{(a.get('supplier') or '').strip().lower()}__{a.get('code')}": a
+        for a in (data.get("articles") or [])
+    }
+
+    # toutes les lignes doivent avoir une décision
+    errors = []
+
+    for inv in invoices:
+        for line in inv.get("lines") or []:
+            key = f"{(inv.get('supplier') or '').strip().lower()}__{line.get('code')}"
+            a = articles.get(key)
+
+            if not a or a.get("action") not in ("map", "create", "ignore"):
+                errors.append(f"{inv.get('invoice_number')} : article {line.get('code')} sans décision")
+            elif a["action"] != "ignore" and not (a.get("product_name") or "").strip():
+                errors.append(f"Article {line.get('code')} : produit manquant")
+            elif a["action"] != "ignore" and not float(a.get("factor") or 0) > 0:
+                errors.append(f"Article {line.get('code')} : facteur invalide")
+
+    if errors:
+        return jsonify({"error": "Données incomplètes", "details": sorted(set(errors))}), 400
+
+    # =========================
+    # 1. nouveaux produits → Google Sheet (source of truth) puis sync
+    # =========================
+
+    to_create = [a for a in articles.values() if a.get("action") == "create"]
+    created = []
+
+    if to_create:
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+
+                rows_by_supplier = {}
+
+                for a in to_create:
+                    name = a["product_name"].strip()
+
+                    cur.execute("""
+                    SELECT 1 FROM stock_products
+                    WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+                    AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                    """, (name, a["supplier"]))
+
+                    if cur.fetchone():
+                        continue  # existe déjà → simple association
+
+                    rows_by_supplier.setdefault(a["supplier"], []).append([
+                        name,                               # Produit
+                        (a.get("purchase_unit") or "").strip(),  # Unité achat
+                        0,                                  # Stock min
+                        0,                                  # Stock Réel
+                        "",                                 # Commander
+                        "Créé par import facture"           # Note
+                    ])
+                    created.append(a)
+
+        try:
+            for supplier, rows in rows_by_supplier.items():
+                spreadsheet.worksheet(supplier).append_rows(rows)
+
+            if rows_by_supplier:
+                sync_stock()
+        except Exception as e:
+            return jsonify({"error": f"Création produits Google Sheet impossible : {e}"}), 500
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                for a in created:
+                    cur.execute("""
+                    UPDATE stock_products
+                    SET stock_unit = %s,
+                        conversion_factor = %s
+                    WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+                    AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                    """, (
+                        (a.get("stock_unit") or a.get("purchase_unit") or "").strip(),
+                        float(a.get("conversion_factor") or 1) or 1,
+                        a["product_name"].strip(),
+                        a["supplier"]
+                    ))
+
+    # =========================
+    # 2. lignes d'achat (transaction unique)
+    # =========================
+
+    conn = get_conn()
+    conn.autocommit = False
+
+    imported = []
+    skipped = []
+    line_count = 0
+    touched = set()
+
+    try:
+        with conn.cursor() as cur:
+
+            product_cache = {}
+
+            def get_product(name, supplier):
+                k = (name.strip().lower(), supplier.strip().lower())
+                if k not in product_cache:
+                    cur.execute("""
+                    SELECT name, supplier, purchase_unit
+                    FROM stock_products
+                    WHERE LOWER(TRIM(name)) = %s
+                    AND LOWER(TRIM(supplier)) = %s
+                    """, k)
+                    product_cache[k] = cur.fetchone()
+                return product_cache[k]
+
+            # codes mémorisés
+            for a in articles.values():
+                product_name = None if a["action"] == "ignore" else a["product_name"].strip()
+
+                cur.execute("""
+                INSERT INTO stock_supplier_codes
+                (supplier, code, description, product_name, factor, updated_at)
+                VALUES (%s,%s,%s,%s,%s,NOW())
+                ON CONFLICT (LOWER(supplier), code)
+                DO UPDATE SET
+                    description = EXCLUDED.description,
+                    product_name = EXCLUDED.product_name,
+                    factor = EXCLUDED.factor,
+                    updated_at = NOW()
+                """, (
+                    a["supplier"],
+                    a["code"],
+                    a.get("description"),
+                    product_name,
+                    float(a.get("factor") or 1)
+                ))
+
+            for inv in invoices:
+
+                supplier = inv["supplier"]
+                number = inv["invoice_number"]
+
+                cur.execute("""
+                SELECT COUNT(*)
+                FROM stock_movements
+                WHERE LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                AND (invoice_ref = %s OR note ILIKE %s)
+                """, (supplier, number, f"%Facture {number}%"))
+
+                if cur.fetchone()[0] > 0:
+                    skipped.append(number)
+                    continue
+
+                for line in inv["lines"]:
+
+                    a = articles[f"{supplier.strip().lower()}__{line['code']}"]
+
+                    if a["action"] == "ignore":
+                        continue
+
+                    product = get_product(a["product_name"], supplier)
+
+                    if not product:
+                        raise ValueError(f"Produit introuvable : {a['product_name']} ({supplier})")
+
+                    factor = float(a.get("factor") or 1)
+                    qty_invoice = float(line["quantity"])
+                    qty = qty_invoice * factor
+                    unit_price = float(line["unit_price"]) / factor
+                    movement_type = "ACHAT" if qty > 0 else "RETOUR"
+
+                    cur.execute("""
+                    INSERT INTO stock_movements
+                    (
+                        product_name,
+                        supplier,
+                        movement_type,
+                        quantity,
+                        purchase_quantity,
+                        purchase_unit,
+                        total_price,
+                        unit_price,
+                        purchase_date,
+                        invoice_ref,
+                        note
+                    )
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """, (
+                        product[0],
+                        product[1],
+                        movement_type,
+                        qty,
+                        qty,
+                        product[2],
+                        float(line["total"]),
+                        round(unit_price, 4),
+                        inv["purchase_date"],
+                        number,
+                        f"Facture {number} (import PDF)\n"
+                        f"{line['code']} {line['description']}\n"
+                        f"{qty_invoice:g} × {float(line['unit_price']):.2f} €"
+                    ))
+
+                    line_count += 1
+
+                    if movement_type == "ACHAT":
+                        touched.add((product[0], product[1]))
+
+                imported.append(number)
+
+            for name, supplier in touched:
+                _refresh_product_prices(cur, name, supplier)
+
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": f"Import annulé : {e}"}), 500
+
+    finally:
+        conn.close()
+
+    return jsonify({
+        "success": True,
+        "imported": imported,
+        "skipped": skipped,
+        "lines": line_count,
+        "created_products": [a["product_name"] for a in created]
+    })
 
 
 @app.route("/admin/stock/refresh", methods=["POST"])
