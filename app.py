@@ -1907,6 +1907,85 @@ def stock_history():
 
     return jsonify(result)
 
+
+@app.route("/admin/stock/delete-movement", methods=["POST"])
+def stock_delete_movement():
+    """
+    Supprime une ligne d'historique (saisie erronée).
+    Si c'est un ACHAT, recalcule prix moyen + dernier prix d'achat du produit.
+    """
+
+    if not check_admin(request):
+        return jsonify({"error":"unauthorized"}), 403
+
+    movement_id = int(request.json.get("id"))
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+            DELETE FROM stock_movements
+            WHERE id = %s
+            RETURNING product_name, supplier, movement_type
+            """, (movement_id,))
+
+            row = cur.fetchone()
+
+            if not row:
+                return jsonify({"error":"not found"}), 404
+
+            product_name, supplier, movement_type = row
+
+            if movement_type == "ACHAT":
+
+                cur.execute("""
+                SELECT stock_unit, conversion_factor
+                FROM stock_products
+                WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+                AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                """, (product_name, supplier))
+
+                product = cur.fetchone()
+
+                if product:
+
+                    new_avg = _weighted_avg_price(
+                        cur,
+                        product_name,
+                        supplier,
+                        product[0],
+                        product[1]
+                    )
+
+                    cur.execute("""
+                    SELECT unit_price
+                    FROM stock_movements
+                    WHERE movement_type = 'ACHAT'
+                    AND LOWER(TRIM(product_name)) = LOWER(TRIM(%s))
+                    AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                    AND COALESCE(unit_price, 0) > 0
+                    ORDER BY COALESCE(purchase_date, created_at::date) DESC, id DESC
+                    LIMIT 1
+                    """, (product_name, supplier))
+
+                    last = cur.fetchone()
+
+                    cur.execute("""
+                    UPDATE stock_products
+                    SET average_price=%s,
+                        last_purchase_price=%s,
+                        updated_at=NOW()
+                    WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+                    AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                    """, (
+                        new_avg,
+                        float(last[0]) if last else 0,
+                        product_name,
+                        supplier
+                    ))
+
+    return jsonify({"success": True})
+
 @app.route("/admin/stock/dashboard")
 def stock_dashboard():
 
