@@ -2994,10 +2994,58 @@ def _parse_items_from_text(full_text):
 # =========================
 
 def _norm_product_name(s):
-    s = unicodedata.normalize("NFKD", str(s or ""))
+    s = str(s or "").replace("Œ", "OE").replace("œ", "oe")
+    s = unicodedata.normalize("NFKD", s)
     s = "".join(c for c in s if not unicodedata.combining(c)).upper()
     s = re.sub(r"[^A-Z0-9/.,%]+", " ", s)
+    s = re.sub(r"\b(\d+)GR\b", r"\1G", s)
+    s = re.sub(r"\b(\d+(?:[.,]\d+)?)K\b", r"\1KG", s)   # Metro : "10K" = 10 kg
+    # "800 ML" → "800ML" pour comparer les contenances
+    s = re.sub(r"\b(\d+(?:[.,]\d+)?)\s+(ML|CL|L|G|KG|MM|CM|M)\b", r"\1\2", s)
     return re.sub(r"\s+", " ", s).strip(" .")
+
+
+# mots trop courants pour départager deux produits
+_MATCH_STOPWORDS = {
+    "DE", "DU", "DES", "LA", "LE", "LES", "AU", "AUX", "ET", "EN", "A", "L", "D",
+    "MC", "C1", "FR", "FRANCE", "ES", "ESPAGNE", "ALLEMAGNE", "DEALLEMAGNE", "ITALIE", "CHINE",
+    "VN", "CH", "PRIX", "KG", "LOT", "PCE", "PC",
+}
+
+
+def _match_tokens(norm):
+    return {
+        t for t in re.split(r"[\s/.,]+", norm)
+        if t and t not in _MATCH_STOPWORDS and (len(t) > 1 or t.isdigit())
+    }
+
+
+def _similarity(a, b):
+    """a, b : noms normalisés. Mélange ressemblance de la chaîne et mots communs."""
+    seq = difflib.SequenceMatcher(None, a, b).ratio()
+
+    ta, tb = _match_tokens(a), _match_tokens(b)
+    if not ta or not tb:
+        return seq
+
+    common = ta & tb
+    # mots partiellement communs ("CREV" ↔ "CREVETTES", "PLT" ↔ "POULET" non)
+    partial = sum(
+        1 for x in ta - common
+        if len(x) >= 4 and any(y.startswith(x) or x.startswith(y) for y in tb if len(y) >= 4)
+    )
+    overlap = (len(common) + 0.7 * partial) / min(len(ta), len(tb))
+
+    score = max(seq, 0.85 * min(overlap, 1.0))
+
+    # contenances / poids différents (800ML ≠ 250ML) → produit différent
+    measure = re.compile(r"^\d+(?:\.\d+)?(?:ML|CL|L|G|KG)$")
+    na = {t for t in ta if measure.match(t)}
+    nb = {t for t in tb if measure.match(t)}
+    if na and nb:
+        score *= 0.6 + 0.4 * len(na & nb) / min(len(na), len(nb))
+
+    return score
 
 
 def _pack_factor(invoice_desc, product_name, conversion_factor=1):
@@ -3030,21 +3078,26 @@ def _pack_factor(invoice_desc, product_name, conversion_factor=1):
 
 
 def _canonical_supplier(cur, supplier):
-    cur.execute("""
-    SELECT supplier
-    FROM stock_products
-    WHERE LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
-    LIMIT 1
-    """, (supplier,))
-    row = cur.fetchone()
-    return row[0] if row else supplier
+    """Nom du fournisseur tel qu'il existe déjà (accents / casse ignorés : « Emballage futé »)."""
+    cur.execute("SELECT DISTINCT supplier FROM stock_products")
+
+    target = _norm_product_name(supplier)
+
+    for (name,) in cur.fetchall():
+        if name and _norm_product_name(name) == target:
+            return name, True
+
+    return supplier, False
 
 
-def _match_article(code, description, products, codes):
+def _match_article(code, description, products, codes, kind="product"):
     """
     products : {nom_normalisé: produit}
     codes    : {code: (product_name, factor)} pour ce fournisseur
     """
+    if kind == "discount":
+        return {"status": "discount", "product_name": None, "factor": 1, "candidates": []}
+
     if code in codes:
         product_name, factor = codes[code]
 
@@ -3059,7 +3112,11 @@ def _match_article(code, description, products, codes):
     if norm in products:
         return {"status": "exact", "product_name": products[norm]["name"], "factor": 1, "candidates": []}
 
-    candidates = difflib.get_close_matches(norm, list(products.keys()), n=3, cutoff=0.6)
+    scored = sorted(
+        ((_similarity(norm, key), key) for key in products),
+        reverse=True
+    )
+    candidates = [key for score, key in scored[:3] if score >= 0.55]
     names = [products[c]["name"] for c in candidates]
 
     if names:
@@ -3123,8 +3180,15 @@ def stock_invoices_parse():
                     inv["purchase_date"] = ""
                     continue
 
-                supplier = _canonical_supplier(cur, inv["supplier"])
+                supplier, known = _canonical_supplier(cur, inv["supplier"])
                 inv["supplier"] = supplier
+                inv["supplier_known"] = known
+
+                if not known:
+                    inv["warnings"].append(
+                        f"Fournisseur « {supplier} » absent du stock : créez l'onglet "
+                        f"« {supplier} » dans Google Sheet avant d'importer"
+                    )
 
                 # date d'achat = date de livraison (BL), sinon date facture
                 inv["purchase_date"] = inv["delivery_date"] or inv["invoice_date"]
@@ -3205,7 +3269,12 @@ def stock_invoices_parse():
                             "total_quantity": 0,
                             "last_unit_price": line["unit_price"],
                             "last_date": "",
-                            **_match_article(line["code"], line["description"], products, codes)
+                            "kind": line.get("kind", "product"),
+                            "unit_hint": line.get("unit_hint", ""),
+                            **_match_article(
+                                line["code"], line["description"], products, codes,
+                                line.get("kind", "product")
+                            )
                         }
 
                     art["occurrences"] += 1
@@ -3299,7 +3368,15 @@ def stock_invoices_import():
 
         try:
             for supplier, rows in rows_by_supplier.items():
-                spreadsheet.worksheet(supplier).append_rows(rows)
+                try:
+                    sheet = spreadsheet.worksheet(supplier)
+                except gspread.exceptions.WorksheetNotFound:
+                    return jsonify({
+                        "error": f"Onglet « {supplier} » introuvable dans Google Sheet : "
+                                 f"créez-le (mêmes colonnes que les autres fournisseurs) puis relancez l'import"
+                    }), 400
+
+                sheet.append_rows(rows)
 
             if rows_by_supplier:
                 sync_stock()
