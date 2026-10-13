@@ -1,6 +1,6 @@
 flask
 flask-cors
-stripe
+stripe==14.4.1
 python-dotenv
 gunicorn
 resend

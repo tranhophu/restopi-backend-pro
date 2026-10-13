@@ -881,8 +881,8 @@ def create_checkout_session():
     success_url = data.get("success_url") or "https://aupetitvietnam.com/success.html"
     cancel_url = data.get("cancel_url") or "https://aupetitvietnam.com"
 
+    # payment_method_types không còn được Stripe hỗ trợ → quản lý trong Dashboard
     session = stripe.checkout.Session.create(
-        payment_method_types=["card"],
         line_items=line_items,
         mode="payment",
         success_url=success_url,
