@@ -2336,14 +2336,40 @@ def add_deliveries():
 
     saved = 0
     skipped = []
+    skipped_invoices = []
 
     with get_conn() as conn:
         with conn.cursor() as cur:
+
+            # factures déjà enregistrées (import PDF ou achats) → ignorées entièrement
+            already_imported = set()
+
+            for supplier, ref in {
+                ((d.get("supplier") or "").strip(), (d.get("invoice_ref") or "").strip())
+                for d in deliveries
+                if (d.get("invoice_ref") or "").strip()
+            }:
+                cur.execute("""
+                SELECT COUNT(*)
+                FROM stock_movements
+                WHERE LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                AND (invoice_ref = %s OR note ILIKE %s)
+                """, (supplier, ref, f"%Facture {ref}%"))
+
+                if cur.fetchone()[0] > 0:
+                    already_imported.add((supplier.lower(), ref))
+                    skipped_invoices.append(ref)
 
             for d in deliveries:
 
                 product_name = d.get("product_name")
                 supplier = d.get("supplier")
+
+                if (
+                    (supplier or "").strip().lower(),
+                    (d.get("invoice_ref") or "").strip()
+                ) in already_imported:
+                    continue
 
                 quantity = float(
                     d.get("quantity") or 0
@@ -2392,7 +2418,10 @@ def add_deliveries():
                         ) / last_price
                     ) * 100
                 purchase_unit = d.get("purchase_unit")
-                invoice_ref = d.get("invoice_ref", "")
+                invoice_ref = (d.get("invoice_ref") or "").strip()
+
+                # quantité négative sur facture = retour / avoir
+                movement_type = "RETOUR" if quantity < 0 else "ACHAT"
 
                 stock_added = quantity
 
@@ -2426,15 +2455,16 @@ def add_deliveries():
 
                     purchase_date,
                     expiry_date,
+                    invoice_ref,
                     note
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, (
 
                     product_name,
                     supplier,
 
-                    "ACHAT",
+                    movement_type,
 
                     stock_added,
 
@@ -2446,8 +2476,9 @@ def add_deliveries():
 
                     purchase_date,
                     expiry_date,
+                    invoice_ref or None,
 
-                    f"""{"Facture " + invoice_ref if invoice_ref else "Livraison ERP"}
+                    f"""{"Facture " + invoice_ref + " (achats fournisseurs)" if invoice_ref else "Livraison ERP"}
 
 Achat:
 {quantity} {purchase_unit}
@@ -2459,6 +2490,17 @@ Variation prix:
 {round(price_variation, 2)}%
 """
                 ))
+
+                saved += 1
+
+                if movement_type == "RETOUR":
+                    continue  # un retour ne change pas le prix d'achat
+
+                if invoice_ref:
+                    # facture : plusieurs dates possibles dans le lot →
+                    # dernier prix = achat le plus récent par date
+                    _refresh_product_prices(cur, product_name, supplier)
+                    continue
 
                 # prix moyen pondéré (12 derniers mois, en unité stock)
                 new_avg = _weighted_avg_price(
@@ -2483,12 +2525,11 @@ Variation prix:
                     supplier
                 ))
 
-                saved += 1
-
     return jsonify({
         "success": True,
         "saved": saved,
-        "skipped": skipped
+        "skipped": skipped,
+        "skipped_invoices": sorted(set(skipped_invoices))
     })
 
 # =========================
