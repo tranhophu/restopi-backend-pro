@@ -372,11 +372,11 @@ def parse_metro(text):
 # EXOSTAR (Shopify) — prix TTC
 # =========================
 
-def _code_from_name(name):
-    """Article sans SKU : code stable dérivé du nom (mémorisable comme un vrai code)."""
+def _code_from_name(name, prefix="SANS-SKU-"):
+    """Article sans code : code stable dérivé du nom (mémorisable comme un vrai code)."""
     ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
     slug = re.sub(r"[^A-Z0-9]+", "-", ascii_name.upper()).strip("-")
-    return "SANS-SKU-" + (slug[:40] or "ARTICLE")
+    return prefix + (slug[:40] or "ARTICLE")
 
 
 def is_exostar(text):
@@ -620,6 +620,111 @@ def parse_delidrinks(text):
 # DISPATCH
 # =========================
 
+# =========================
+# NHU Y — SAS FAST VIET / Petite Asie (Chasseneuil) — prix HT, pas de code article
+# =========================
+
+_NHUY_LINE = re.compile(
+    r"^(?P<qty>-?\d+(?:,\d+)?)\s+(?P<desc>.+?)\s+"
+    r"(?P<pu>\d{1,3}(?: \d{3})*,\d{2})\s*€\s+"
+    r"(?P<total>-?\d{1,3}(?: \d{3})*,\d{2})\s*€$"
+)
+
+_FR_MONTHS = {
+    "janv": 1, "jan": 1, "fevr": 2, "févr": 2, "fev": 2, "fév": 2, "mars": 3, "avr": 4,
+    "mai": 5, "juin": 6, "juil": 7, "aout": 8, "août": 8, "sept": 9, "oct": 10,
+    "nov": 11, "dec": 12, "déc": 12,
+}
+
+
+def is_nhuy(text):
+    t = text.lower()
+    return "fast viet" in t or "petiteasie" in t or "821 959 947" in t
+
+
+def parse_nhuy(text):
+    result = _empty("nhuy", "Nhu Y")
+
+    m = re.search(r"Facture\s+num\S*\s*:\s*(\S+)", text)
+    if m:
+        result["invoice_number"] = m.group(1)
+
+    m = re.search(r"Date\s*:\s*(\d{2}/\d{2}/\d{4})", text)
+    if m:
+        result["invoice_date"] = _iso(m.group(1))
+
+    m = re.search(r"Total TTC\s+(\d{1,3}(?: \d{3})*,\d{2})", text)
+    if m:
+        result["total_ttc"] = _num(m.group(1))
+
+    m = re.search(r"Total HT\s+(\d{1,3}(?: \d{3})*,\d{2})", text)
+    total_ht = _num(m.group(1)) if m else None
+
+    # TVA de la facture : taux qui ont un montant (« T.V.A 5,5% 15,53 € », « T.V.A 10% » vide)
+    rates = [
+        _num(rate)
+        for rate, amount in re.findall(r"T\.?V\.?A\.?\s*(\d+(?:,\d+)?)\s*%\s*(\d{1,3}(?: \d{3})*,\d{2})?", text)
+        if amount and _num(amount) > 0
+    ]
+
+    if len(rates) == 1:
+        rate = rates[0]
+    elif total_ht and result["total_ttc"]:
+        # plusieurs taux sans détail par ligne → taux moyen de la facture
+        rate = round((result["total_ttc"] / total_ht - 1) * 100, 2)
+        result["warnings"].append(
+            f"Plusieurs taux de TVA sans détail par ligne : taux moyen {rate} % appliqué"
+        )
+    else:
+        rate = 5.5
+        result["warnings"].append("Taux de TVA introuvable : 5,5 % appliqué")
+
+    for raw in text.split("\n"):
+        lm = _NHUY_LINE.match(raw.strip())
+        if not lm:
+            continue
+
+        qty = _num(lm.group("qty"))
+        total_ht_line = _num(lm.group("total"))
+        desc = lm.group("desc")
+
+        if qty == 0:
+            continue
+
+        # prix affiché arrondi (52 × 0,64 ≠ 33,37) → prix réel = total ÷ quantité
+        result["lines"].append(_line(
+            _code_from_name(desc, prefix="NHUY-"),
+            desc,
+            qty,
+            _ttc(total_ht_line / qty, rate),
+            _ttc(total_ht_line, rate),
+            rate,
+        ))
+
+    # facture récapitulative : tableau des livraisons « 26-mars 120 50 », « 24-avr 120 50 24 »
+    deliveries = []
+    year = int(result["invoice_date"][:4]) if result["invoice_date"] else None
+    invoice_month = int(result["invoice_date"][5:7]) if result["invoice_date"] else None
+
+    for day, month in re.findall(r"^(\d{1,2})-([a-zéû]+)\.?(?:\s+\d+)+\s*$", text, re.M | re.I):
+        mon = _FR_MONTHS.get(month.lower().rstrip("."))
+        if not mon or not year:
+            continue
+        y = year - 1 if invoice_month and mon > invoice_month else year
+        deliveries.append(f"{y}-{mon:02d}-{int(day):02d}")
+
+    if deliveries:
+        deliveries.sort()
+        result["delivery_date"] = deliveries[-1]
+        result["warnings"].append(
+            "Facture récapitulative, livraisons du "
+            + ", ".join(f"{d[8:10]}/{d[5:7]}" for d in deliveries)
+            + f" : date d'achat = dernière livraison ({deliveries[-1][8:10]}/{deliveries[-1][5:7]}), modifiable"
+        )
+
+    return _finalize(result)
+
+
 def parse_supplier_invoice(pdf_bytes):
     text = extract_text(pdf_bytes)
 
@@ -639,9 +744,12 @@ def parse_supplier_invoice(pdf_bytes):
     if is_yenanh(text):
         return parse_yenanh(text)
 
+    if is_nhuy(text):
+        return parse_nhuy(text)
+
     result = _empty(None, "")
     result["lines_total"] = 0
     result["warnings"].append(
-        "Format de facture non reconnu (gérés : Yen Anh, Metro, Exostar, Emballage futé, Delidrinks)"
+        "Format de facture non reconnu (gérés : Yen Anh, Metro, Exostar, Emballage futé, Delidrinks, Nhu Y)"
     )
     return result
