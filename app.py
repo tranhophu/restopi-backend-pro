@@ -533,6 +533,44 @@ def init_stock():
             ON recipe_ingredients (menu_product_id);
             """)
 
+            # ligne = produit stock OU préparation maison ; unité de saisie (g, cl…) optionnelle
+            cur.execute("""
+            ALTER TABLE recipe_ingredients
+            ADD COLUMN IF NOT EXISTS preparation_id INTEGER,
+            ADD COLUMN IF NOT EXISTS unit TEXT;
+            """)
+
+            # préparations maison (sauce nuoc mam 8 L, bouillon…) : coût par unité de rendement
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS preparations (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                yield_qty FLOAT NOT NULL DEFAULT 1,
+                yield_unit TEXT NOT NULL DEFAULT 'L',
+                extra_cost FLOAT DEFAULT 0,
+                note TEXT,
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+            """)
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS preparation_ingredients (
+                id SERIAL PRIMARY KEY,
+                preparation_id INTEGER NOT NULL,
+                product_name TEXT NOT NULL DEFAULT '',
+                supplier TEXT NOT NULL DEFAULT '',
+                sub_preparation_id INTEGER,
+                quantity FLOAT NOT NULL,
+                unit TEXT,
+                note TEXT
+            );
+            """)
+
+            cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_preparation_ingredients_prep
+            ON preparation_ingredients (preparation_id);
+            """)
+
 init_stock()
 
 @app.route("/customer/set-pin", methods=["POST"])
@@ -1897,6 +1935,7 @@ def rename_stock_product():
                 "stock_reference_prices",
                 "stock_supplier_codes",
                 "recipe_ingredients",
+                "preparation_ingredients",
             ):
                 cur.execute(f"""
                 UPDATE {table} SET product_name = %s
@@ -4152,23 +4191,98 @@ def costing_data():
             }
 
             cur.execute("""
-            SELECT menu_product_id, product_name, supplier, quantity, note
+            SELECT menu_product_id, product_name, supplier, quantity, note, preparation_id, unit
             FROM recipe_ingredients
             ORDER BY id
             """)
             for r in cur.fetchall():
                 recipes.setdefault(r[0], {
                     "portions": 1, "extra_cost": 0, "note": "", "updated_at": "", "ingredients": []
-                })["ingredients"].append({
-                    "product_name": r[1], "supplier": r[2],
-                    "quantity": float(r[3] or 0), "note": r[4] or ""
-                })
+                })["ingredients"].append(_ingredient_json(r[1], r[2], r[5], r[3], r[6], r[4]))
+
+            cur.execute("""
+            SELECT id, name, yield_qty, yield_unit, extra_cost, note, updated_at
+            FROM preparations
+            ORDER BY name
+            """)
+            preparations = {
+                r[0]: {
+                    "id": r[0], "name": r[1], "yield_qty": float(r[2] or 1),
+                    "yield_unit": r[3] or "L", "extra_cost": float(r[4] or 0),
+                    "note": r[5] or "", "updated_at": r[6].isoformat() if r[6] else "",
+                    "ingredients": []
+                }
+                for r in cur.fetchall()
+            }
+
+            cur.execute("""
+            SELECT preparation_id, product_name, supplier, quantity, note, sub_preparation_id, unit
+            FROM preparation_ingredients
+            ORDER BY id
+            """)
+            for r in cur.fetchall():
+                if r[0] in preparations:
+                    preparations[r[0]]["ingredients"].append(
+                        _ingredient_json(r[1], r[2], r[5], r[3], r[6], r[4])
+                    )
 
     return jsonify({
         "menu": menu,
         "stock": stock,
-        "recipes": {str(k): v for k, v in recipes.items()}
+        "recipes": {str(k): v for k, v in recipes.items()},
+        "preparations": list(preparations.values())
     })
+
+
+def _ingredient_json(product_name, supplier, preparation_id, quantity, unit, note):
+    return {
+        "product_name": product_name or "",
+        "supplier": supplier or "",
+        "preparation_id": preparation_id,
+        "quantity": float(quantity or 0),
+        "unit": unit or "",
+        "note": note or ""
+    }
+
+
+def _parse_ingredient_lines(lines):
+    """
+    → (liste [(product_name, supplier, preparation_id, qty, unit, note)], erreur)
+    Une ligne = produit stock (nom + fournisseur) OU préparation maison (preparation_id).
+    """
+    result = []
+
+    for ing in lines or []:
+        name = (ing.get("product_name") or "").strip()
+        supplier = (ing.get("supplier") or "").strip()
+        prep_id = ing.get("preparation_id")
+
+        try:
+            prep_id = int(prep_id) if prep_id not in (None, "") else None
+        except (TypeError, ValueError):
+            prep_id = None
+
+        if not prep_id and (not name or not supplier):
+            continue
+
+        try:
+            qty = float(ing.get("quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+
+        if qty <= 0:
+            return None, f"Quantité invalide pour « {name or 'préparation'} »"
+
+        result.append((
+            "" if prep_id else name,
+            "" if prep_id else supplier,
+            prep_id,
+            qty,
+            (ing.get("unit") or "").strip(),
+            (ing.get("note") or "").strip()
+        ))
+
+    return result, None
 
 
 @app.route("/admin/costing/recipe", methods=["POST"])
@@ -4194,24 +4308,10 @@ def costing_save_recipe():
     if portions <= 0:
         return jsonify({"error": "Nombre de portions invalide (> 0)"}), 400
 
-    ingredients = []
+    ingredients, error = _parse_ingredient_lines(data.get("ingredients"))
 
-    for ing in data.get("ingredients") or []:
-        name = (ing.get("product_name") or "").strip()
-        supplier = (ing.get("supplier") or "").strip()
-
-        try:
-            qty = float(ing.get("quantity") or 0)
-        except (TypeError, ValueError):
-            qty = 0
-
-        if not name or not supplier:
-            continue
-
-        if qty <= 0:
-            return jsonify({"error": f"Quantité invalide pour « {name} »"}), 400
-
-        ingredients.append((name, supplier, qty, (ing.get("note") or "").strip()))
+    if error:
+        return jsonify({"error": error}), 400
 
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -4236,11 +4336,120 @@ def costing_save_recipe():
                           updated_at = NOW()
             """, (menu_id, portions, extra_cost, (data.get("note") or "").strip()))
 
-            for name, supplier, qty, note in ingredients:
+            for name, supplier, prep_id, qty, unit, note in ingredients:
                 cur.execute("""
-                INSERT INTO recipe_ingredients (menu_product_id, product_name, supplier, quantity, note)
+                INSERT INTO recipe_ingredients
+                (menu_product_id, product_name, supplier, preparation_id, quantity, unit, note)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                """, (menu_id, name, supplier, prep_id, qty, unit, note))
+
+    return jsonify({"success": True})
+
+
+@app.route("/admin/costing/preparation", methods=["POST"])
+def costing_save_preparation():
+    """
+    Body : {id?, name, yield_qty, yield_unit, extra_cost, note,
+            ingredients: [{product_name, supplier | preparation_id, quantity, unit, note}]}
+    Crée (sans id) ou remplace une préparation maison. Retour : {success, id}
+    """
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json or {}
+    name = (data.get("name") or "").strip()
+    yield_unit = (data.get("yield_unit") or "").strip()
+
+    try:
+        yield_qty = float(data.get("yield_qty") or 0)
+        extra_cost = float(data.get("extra_cost") or 0)
+        prep_id = int(data["id"]) if data.get("id") not in (None, "") else None
+    except (TypeError, ValueError):
+        return jsonify({"error": "Données invalides"}), 400
+
+    if not name:
+        return jsonify({"error": "Nom de la préparation obligatoire"}), 400
+
+    if yield_qty <= 0 or not yield_unit:
+        return jsonify({"error": "Rendement obligatoire (ex : 8 L)"}), 400
+
+    ingredients, error = _parse_ingredient_lines(data.get("ingredients"))
+
+    if error:
+        return jsonify({"error": error}), 400
+
+    if prep_id and any(line[2] == prep_id for line in ingredients):
+        return jsonify({"error": "Une préparation ne peut pas s'utiliser elle-même"}), 400
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            if prep_id:
+                cur.execute("""
+                UPDATE preparations
+                SET name=%s, yield_qty=%s, yield_unit=%s, extra_cost=%s, note=%s, updated_at=NOW()
+                WHERE id=%s
+                """, (name, yield_qty, yield_unit, extra_cost, (data.get("note") or "").strip(), prep_id))
+
+                if cur.rowcount == 0:
+                    return jsonify({"error": "Préparation introuvable"}), 404
+
+                cur.execute("DELETE FROM preparation_ingredients WHERE preparation_id = %s", (prep_id,))
+            else:
+                cur.execute("""
+                INSERT INTO preparations (name, yield_qty, yield_unit, extra_cost, note)
                 VALUES (%s,%s,%s,%s,%s)
-                """, (menu_id, name, supplier, qty, note))
+                RETURNING id
+                """, (name, yield_qty, yield_unit, extra_cost, (data.get("note") or "").strip()))
+                prep_id = cur.fetchone()[0]
+
+            for pname, supplier, sub_id, qty, unit, note in ingredients:
+                cur.execute("""
+                INSERT INTO preparation_ingredients
+                (preparation_id, product_name, supplier, sub_preparation_id, quantity, unit, note)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                """, (prep_id, pname, supplier, sub_id, qty, unit, note))
+
+    return jsonify({"success": True, "id": prep_id})
+
+
+@app.route("/admin/costing/preparation/delete", methods=["POST"])
+def costing_delete_preparation():
+    """Body : {id}. Refusé si la préparation est utilisée par un plat ou une autre préparation."""
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    try:
+        prep_id = int((request.json or {}).get("id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Préparation invalide"}), 400
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+            SELECT DISTINCT p.name
+            FROM recipe_ingredients ri
+            JOIN products p ON p.id = ri.menu_product_id
+            WHERE ri.preparation_id = %s
+            """, (prep_id,))
+            used = [r[0] for r in cur.fetchall()]
+
+            cur.execute("""
+            SELECT DISTINCT pr.name
+            FROM preparation_ingredients pi
+            JOIN preparations pr ON pr.id = pi.preparation_id
+            WHERE pi.sub_preparation_id = %s
+            """, (prep_id,))
+            used += [f"🥣 {r[0]}" for r in cur.fetchall()]
+
+            if used:
+                return jsonify({"error": "Utilisée dans : " + ", ".join(used)}), 400
+
+            cur.execute("DELETE FROM preparation_ingredients WHERE preparation_id = %s", (prep_id,))
+            cur.execute("DELETE FROM preparations WHERE id = %s", (prep_id,))
 
     return jsonify({"success": True})
 

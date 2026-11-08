@@ -6,6 +6,7 @@ import os
 import re
 from dotenv import load_dotenv
 from datetime import datetime
+import pytz
 
 load_dotenv()
 
@@ -53,7 +54,7 @@ SHEET_ID = "1LUG-_t_H4Ol4QCUZX0lDTdQa3ISWB5m6qUDhXa4LxU0"
 
 spreadsheet = client.open_by_key(SHEET_ID)
 
-today = datetime.now().date()
+PARIS_TZ = pytz.timezone("Europe/Paris")
 
 def extract_number(value):
 
@@ -83,6 +84,10 @@ def parse_sheet_date(value):
         return None
 
 def sync_stock():
+
+    # date du jour à Paris, recalculée à chaque synchro
+    # (avant : calculée une seule fois au démarrage du serveur, en UTC)
+    today = datetime.now(PARIS_TZ).date()
 
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = True
