@@ -11,7 +11,8 @@ Chaque parser renvoie :
     "delivery_date": "2026-09-09",
     "total_ttc": 739.25,
     "lines": [
-        {"code", "description", "quantity", "unit_price", "total", "tva", "unit_hint", "kind"}
+        {"code", "description", "quantity", "unit_price", "total", "tva", "unit_hint", "kind",
+         "quantity_source"}   # "invoice" | "deduced" (montant ÷ P.U.) | "history" | "missing"
     ],
     "lines_total": 739.25,
     "warnings": [...]
@@ -73,17 +74,28 @@ def _empty(fmt, supplier):
     }
 
 
-def _line(code, description, quantity, unit_price, total, tva=None, unit_hint="", kind="product"):
+def _line(code, description, quantity, unit_price, total, tva=None, unit_hint="", kind="product",
+          quantity_source="invoice"):
     return {
         "code": str(code),
         "description": re.sub(r"\s+", " ", description).strip(),
-        "quantity": round(quantity, 3),
-        "unit_price": round(unit_price, 4),
+        "quantity": round(quantity, 3) if quantity is not None else None,
+        "unit_price": round(unit_price, 4) if unit_price is not None else None,
         "total": round(total, 2),
         "tva": tva,
         "unit_hint": unit_hint,
         "kind": kind,
+        "quantity_source": quantity_source,
     }
+
+
+def _deduce_quantity(total, unit_price):
+    """Colonne quantité vide : quantité = montant ÷ prix unitaire (None si impossible)."""
+    if not unit_price:
+        return None
+    qty = total / unit_price
+    # arrondi : entier si très proche, sinon 3 décimales (articles au kg)
+    return float(round(qty)) if abs(qty - round(qty)) < 0.02 else round(qty, 3)
 
 
 def _finalize(result):
@@ -124,6 +136,46 @@ _YENANH_LINE = re.compile(
 )
 
 
+# même ligne mais colonne « Qté » vide (certaines factures EBP) :
+# "600165 GIO DAC BIET PATE DE PORC LKV 5,15 4,88 15,45 5,50"
+_YENANH_LINE_NO_QTY = re.compile(
+    rf"^(?P<code>\d{{5,7}})\s+(?P<desc>.+?)\s+"
+    rf"(?P<pu_ttc>{_AMOUNT})\s+(?P<pu_ht>{_AMOUNT})\s+"
+    rf"(?:(?P<remise>{_AMOUNT})\s+)?"
+    rf"(?P<total>{_TOTAL})\s+(?P<tva>\d+,\d{{2}})$"
+)
+
+# seulement montant + TVA lisibles
+_YENANH_LINE_TOTAL_ONLY = re.compile(
+    rf"^(?P<code>\d{{5,7}})\s+(?P<desc>.+?)\s+"
+    rf"(?P<total>{_TOTAL})\s+(?P<tva>\d+,\d{{2}})$"
+)
+
+
+def _parse_yenanh_line(line):
+    """
+    → (code, description, quantité | None, P.U. TTC | None, montant TTC, TVA) ou None.
+    Le format complet (avec quantité) reste prioritaire ; les variantes sans quantité
+    ne sont essayées que s'il ne correspond pas.
+    """
+    lm = _YENANH_LINE.match(line)
+    if lm:
+        return (lm.group("code"), lm.group("desc"), _num(lm.group("qty")),
+                _num(lm.group("pu_ttc")), _num(lm.group("total")), _num(lm.group("tva")))
+
+    lm = _YENANH_LINE_NO_QTY.match(line)
+    if lm:
+        return (lm.group("code"), lm.group("desc"), None,
+                _num(lm.group("pu_ttc")), _num(lm.group("total")), _num(lm.group("tva")))
+
+    lm = _YENANH_LINE_TOTAL_ONLY.match(line)
+    if lm:
+        return (lm.group("code"), lm.group("desc"), None,
+                None, _num(lm.group("total")), _num(lm.group("tva")))
+
+    return None
+
+
 def is_yenanh(text):
     t = text.lower()
     return "yenanh.fr" in t or "413 357 286" in t
@@ -132,43 +184,71 @@ def is_yenanh(text):
 def parse_yenanh(text):
     result = _empty("yenanh", "Yen Anh")
 
-    m = re.search(r"FACTURE\s+(FA\d+)", text)
+    # "FACTURE FA202609063" ou (autre modèle EBP) "Facture N° FA202602058"
+    m = re.search(r"FACTURE\s+(FA\d+)", text) or re.search(r"Facture\s+N\S*\s*(FA\d+)", text)
     if m:
         result["invoice_number"] = m.group(1)
 
     # ligne sous l'entête : "10/09/2026 86RESTOPI 10/09/2026 Virement Bancaire"
-    m = re.search(r"(\d{2}/\d{2}/\d{4})\s+\S+\s+\d{2}/\d{2}/\d{4}", text)
+    # ou "FA202602058 12/02/2026 86RESTOPI Virement Bancaire"
+    m = re.search(r"(\d{2}/\d{2}/\d{4})\s+\S+\s+\d{2}/\d{2}/\d{4}", text) or re.search(
+        r"FA\d+\s+(\d{2}/\d{2}/\d{4})", text
+    )
     if m:
         result["invoice_date"] = _iso(m.group(1))
 
-    # "Transformé de : Bon de livraison N° BL202609103 du 09/09/2026."
-    m = re.search(r"(BL\d+)\s+du\s+(\d{2}/\d{2}/\d{4})", text)
+    # "Transformé de : Bon de livraison N° BL202609103 du 09/09/2026." (parfois "11/ 02/ 2026")
+    m = re.search(r"(BL\d+)\s+du\s+(\d{2}/\s*\d{2}/\s*\d{4})", text)
     if m:
         result["delivery_number"] = m.group(1)
-        result["delivery_date"] = _iso(m.group(2))
+        result["delivery_date"] = _iso(re.sub(r"\s+", "", m.group(2)))
+    else:
+        m = re.search(r"Date de livraison\s*:\s*(\d{2}/\d{2}/\d{4})", text)
+        if m:
+            result["delivery_date"] = _iso(m.group(1))
 
     m = re.search(r"Total TTC\s+(\d{1,3}(?: \d{3})*,\d{2})", text)
     if m:
         result["total_ttc"] = _num(m.group(1))
+    else:
+        # libellés et montants séparés : "Net à payer … 350,80 €" (hors « Capital : 40 000,00 € »)
+        without_capital = re.sub(r"Capital\s*:\s*[\d ,.]+€", "", text)
+        amounts = [_num(a) for a in re.findall(r"(\d{1,3}(?: \d{3})*,\d{2})\s*€", without_capital)]
+        if amounts:
+            result["total_ttc"] = max(amounts)
 
     for raw in text.split("\n"):
-        lm = _YENANH_LINE.match(raw.strip())
-        if not lm:
+        parsed = _parse_yenanh_line(raw.strip())
+        if not parsed:
             continue
 
-        qty = _num(lm.group("qty"))
-        pu = _num(lm.group("pu_ttc"))
-        total = _num(lm.group("total"))
+        code, desc, qty, pu, total, tva = parsed
+        source = "invoice"
+
+        if qty is None:
+            # colonne quantité vide → montant ÷ P.U. ; sinon vide (complétée par l'historique côté serveur)
+            if total == 0:
+                continue
+            qty = _deduce_quantity(total, pu)
+            source = "deduced" if qty is not None else "missing"
 
         if qty == 0:
             continue
 
-        if abs(qty * pu - total) > 0.05:
-            result["warnings"].append(f"{lm.group('code')} {lm.group('desc')} : {qty} × {pu} ≠ {total}")
+        if source == "invoice" and abs(qty * pu - total) > 0.05:
+            result["warnings"].append(f"{code} {desc} : {qty} × {pu} ≠ {total}")
 
-        result["lines"].append(
-            _line(lm.group("code"), lm.group("desc"), qty, pu, total, _num(lm.group("tva")))
+        result["lines"].append(_line(code, desc, qty, pu, total, tva, quantity_source=source))
+
+    deduced = sum(1 for l in result["lines"] if l["quantity_source"] == "deduced")
+    missing = sum(1 for l in result["lines"] if l["quantity_source"] == "missing")
+
+    if deduced:
+        result["warnings"].append(
+            f"Quantités absentes de la facture : {deduced} ligne(s) déduite(s) (montant ÷ P.U.) — à vérifier"
         )
+    if missing:
+        result["warnings"].append(f"{missing} ligne(s) sans quantité ni prix unitaire lisibles")
 
     return _finalize(result)
 

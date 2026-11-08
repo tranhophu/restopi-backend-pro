@@ -3588,6 +3588,27 @@ def _match_article(code, description, products, codes, kind="product"):
     return {"status": "none", "product_name": None, "factor": 1, "candidates": []}
 
 
+def _guess_quantity_from_history(line, art, products):
+    """
+    Ligne de facture sans quantité ni prix unitaire lisibles :
+    quantité ≈ montant ÷ (dernier prix d'achat du produit × facteur), arrondie (≥ 1).
+    Sans produit associé ou sans historique → la quantité reste vide (à saisir).
+    """
+    product = products.get(_norm_product_name(art.get("product_name") or ""))
+    last_price = float((product or {}).get("last_purchase_price") or 0)
+    total = float(line.get("total") or 0)
+
+    if last_price <= 0 or total <= 0:
+        return
+
+    invoice_unit_price = last_price * float(art.get("factor") or 1)
+    qty = max(1, round(total / invoice_unit_price))
+
+    line["quantity"] = float(qty)
+    line["unit_price"] = round(total / qty, 4)
+    line["quantity_source"] = "history"
+
+
 @app.route("/admin/stock/invoices/parse", methods=["POST"])
 def stock_invoices_parse():
     """
@@ -3681,7 +3702,11 @@ def stock_invoices_parse():
                     """, (supplier,))
 
                     products = {
-                        _norm_product_name(r[0]): {"name": r[0], "conversion_factor": r[3]}
+                        _norm_product_name(r[0]): {
+                            "name": r[0],
+                            "conversion_factor": r[3],
+                            "last_purchase_price": r[4]
+                        }
                         for r in cur.fetchall()
                     }
 
@@ -3711,7 +3736,7 @@ def stock_invoices_parse():
                             "description": line["description"],
                             "occurrences": 0,
                             "total_quantity": 0,
-                            "last_unit_price": line["unit_price"],
+                            "last_unit_price": line["unit_price"] or 0,
                             "last_date": "",
                             "kind": line.get("kind", "product"),
                             "unit_hint": line.get("unit_hint", ""),
@@ -3721,10 +3746,14 @@ def stock_invoices_parse():
                             )
                         }
 
-                    art["occurrences"] += 1
-                    art["total_quantity"] += line["quantity"]
+                    # quantité illisible sur la facture → estimée d'après le dernier prix d'achat
+                    if line.get("quantity") is None:
+                        _guess_quantity_from_history(line, art, products)
 
-                    if line["quantity"] > 0 and inv["purchase_date"] >= art["last_date"]:
+                    art["occurrences"] += 1
+                    art["total_quantity"] += line["quantity"] or 0
+
+                    if (line["quantity"] or 0) > 0 and inv["purchase_date"] >= art["last_date"]:
                         art["last_date"] = inv["purchase_date"]
                         art["last_unit_price"] = line["unit_price"]
 
@@ -3770,6 +3799,12 @@ def stock_invoices_import():
                 errors.append(f"Article {line.get('code')} : produit manquant")
             elif a["action"] != "ignore" and not float(a.get("factor") or 0) > 0:
                 errors.append(f"Article {line.get('code')} : facteur invalide")
+            elif a["action"] != "ignore" and line.get("quantity") is None:
+                errors.append(
+                    f"{inv.get('invoice_number')} : quantité illisible pour {line.get('code')} "
+                    f"{line.get('description', '')} — importez cette facture depuis « Achats fournisseurs » "
+                    f"pour saisir la quantité"
+                )
 
     if errors:
         return jsonify({"error": "Données incomplètes", "details": sorted(set(errors))}), 400
