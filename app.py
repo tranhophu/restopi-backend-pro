@@ -596,6 +596,22 @@ def init_stock():
             );
             """)
 
+            # quantité vendue par le concurrent pour ce prix (ex : 4 nems) — NULL = même portion que nous
+            cur.execute("""
+            ALTER TABLE competitor_prices
+            ADD COLUMN IF NOT EXISTS quantity FLOAT;
+            """)
+
+            # notre portion par plat (ex : 2 pce, 350 g) → comparaison à portion égale
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS menu_portions (
+                menu_product_id INTEGER PRIMARY KEY,
+                quantity FLOAT NOT NULL,
+                unit TEXT NOT NULL DEFAULT 'pce',
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+            """)
+
 init_stock()
 
 @app.route("/customer/set-pin", methods=["POST"])
@@ -4255,14 +4271,21 @@ def costing_data():
             competitors = [{"id": r[0], "name": r[1], "note": r[2] or ""} for r in cur.fetchall()]
 
             cur.execute("""
-            SELECT menu_product_id, competitor_id, price, updated_at
+            SELECT menu_product_id, competitor_id, price, updated_at, quantity
             FROM competitor_prices
             """)
             competitor_prices = [
                 {
                     "menu_product_id": r[0], "competitor_id": r[1], "price": float(r[2]),
-                    "updated_at": r[3].isoformat() if r[3] else ""
+                    "updated_at": r[3].isoformat() if r[3] else "",
+                    "quantity": float(r[4]) if r[4] is not None else None
                 }
+                for r in cur.fetchall()
+            ]
+
+            cur.execute("SELECT menu_product_id, quantity, unit FROM menu_portions")
+            portions = [
+                {"menu_product_id": r[0], "quantity": float(r[1]), "unit": r[2] or "pce"}
                 for r in cur.fetchall()
             ]
 
@@ -4272,7 +4295,8 @@ def costing_data():
         "recipes": {str(k): v for k, v in recipes.items()},
         "preparations": list(preparations.values()),
         "competitors": competitors,
-        "competitor_prices": competitor_prices
+        "competitor_prices": competitor_prices,
+        "portions": portions
     })
 
 
@@ -4580,6 +4604,16 @@ def costing_save_competitor_price():
 
     raw = data.get("price")
     price = None
+    quantity = None
+
+    if data.get("quantity") not in (None, ""):
+        try:
+            quantity = float(str(data.get("quantity")).replace(",", "."))
+        except ValueError:
+            return jsonify({"error": "Quantité invalide"}), 400
+
+        if quantity <= 0:
+            return jsonify({"error": "Quantité invalide"}), 400
 
     if raw not in (None, ""):
         try:
@@ -4601,16 +4635,61 @@ def costing_save_competitor_price():
                 return jsonify({"success": True, "deleted": True})
 
             cur.execute("""
-            INSERT INTO competitor_prices (menu_product_id, competitor_id, price, updated_at)
-            VALUES (%s,%s,%s,NOW())
+            INSERT INTO competitor_prices (menu_product_id, competitor_id, price, quantity, updated_at)
+            VALUES (%s,%s,%s,%s,NOW())
             ON CONFLICT (menu_product_id, competitor_id)
-            DO UPDATE SET price = EXCLUDED.price, updated_at = NOW()
+            DO UPDATE SET price = EXCLUDED.price, quantity = EXCLUDED.quantity, updated_at = NOW()
             RETURNING updated_at
-            """, (menu_id, comp_id, price))
+            """, (menu_id, comp_id, price, quantity))
 
             updated_at = cur.fetchone()[0]
 
-    return jsonify({"success": True, "price": price, "updated_at": updated_at.isoformat()})
+    return jsonify({
+        "success": True, "price": price, "quantity": quantity,
+        "updated_at": updated_at.isoformat()
+    })
+
+
+@app.route("/admin/costing/portion", methods=["POST"])
+def costing_save_portion():
+    """Body : {menu_product_id, quantity, unit} — quantité vide → portion supprimée."""
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json or {}
+
+    try:
+        menu_id = int(data.get("menu_product_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Plat invalide"}), 400
+
+    unit = (data.get("unit") or "pce").strip()[:20] or "pce"
+    raw = data.get("quantity")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            if raw in (None, ""):
+                cur.execute("DELETE FROM menu_portions WHERE menu_product_id = %s", (menu_id,))
+                return jsonify({"success": True, "deleted": True})
+
+            try:
+                quantity = float(str(raw).replace(",", "."))
+            except ValueError:
+                return jsonify({"error": "Quantité invalide"}), 400
+
+            if quantity <= 0:
+                return jsonify({"error": "Quantité invalide"}), 400
+
+            cur.execute("""
+            INSERT INTO menu_portions (menu_product_id, quantity, unit, updated_at)
+            VALUES (%s,%s,%s,NOW())
+            ON CONFLICT (menu_product_id)
+            DO UPDATE SET quantity = EXCLUDED.quantity, unit = EXCLUDED.unit, updated_at = NOW()
+            """, (menu_id, quantity, unit))
+
+    return jsonify({"success": True, "quantity": quantity, "unit": unit})
 
 
 @app.route("/admin/costing/purchase-tva", methods=["POST"])
