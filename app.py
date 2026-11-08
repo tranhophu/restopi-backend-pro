@@ -492,6 +492,47 @@ def init_stock():
             ON stock_supplier_codes (LOWER(supplier), code);
             """)
 
+            # =========================
+            # COÛT DES PLATS (fiches techniques)
+            # =========================
+
+            # TVA d'achat (prix stock enregistrés en TTC → HT pour le coût matière)
+            cur.execute("""
+            ALTER TABLE stock_products
+            ADD COLUMN IF NOT EXISTS purchase_tva FLOAT DEFAULT 5.5;
+            """)
+
+            # une fiche par plat du menu (table products)
+            # portions : nb de portions produites par la recette (ex : sauce pour 20 plats)
+            # extra_cost : coût HT fixe ajouté (gaz, garniture non suivie en stock…)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS recipes (
+                menu_product_id INTEGER PRIMARY KEY,
+                portions FLOAT DEFAULT 1,
+                extra_cost FLOAT DEFAULT 0,
+                note TEXT,
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+            """)
+
+            # ingrédients : produit stock par nom + fournisseur (comme les autres tables stock,
+            # les id changent quand Google Sheet recrée un produit), quantité en unité stock
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS recipe_ingredients (
+                id SERIAL PRIMARY KEY,
+                menu_product_id INTEGER NOT NULL,
+                product_name TEXT NOT NULL,
+                supplier TEXT NOT NULL,
+                quantity FLOAT NOT NULL,
+                note TEXT
+            );
+            """)
+
+            cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_recipe_ingredients_menu
+            ON recipe_ingredients (menu_product_id);
+            """)
+
 init_stock()
 
 @app.route("/customer/set-pin", methods=["POST"])
@@ -1855,6 +1896,7 @@ def rename_stock_product():
                 "stock_snapshots",
                 "stock_reference_prices",
                 "stock_supplier_codes",
+                "recipe_ingredients",
             ):
                 cur.execute(f"""
                 UPDATE {table} SET product_name = %s
@@ -2904,6 +2946,19 @@ Variation prix:
                         product_name,
                         round(quantity / invoice_qty, 6)
                     ))
+
+                # TVA d'achat lue sur la facture → mémorisée pour le coût HT des plats
+                try:
+                    purchase_tva = float(d.get("purchase_tva"))
+                except (TypeError, ValueError):
+                    purchase_tva = None
+
+                if purchase_tva is not None and 0 <= purchase_tva <= 30:
+                    cur.execute("""
+                    UPDATE stock_products SET purchase_tva = %s
+                    WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+                    AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                    """, (purchase_tva, product_name, supplier))
 
                 if movement_type == "RETOUR":
                     continue  # un retour ne change pas le prix d'achat
@@ -3993,6 +4048,13 @@ def stock_invoices_import():
                     if movement_type == "ACHAT":
                         touched.add((product[0], product[1]))
 
+                        if line.get("tva") is not None and 0 <= float(line["tva"]) <= 30:
+                            cur.execute("""
+                            UPDATE stock_products SET purchase_tva = %s
+                            WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+                            AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                            """, (float(line["tva"]), product[0], product[1]))
+
                 imported.append(number)
 
             for name, supplier in touched:
@@ -4027,6 +4089,193 @@ def refresh_stock():
     result = sync_stock()
 
     return jsonify(result)
+
+
+# =========================
+# COÛT DES PLATS
+# =========================
+
+@app.route("/admin/costing", methods=["GET"])
+def costing_data():
+    """
+    Tout ce qu'il faut pour calculer le coût des plats côté page :
+    plats du menu, fiches techniques, produits stock avec prix.
+    Les calculs (HT, conversion, food cost) sont faits dans cout.html.
+    """
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+            SELECT id, name, price, category, tva, active
+            FROM products
+            ORDER BY category, name
+            """)
+            menu = [
+                {
+                    "id": r[0], "name": r[1], "price": float(r[2] or 0),
+                    "category": r[3] or "", "tva": float(r[4] if r[4] is not None else 10),
+                    "active": r[5] is not False
+                }
+                for r in cur.fetchall()
+            ]
+
+            cur.execute("""
+            SELECT name, supplier, purchase_unit, stock_unit, conversion_factor,
+                   last_purchase_price, average_price, COALESCE(purchase_tva, 5.5)
+            FROM stock_products
+            ORDER BY supplier, name
+            """)
+            stock = [
+                {
+                    "name": r[0], "supplier": r[1],
+                    "purchase_unit": r[2] or "", "stock_unit": r[3] or "",
+                    "conversion_factor": float(r[4] or 1),
+                    "last_purchase_price": float(r[5] or 0),
+                    "average_price": float(r[6] or 0),
+                    "purchase_tva": float(r[7]),
+                }
+                for r in cur.fetchall()
+            ]
+
+            cur.execute("SELECT menu_product_id, portions, extra_cost, note, updated_at FROM recipes")
+            recipes = {
+                r[0]: {
+                    "portions": float(r[1] or 1), "extra_cost": float(r[2] or 0),
+                    "note": r[3] or "", "updated_at": r[4].isoformat() if r[4] else "",
+                    "ingredients": []
+                }
+                for r in cur.fetchall()
+            }
+
+            cur.execute("""
+            SELECT menu_product_id, product_name, supplier, quantity, note
+            FROM recipe_ingredients
+            ORDER BY id
+            """)
+            for r in cur.fetchall():
+                recipes.setdefault(r[0], {
+                    "portions": 1, "extra_cost": 0, "note": "", "updated_at": "", "ingredients": []
+                })["ingredients"].append({
+                    "product_name": r[1], "supplier": r[2],
+                    "quantity": float(r[3] or 0), "note": r[4] or ""
+                })
+
+    return jsonify({
+        "menu": menu,
+        "stock": stock,
+        "recipes": {str(k): v for k, v in recipes.items()}
+    })
+
+
+@app.route("/admin/costing/recipe", methods=["POST"])
+def costing_save_recipe():
+    """
+    Body : {menu_product_id, portions, extra_cost, note,
+            ingredients: [{product_name, supplier, quantity, note}]}
+    Remplace entièrement la fiche du plat.
+    """
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json or {}
+
+    try:
+        menu_id = int(data.get("menu_product_id"))
+        portions = float(data.get("portions") or 1)
+        extra_cost = float(data.get("extra_cost") or 0)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Données invalides"}), 400
+
+    if portions <= 0:
+        return jsonify({"error": "Nombre de portions invalide (> 0)"}), 400
+
+    ingredients = []
+
+    for ing in data.get("ingredients") or []:
+        name = (ing.get("product_name") or "").strip()
+        supplier = (ing.get("supplier") or "").strip()
+
+        try:
+            qty = float(ing.get("quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+
+        if not name or not supplier:
+            continue
+
+        if qty <= 0:
+            return jsonify({"error": f"Quantité invalide pour « {name} »"}), 400
+
+        ingredients.append((name, supplier, qty, (ing.get("note") or "").strip()))
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("SELECT 1 FROM products WHERE id = %s", (menu_id,))
+            if not cur.fetchone():
+                return jsonify({"error": "Plat introuvable"}), 404
+
+            cur.execute("DELETE FROM recipe_ingredients WHERE menu_product_id = %s", (menu_id,))
+
+            if not ingredients and extra_cost == 0:
+                cur.execute("DELETE FROM recipes WHERE menu_product_id = %s", (menu_id,))
+                return jsonify({"success": True, "deleted": True})
+
+            cur.execute("""
+            INSERT INTO recipes (menu_product_id, portions, extra_cost, note, updated_at)
+            VALUES (%s,%s,%s,%s,NOW())
+            ON CONFLICT (menu_product_id)
+            DO UPDATE SET portions = EXCLUDED.portions,
+                          extra_cost = EXCLUDED.extra_cost,
+                          note = EXCLUDED.note,
+                          updated_at = NOW()
+            """, (menu_id, portions, extra_cost, (data.get("note") or "").strip()))
+
+            for name, supplier, qty, note in ingredients:
+                cur.execute("""
+                INSERT INTO recipe_ingredients (menu_product_id, product_name, supplier, quantity, note)
+                VALUES (%s,%s,%s,%s,%s)
+                """, (menu_id, name, supplier, qty, note))
+
+    return jsonify({"success": True})
+
+
+@app.route("/admin/costing/purchase-tva", methods=["POST"])
+def costing_purchase_tva():
+    """Body : {product_name, supplier, purchase_tva} (correction manuelle)."""
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json or {}
+
+    try:
+        tva = float(data.get("purchase_tva"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "TVA invalide"}), 400
+
+    if not 0 <= tva <= 30:
+        return jsonify({"error": "TVA invalide (0 à 30 %)"}), 400
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            UPDATE stock_products SET purchase_tva = %s
+            WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+            AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+            """, (tva, data.get("product_name") or "", data.get("supplier") or ""))
+
+            if cur.rowcount == 0:
+                return jsonify({"error": "Produit introuvable"}), 404
+
+    return jsonify({"success": True})
+
+
 # =========================
 # RUN SERVER
 # =========================
