@@ -1656,6 +1656,114 @@ def stock_products():
     return jsonify(result)
 
 
+def _create_stock_products(items, fail_if_exists=False):
+    """
+    Crée des produits : ligne dans l'onglet fournisseur de Google Sheet (source of truth),
+    synchronisation, puis unité stock + conversion en base (pas de colonne dans Google Sheet).
+
+    items : [{name, supplier, purchase_unit, stock_unit, conversion_factor,
+              min_stock?, stock_quantity?}]
+    Retourne (noms créés, message d'erreur ou None).
+    Un produit qui existe déjà est ignoré (ou erreur si fail_if_exists).
+    """
+    prepared = []
+    rows_by_supplier = {}
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for it in items:
+                name = (it.get("name") or "").strip()
+                purchase_unit = (it.get("purchase_unit") or "").strip()
+                stock_unit = (it.get("stock_unit") or purchase_unit).strip()
+
+                try:
+                    factor = float(it.get("conversion_factor") or 1)
+                except (TypeError, ValueError):
+                    factor = 0
+
+                if purchase_unit.lower() == stock_unit.lower():
+                    factor = 1
+
+                if not name or not (it.get("supplier") or "").strip():
+                    return [], "Produit et fournisseur obligatoires"
+
+                if not purchase_unit:
+                    return [], f"« {name} » : unité achat obligatoire"
+
+                if factor <= 0:
+                    return [], f"« {name} » : conversion invalide (nombre > 0)"
+
+                # nom exact de l'onglet (casse / accents ignorés)
+                supplier, _ = _canonical_supplier(cur, it["supplier"].strip())
+
+                cur.execute("""
+                SELECT 1 FROM stock_products
+                WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+                AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                """, (name, supplier))
+
+                if cur.fetchone():
+                    if fail_if_exists:
+                        return [], f"« {name} » existe déjà chez {supplier}"
+                    continue
+
+                prepared.append((name, supplier, stock_unit, factor))
+                rows_by_supplier.setdefault(supplier, []).append([
+                    name,                                       # Produit
+                    purchase_unit,                              # Unité achat
+                    float(it.get("min_stock") or 0),            # Stock min
+                    float(it.get("stock_quantity") or 0),       # Stock Réel
+                    "",                                         # Commander
+                    "Créé depuis RestoPi"                       # Note
+                ])
+
+    if not prepared:
+        return [], None
+
+    try:
+        sheets = {}
+        for supplier in rows_by_supplier:
+            try:
+                sheets[supplier] = spreadsheet.worksheet(supplier)
+            except gspread.exceptions.WorksheetNotFound:
+                return [], (
+                    f"Onglet « {supplier} » introuvable dans Google Sheet : "
+                    f"créez-le (mêmes colonnes que les autres fournisseurs) puis réessayez"
+                )
+
+        for supplier, rows in rows_by_supplier.items():
+            sheets[supplier].append_rows(rows)
+
+        sync_stock()
+    except Exception as e:
+        return [], f"Création Google Sheet impossible : {e}"
+
+    missing = []
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for name, supplier, stock_unit, factor in prepared:
+                cur.execute("""
+                UPDATE stock_products
+                SET stock_unit = %s,
+                    conversion_factor = %s,
+                    updated_at = NOW()
+                WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+                AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                """, (stock_unit, factor, name, supplier))
+
+                if cur.rowcount == 0:
+                    missing.append(name)
+
+    if missing:
+        return [], (
+            f"Ajouté(s) dans Google Sheet mais pas encore synchronisé(s) : {', '.join(missing)}. "
+            f"Cliquez « 🔄 Actualiser Google Sheet » puis complétez unité stock / conversion"
+        )
+
+    return [name for name, _, _, _ in prepared], None
+
+
 @app.route("/admin/stock/create", methods=["POST"])
 def create_stock_product():
 
@@ -1664,83 +1772,20 @@ def create_stock_product():
 
     data = request.json or {}
 
-    name = (data.get("name") or "").strip()
-    purchase_unit = (data.get("purchase_unit") or data.get("unit") or "").strip()
-    stock_unit = (data.get("stock_unit") or purchase_unit).strip()
+    created, error = _create_stock_products([{
+        "name": data.get("name"),
+        "supplier": data.get("supplier"),
+        "purchase_unit": data.get("purchase_unit") or data.get("unit"),
+        "stock_unit": data.get("stock_unit"),
+        "conversion_factor": data.get("conversion_factor"),
+        "min_stock": data.get("min_stock"),
+        "stock_quantity": data.get("stock_quantity"),
+    }], fail_if_exists=True)
 
-    try:
-        conversion_factor = float(data.get("conversion_factor") or 1)
-    except (TypeError, ValueError):
-        conversion_factor = 0
+    if error:
+        return jsonify({"error": error}), 400
 
-    if purchase_unit.lower() == stock_unit.lower():
-        conversion_factor = 1
-
-    if not name or not (data.get("supplier") or "").strip():
-        return jsonify({"error": "Produit et fournisseur obligatoires"}), 400
-
-    if not purchase_unit:
-        return jsonify({"error": "Unité achat obligatoire"}), 400
-
-    if conversion_factor <= 0:
-        return jsonify({"error": "Conversion invalide (nombre > 0)"}), 400
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            # nom exact de l'onglet (casse / accents ignorés)
-            supplier, _ = _canonical_supplier(cur, data["supplier"].strip())
-
-            cur.execute("""
-            SELECT 1 FROM stock_products
-            WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
-            AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
-            """, (name, supplier))
-
-            if cur.fetchone():
-                return jsonify({"error": f"« {name} » existe déjà chez {supplier}"}), 400
-
-    try:
-        sheet = spreadsheet.worksheet(supplier)
-    except gspread.exceptions.WorksheetNotFound:
-        return jsonify({
-            "error": f"Onglet « {supplier} » introuvable dans Google Sheet : "
-                     f"créez-le (mêmes colonnes que les autres fournisseurs) puis réessayez"
-        }), 400
-
-    try:
-        sheet.append_row([
-            name,                                   # Produit
-            purchase_unit,                          # Unité achat
-            float(data.get("min_stock") or 0),      # Stock min
-            float(data.get("stock_quantity") or 0), # Stock Réel
-            "",                                     # Commander
-            ""                                      # Note
-        ])
-        sync_stock()
-    except Exception as e:
-        return jsonify({"error": f"Création Google Sheet impossible : {e}"}), 500
-
-    # unité stock + conversion : gérées en base (pas de colonne dans Google Sheet)
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-            UPDATE stock_products
-            SET stock_unit = %s,
-                conversion_factor = %s,
-                updated_at = NOW()
-            WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
-            AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
-            """, (stock_unit, conversion_factor, name, supplier))
-
-            created = cur.rowcount > 0
-
-    if not created:
-        return jsonify({
-            "error": "Ligne ajoutée dans Google Sheet mais pas encore synchronisée : "
-                     "cliquez « 🔄 Actualiser Google Sheet » puis complétez unité stock / conversion"
-        }), 500
-
-    return jsonify({"success": True})
+    return jsonify({"success": True, "created": created})
 
 
 @app.route("/admin/stock/update", methods=["POST"])
@@ -2393,6 +2438,36 @@ def add_deliveries():
     skipped = []
     skipped_invoices = []
 
+    # nouveaux produits demandés depuis « Achats fournisseurs » (article de facture inconnu)
+    to_create = {}
+
+    for d in deliveries:
+        cp = d.get("create_product")
+
+        if not cp or not (d.get("product_name") or "").strip():
+            continue
+
+        key = (
+            d["product_name"].strip().lower(),
+            (d.get("supplier") or "").strip().lower()
+        )
+
+        to_create.setdefault(key, {
+            "name": d["product_name"],
+            "supplier": d.get("supplier"),
+            "purchase_unit": d.get("purchase_unit"),
+            "stock_unit": cp.get("stock_unit"),
+            "conversion_factor": cp.get("conversion_factor"),
+        })
+
+    created_products = []
+
+    if to_create:
+        created_products, error = _create_stock_products(list(to_create.values()))
+
+        if error:
+            return jsonify({"success": False, "error": error}), 400
+
     with get_conn() as conn:
         with conn.cursor() as cur:
 
@@ -2612,7 +2687,8 @@ Variation prix:
         "success": True,
         "saved": saved,
         "skipped": skipped,
-        "skipped_invoices": sorted(set(skipped_invoices))
+        "skipped_invoices": sorted(set(skipped_invoices)),
+        "created_products": created_products
     })
 
 # =========================
