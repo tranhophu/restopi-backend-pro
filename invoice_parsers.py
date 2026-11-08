@@ -259,13 +259,20 @@ def parse_yenanh(text):
 # =========================
 
 _METRO_LINE = re.compile(
-    r"^(?P<code>\d{7})\s+(?P<desc>.+?)\s+"
+    r"^(?:(?P<ean>\d{8,14})\s+)?"           # EAN (factures d'achat en magasin)
+    r"(?P<code>\d{7})\s+(?P<desc>.+?)\s+"
     r"(?:(?P<poids>\d+,\d{3})\s+)?"          # poids (articles vendus au kg)
     r"(?P<prix>\d+,\d{3})\s+"                # prix unitaire HT (ou prix au kg)
     r"(?:(?P<colis>\d+)\s+)?"                # colisage (nb unités par colis)
     r"(?P<qty>-?\d+)\s+"                     # quantité de colis
     r"(?P<montant>-?\d{1,3}(?: \d{3})*,\d{2}|-?\d+,\d{2})\s+"
     r"(?P<tva>[A-Z])(?:\s+P)?$"
+)
+
+
+# remise sur l'article précédent (montant HT suivi de « - »)
+_METRO_LINE_DISCOUNT = re.compile(
+    r"^(?P<label>[A-Za-zÀ-ÿ][^\d]*?)\s+(?P<amount>\d{1,3}(?: \d{3})*,\d{2})-$"
 )
 
 
@@ -303,7 +310,23 @@ def parse_metro(text):
     }
 
     for raw in text.split("\n"):
-        lm = _METRO_LINE.match(raw.strip())
+        line = raw.strip()
+
+        # remise promo → déduite de l'article qui la précède (prix unitaire réel)
+        dm = _METRO_LINE_DISCOUNT.match(line)
+        if dm and result["lines"] and result["lines"][-1]["kind"] == "product":
+            last = result["lines"][-1]
+            discount_ttc = _ttc(_num(dm.group("amount")), last["tva"] or 0)
+            last["total"] = round(last["total"] - discount_ttc, 2)
+            if last["quantity"]:
+                last["unit_price"] = round(last["total"] / last["quantity"], 4)
+            result["warnings"].append(
+                f"{last['code']} {last['description']} : {dm.group('label').strip()} "
+                f"-{dm.group('amount')} € HT déduit du prix"
+            )
+            continue
+
+        lm = _METRO_LINE.match(line)
         if not lm:
             continue
 
