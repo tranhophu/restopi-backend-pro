@@ -1662,28 +1662,83 @@ def create_stock_product():
     if not check_admin(request):
         return jsonify({"error": "unauthorized"}), 403
 
-    data = request.json
+    data = request.json or {}
 
-    sheet = spreadsheet.worksheet(
-        data.get("supplier")
-    )
+    name = (data.get("name") or "").strip()
+    purchase_unit = (data.get("purchase_unit") or data.get("unit") or "").strip()
+    stock_unit = (data.get("stock_unit") or purchase_unit).strip()
 
-    sheet.append_row([
+    try:
+        conversion_factor = float(data.get("conversion_factor") or 1)
+    except (TypeError, ValueError):
+        conversion_factor = 0
 
-        data.get("name"),           # Produit
+    if purchase_unit.lower() == stock_unit.lower():
+        conversion_factor = 1
 
-        data.get("purchase_unit"),  # Unité achat
+    if not name or not (data.get("supplier") or "").strip():
+        return jsonify({"error": "Produit et fournisseur obligatoires"}), 400
 
-        data.get("min_stock"),      # Stock min
+    if not purchase_unit:
+        return jsonify({"error": "Unité achat obligatoire"}), 400
 
-        data.get("stock_quantity"), # Stock Réel
+    if conversion_factor <= 0:
+        return jsonify({"error": "Conversion invalide (nombre > 0)"}), 400
 
-        "",                         # Commander
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # nom exact de l'onglet (casse / accents ignorés)
+            supplier, _ = _canonical_supplier(cur, data["supplier"].strip())
 
-        ""                          # Note
+            cur.execute("""
+            SELECT 1 FROM stock_products
+            WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+            AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+            """, (name, supplier))
 
-    ])
-    sync_stock()
+            if cur.fetchone():
+                return jsonify({"error": f"« {name} » existe déjà chez {supplier}"}), 400
+
+    try:
+        sheet = spreadsheet.worksheet(supplier)
+    except gspread.exceptions.WorksheetNotFound:
+        return jsonify({
+            "error": f"Onglet « {supplier} » introuvable dans Google Sheet : "
+                     f"créez-le (mêmes colonnes que les autres fournisseurs) puis réessayez"
+        }), 400
+
+    try:
+        sheet.append_row([
+            name,                                   # Produit
+            purchase_unit,                          # Unité achat
+            float(data.get("min_stock") or 0),      # Stock min
+            float(data.get("stock_quantity") or 0), # Stock Réel
+            "",                                     # Commander
+            ""                                      # Note
+        ])
+        sync_stock()
+    except Exception as e:
+        return jsonify({"error": f"Création Google Sheet impossible : {e}"}), 500
+
+    # unité stock + conversion : gérées en base (pas de colonne dans Google Sheet)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            UPDATE stock_products
+            SET stock_unit = %s,
+                conversion_factor = %s,
+                updated_at = NOW()
+            WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+            AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+            """, (stock_unit, conversion_factor, name, supplier))
+
+            created = cur.rowcount > 0
+
+    if not created:
+        return jsonify({
+            "error": "Ligne ajoutée dans Google Sheet mais pas encore synchronisée : "
+                     "cliquez « 🔄 Actualiser Google Sheet » puis complétez unité stock / conversion"
+        }), 500
 
     return jsonify({"success": True})
 
@@ -2492,6 +2547,34 @@ Variation prix:
                 ))
 
                 saved += 1
+
+                # ligne de facture : mémorise code article → produit (+ facteur)
+                # pour reconnaître automatiquement les prochaines factures
+                invoice_code = (d.get("invoice_code") or "").strip()
+
+                try:
+                    invoice_qty = float(d.get("invoice_qty") or 0)
+                except (TypeError, ValueError):
+                    invoice_qty = 0
+
+                if invoice_ref and invoice_code and invoice_qty and quantity / invoice_qty > 0:
+                    cur.execute("""
+                    INSERT INTO stock_supplier_codes
+                    (supplier, code, description, product_name, factor, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,NOW())
+                    ON CONFLICT (LOWER(supplier), code)
+                    DO UPDATE SET
+                        description = EXCLUDED.description,
+                        product_name = EXCLUDED.product_name,
+                        factor = EXCLUDED.factor,
+                        updated_at = NOW()
+                    """, (
+                        supplier,
+                        invoice_code,
+                        d.get("invoice_desc") or "",
+                        product_name,
+                        round(quantity / invoice_qty, 6)
+                    ))
 
                 if movement_type == "RETOUR":
                     continue  # un retour ne change pas le prix d'achat
