@@ -1905,43 +1905,141 @@ def rename_stock_product():
     return jsonify({"success": True, "new_name": new_name, "supplier": supplier})
 
 
+def _sheet_number(v):
+    v = float(v or 0)
+    return int(v) if v.is_integer() else v
+
+
+def _push_stock_to_sheet(changes):
+    """
+    Écrit dans Google Sheet les valeurs modifiées depuis la page stock.
+    changes : [(supplier, product_name, {"Stock Réel": 12, "Stock min": 5})]
+    Retourne la liste des erreurs (la base est déjà enregistrée).
+    """
+    errors = []
+    by_supplier = {}
+
+    for supplier, name, fields in changes:
+        by_supplier.setdefault(supplier, []).append((name, fields))
+
+    for supplier, items in by_supplier.items():
+        try:
+            try:
+                sheet = spreadsheet.worksheet(supplier)
+            except gspread.exceptions.WorksheetNotFound:
+                errors.append(f"Onglet « {supplier} » introuvable dans Google Sheet")
+                continue
+
+            headers = [str(h).strip() for h in sheet.row_values(1)]
+
+            if "Produit" not in headers:
+                errors.append(f"Colonne « Produit » introuvable dans l'onglet « {supplier} »")
+                continue
+
+            # ligne Google Sheet de chaque produit (nom insensible à la casse)
+            rows = {}
+            for i, value in enumerate(sheet.col_values(headers.index("Produit") + 1)):
+                key = str(value).strip().lower()
+                if i > 0 and key:
+                    rows.setdefault(key, i + 1)
+
+            cells = []
+
+            for name, fields in items:
+                row = rows.get(name.strip().lower())
+
+                if not row:
+                    errors.append(f"« {name} » introuvable dans l'onglet « {supplier} »")
+                    continue
+
+                for header, value in fields.items():
+                    if header not in headers:
+                        errors.append(f"Colonne « {header} » introuvable dans l'onglet « {supplier} »")
+                        continue
+
+                    cells.append({
+                        "range": gspread.utils.rowcol_to_a1(row, headers.index(header) + 1),
+                        "values": [[_sheet_number(value)]]
+                    })
+
+            if cells:
+                sheet.batch_update(cells, value_input_option="USER_ENTERED")
+
+        except Exception as e:
+            errors.append(f"Onglet « {supplier} » : {e}")
+
+    return errors
+
+
+def _save_stock_products(updates):
+    """
+    Enregistre les modifications du tableau Stock en base, puis reporte
+    Stock Réel / Stock min dans Google Sheet (source of truth : sans cela,
+    la prochaine synchro pourrait remettre l'ancienne valeur).
+    Le nom et le fournisseur ne sont pas modifiés ici (renommage : /admin/stock/rename).
+    """
+    sheet_changes = []
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            for p in updates:
+
+                product_id = int(p.get("id"))
+                stock_quantity = float(p.get("stock_quantity") or 0)
+                min_stock = float(p.get("min_stock") or 0)
+
+                cur.execute("""
+                SELECT name, supplier, stock_quantity, min_stock
+                FROM stock_products
+                WHERE id = %s
+                """, (product_id,))
+
+                old = cur.fetchone()
+
+                if not old:
+                    continue
+
+                cur.execute("""
+                UPDATE stock_products
+                SET stock_quantity=%s,
+                    stock_unit=%s,
+                    conversion_factor=%s,
+                    min_stock=%s,
+                    updated_at=NOW()
+                WHERE id=%s
+                """, (
+                    stock_quantity,
+                    p.get("stock_unit"),
+                    float(p.get("conversion_factor") or 1),
+                    min_stock,
+                    product_id
+                ))
+
+                fields = {}
+
+                if abs(float(old[2] or 0) - stock_quantity) > 1e-9:
+                    fields["Stock Réel"] = stock_quantity
+
+                if abs(float(old[3] or 0) - min_stock) > 1e-9:
+                    fields["Stock min"] = min_stock
+
+                if fields:
+                    sheet_changes.append((old[1], old[0], fields))
+
+    return _push_stock_to_sheet(sheet_changes) if sheet_changes else []
+
+
 @app.route("/admin/stock/update", methods=["POST"])
 def update_stock_product():
 
     if not check_admin(request):
         return jsonify({"error": "unauthorized"}), 403
 
-    data = request.json
+    sheet_errors = _save_stock_products([request.json or {}])
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
+    return jsonify({"success": True, "sheet_errors": sheet_errors})
 
-            cur.execute("""
-            UPDATE stock_products
-            SET name=%s,
-                supplier=%s,
-                stock_quantity=%s,
-                stock_unit=%s,
-                conversion_factor=%s,
-                min_stock=%s,
-                updated_at=NOW()
-            WHERE id=%s
-            """, (
-                data.get("name"),
-                data.get("supplier"),
-
-                float(data.get("stock_quantity") or 0),
-
-                data.get("stock_unit"),
-
-                float(data.get("conversion_factor") or 1),
-
-                float(data.get("min_stock") or 0),
-
-                int(data.get("id"))
-            ))
-
-    return jsonify({"success": True})
 
 @app.route(
     "/admin/stock/bulk-update",
@@ -1954,58 +2052,13 @@ def bulk_update_stock_products():
             "error":"unauthorized"
         }), 403
 
-    data = request.json
+    data = request.json or {}
 
-    updates = data.get("updates", [])
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-
-            for p in updates:
-
-                cur.execute("""
-                UPDATE stock_products
-                SET
-
-                    name=%s,
-                    supplier=%s,
-
-                    stock_quantity=%s,
-
-                    stock_unit=%s,
-
-                    conversion_factor=%s,
-
-                    min_stock=%s,
-
-                    updated_at=NOW()
-
-                WHERE id=%s
-                """, (
-
-                    p.get("name"),
-
-                    p.get("supplier"),
-
-                    float(
-                        p.get("stock_quantity") or 0
-                    ),
-
-                    p.get("stock_unit"),
-
-                    float(
-                        p.get("conversion_factor") or 1
-                    ),
-
-                    float(
-                        p.get("min_stock") or 0
-                    ),
-
-                    int(p.get("id"))
-                ))
+    sheet_errors = _save_stock_products(data.get("updates", []))
 
     return jsonify({
-        "success": True
+        "success": True,
+        "sheet_errors": sheet_errors
     })
 
 @app.route("/admin/stock/delete", methods=["POST"])
@@ -2541,6 +2594,97 @@ def _weighted_avg_price(cur, product_name, supplier, stock_unit, conversion_fact
     return total_cost / total_qty
 
 
+def _invoice_already_imported(cur, supplier, invoice_ref):
+    """
+    Facture déjà enregistrée pour ce fournisseur ?
+    - n° exact dans la colonne invoice_ref
+    - anciennes lignes sans invoice_ref : « Facture <n°> » dans la note, n° complet
+      (« Facture 12 » ne correspond plus à « Facture 123 »)
+    """
+    ref = (invoice_ref or "").strip()
+
+    if not ref:
+        return False
+
+    # échappe les caractères spéciaux pour l'expression régulière PostgreSQL
+    escaped = re.sub(r"([^0-9A-Za-z])", r"\\\1", ref)
+
+    cur.execute("""
+    SELECT 1
+    FROM stock_movements
+    WHERE LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+    AND (
+        TRIM(invoice_ref) = %s
+        OR (
+            COALESCE(TRIM(invoice_ref), '') = ''
+            AND note ~* %s
+        )
+    )
+    LIMIT 1
+    """, (supplier, ref, r"Facture " + escaped + r"([^0-9A-Za-z]|$)"))
+
+    return cur.fetchone() is not None
+
+
+@app.route("/admin/stock/check-duplicates", methods=["POST"])
+def check_purchase_duplicates():
+    """
+    Achats saisis à la main : y a-t-il déjà un achat du même produit
+    (même fournisseur) à ± `days` jours ?
+    Body : {deliveries: [{product_name, supplier, purchase_date}], days?: 3}
+    Retour : {duplicates: [{index, matches: [{date, quantity, purchase_unit, unit_price, invoice_ref}]}]}
+    """
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json or {}
+    days = int(data.get("days") or 3)
+    duplicates = []
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for index, d in enumerate(data.get("deliveries") or []):
+                name = (d.get("product_name") or "").strip()
+                supplier = (d.get("supplier") or "").strip()
+                date = d.get("purchase_date") or None
+
+                if not name or not supplier or not date:
+                    continue
+
+                cur.execute("""
+                SELECT COALESCE(purchase_date, created_at::date) AS d,
+                       COALESCE(purchase_quantity, quantity),
+                       purchase_unit,
+                       unit_price,
+                       invoice_ref
+                FROM stock_movements
+                WHERE movement_type = 'ACHAT'
+                AND LOWER(TRIM(product_name)) = LOWER(TRIM(%s))
+                AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                AND COALESCE(purchase_date, created_at::date)
+                    BETWEEN %s::date - %s AND %s::date + %s
+                ORDER BY d DESC
+                LIMIT 5
+                """, (name, supplier, date, days, date, days))
+
+                matches = [
+                    {
+                        "date": r[0].isoformat() if r[0] else "",
+                        "quantity": float(r[1] or 0),
+                        "purchase_unit": r[2] or "",
+                        "unit_price": float(r[3] or 0),
+                        "invoice_ref": r[4] or ""
+                    }
+                    for r in cur.fetchall()
+                ]
+
+                if matches:
+                    duplicates.append({"index": index, "matches": matches})
+
+    return jsonify({"duplicates": duplicates})
+
+
 @app.route("/admin/stock/add-deliveries", methods=["POST"])
 def add_deliveries():
 
@@ -2596,14 +2740,7 @@ def add_deliveries():
                 for d in deliveries
                 if (d.get("invoice_ref") or "").strip()
             }:
-                cur.execute("""
-                SELECT COUNT(*)
-                FROM stock_movements
-                WHERE LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
-                AND (invoice_ref = %s OR note ILIKE %s)
-                """, (supplier, ref, f"%Facture {ref}%"))
-
-                if cur.fetchone()[0] > 0:
+                if _invoice_already_imported(cur, supplier, ref):
                     already_imported.add((supplier.lower(), ref))
                     skipped_invoices.append(ref)
 
@@ -3511,17 +3648,7 @@ def stock_invoices_parse():
                 inv["purchase_date"] = inv["delivery_date"] or inv["invoice_date"]
 
                 # facture déjà importée ?
-                cur.execute("""
-                SELECT COUNT(*)
-                FROM stock_movements
-                WHERE LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
-                AND (
-                    invoice_ref = %s
-                    OR note ILIKE %s
-                )
-                """, (supplier, inv["invoice_number"], f"%Facture {inv['invoice_number']}%"))
-
-                inv["duplicate"] = cur.fetchone()[0] > 0
+                inv["duplicate"] = _invoice_already_imported(cur, supplier, inv["invoice_number"])
 
                 # achats saisis à la main autour de cette date → risque de doublon
                 inv["nearby_manual"] = []
@@ -3772,14 +3899,7 @@ def stock_invoices_import():
                 supplier = inv["supplier"]
                 number = inv["invoice_number"]
 
-                cur.execute("""
-                SELECT COUNT(*)
-                FROM stock_movements
-                WHERE LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
-                AND (invoice_ref = %s OR note ILIKE %s)
-                """, (supplier, number, f"%Facture {number}%"))
-
-                if cur.fetchone()[0] > 0:
+                if _invoice_already_imported(cur, supplier, number):
                     skipped.append(number)
                     continue
 
