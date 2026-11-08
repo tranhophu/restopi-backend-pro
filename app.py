@@ -1788,6 +1788,123 @@ def create_stock_product():
     return jsonify({"success": True, "created": created})
 
 
+@app.route("/admin/stock/rename", methods=["POST"])
+def rename_stock_product():
+    """
+    Renomme un produit partout : Google Sheet (source of truth, sinon la prochaine
+    synchro supprimerait le produit), puis toutes les tables qui référencent le nom.
+    Body : {supplier, old_name, new_name}
+    """
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json or {}
+
+    old_name = (data.get("old_name") or "").strip()
+    new_name = (data.get("new_name") or "").strip()
+
+    if not old_name or not new_name or not (data.get("supplier") or "").strip():
+        return jsonify({"error": "Fournisseur, ancien et nouveau nom obligatoires"}), 400
+
+    if old_name == new_name:
+        return jsonify({"success": True, "new_name": new_name})
+
+    conn = get_conn()
+    conn.autocommit = False
+
+    try:
+        with conn.cursor() as cur:
+
+            supplier, _ = _canonical_supplier(cur, data["supplier"].strip())
+
+            cur.execute("""
+            SELECT name FROM stock_products
+            WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+            AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+            """, (old_name, supplier))
+
+            row = cur.fetchone()
+
+            if not row:
+                return jsonify({"error": f"« {old_name} » introuvable chez {supplier}"}), 404
+
+            old_db_name = row[0]
+
+            # le nouveau nom ne doit pas exister (sauf simple changement de casse)
+            if new_name.lower() != old_name.lower():
+                cur.execute("""
+                SELECT 1 FROM stock_products
+                WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+                AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                """, (new_name, supplier))
+
+                if cur.fetchone():
+                    return jsonify({"error": f"« {new_name} » existe déjà chez {supplier}"}), 400
+
+            # 1. base (transaction non validée tant que Google Sheet n'est pas à jour)
+            cur.execute("""
+            UPDATE stock_products SET name = %s, updated_at = NOW()
+            WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+            AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+            """, (new_name, old_db_name, supplier))
+
+            for table in (
+                "stock_movements",
+                "stock_units",
+                "stock_snapshots",
+                "stock_reference_prices",
+                "stock_supplier_codes",
+            ):
+                cur.execute(f"""
+                UPDATE {table} SET product_name = %s
+                WHERE LOWER(TRIM(product_name)) = LOWER(TRIM(%s))
+                AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                """, (new_name, old_db_name, supplier))
+
+        # 2. Google Sheet
+        try:
+            sheet = spreadsheet.worksheet(supplier)
+        except gspread.exceptions.WorksheetNotFound:
+            conn.rollback()
+            return jsonify({"error": f"Onglet « {supplier} » introuvable dans Google Sheet"}), 400
+
+        headers = [h.strip() for h in sheet.row_values(1)]
+
+        if "Produit" not in headers:
+            conn.rollback()
+            return jsonify({"error": f"Colonne « Produit » introuvable dans l'onglet « {supplier} »"}), 400
+
+        col = headers.index("Produit") + 1
+        target = old_db_name.strip().lower()
+
+        rows = [
+            i + 1
+            for i, value in enumerate(sheet.col_values(col))
+            if i > 0 and str(value).strip().lower() == target
+        ]
+
+        if not rows:
+            conn.rollback()
+            return jsonify({
+                "error": f"« {old_db_name} » introuvable dans l'onglet « {supplier} » de Google Sheet"
+            }), 400
+
+        for r in rows:
+            sheet.update_cell(r, col, new_name)
+
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": f"Renommage impossible : {e}"}), 500
+
+    finally:
+        conn.close()
+
+    return jsonify({"success": True, "new_name": new_name, "supplier": supplier})
+
+
 @app.route("/admin/stock/update", methods=["POST"])
 def update_stock_product():
 
