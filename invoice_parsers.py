@@ -25,6 +25,7 @@ Les remises globales deviennent une ligne kind="discount" (code "REMISE").
 
 import io
 import re
+import unicodedata
 
 import pdfplumber
 
@@ -348,6 +349,13 @@ def parse_metro(text):
 # EXOSTAR (Shopify) — prix TTC
 # =========================
 
+def _code_from_name(name):
+    """Article sans SKU : code stable dérivé du nom (mémorisable comme un vrai code)."""
+    ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    slug = re.sub(r"[^A-Z0-9]+", "-", ascii_name.upper()).strip("-")
+    return "SANS-SKU-" + (slug[:40] or "ARTICLE")
+
+
 def is_exostar(text):
     return "exostar" in text.lower()
 
@@ -371,6 +379,21 @@ def parse_exostar(text):
 
     in_items = False
     current = None
+    without_sku = []
+
+    def flush():
+        """enregistre l'article en cours — même sans ligne « SKU: » (nouveau produit Shopify)"""
+        nonlocal current
+        if current is None:
+            return
+        name = " ".join(current["name"]).strip()
+        code = current.get("code") or _code_from_name(name)
+        if not current.get("code"):
+            without_sku.append(name or code)
+        result["lines"].append(_line(
+            code, name or code, current["qty"], current["pu"], current["total"], 5.5
+        ))
+        current = None
 
     for raw in text.split("\n"):
         line = raw.strip()
@@ -383,21 +406,21 @@ def parse_exostar(text):
             continue
 
         if re.match(r"(Remise|Total Produits|TVA\(|Exp[ée]dition|Total T\.T\.C)", line):
+            flush()
             in_items = False
             continue
 
-        sku = re.match(r"SKU:\s*(\S+)", line)
-        if sku and current:
-            current["code"] = sku.group(1)
-            result["lines"].append(_line(
-                current["code"], " ".join(current["name"]),
-                current["qty"], current["pu"], current["total"], 5.5
-            ))
-            current = None
+        sku = re.match(r"SKU:\s*(\S*)", line)
+        if sku:
+            if current is not None:
+                current["code"] = sku.group(1)
+                flush()
             continue
 
         im = item_re.match(line)
         if im:
+            # nouvel article alors que le précédent n'a pas eu de SKU → ne pas le perdre
+            flush()
             current = {
                 "name": [im.group("name")] if im.group("name") else [],
                 "qty": int(im.group("qty")),
@@ -406,6 +429,13 @@ def parse_exostar(text):
             }
         elif current is not None:
             current["name"].append(line)
+
+    flush()
+
+    if without_sku:
+        result["warnings"].append(
+            f"{len(without_sku)} article(s) sans SKU (code créé à partir du nom) : " + ", ".join(without_sku)
+        )
 
     # remise globale (code promo)
     m = re.search(r"Remise(?:\s*\(([^)]*)\))?\s*-\s*€\s*([\d.,]+)", text)
