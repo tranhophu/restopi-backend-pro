@@ -571,6 +571,31 @@ def init_stock():
             ON preparation_ingredients (preparation_id);
             """)
 
+            # concurrents (Viet Café, Saigon Exotique…) et leurs prix TTC par plat du menu
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS competitors (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                note TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            """)
+
+            cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_competitors_name
+            ON competitors (LOWER(name));
+            """)
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS competitor_prices (
+                menu_product_id INTEGER NOT NULL,
+                competitor_id INTEGER NOT NULL,
+                price FLOAT NOT NULL,
+                updated_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (menu_product_id, competitor_id)
+            );
+            """)
+
 init_stock()
 
 @app.route("/customer/set-pin", methods=["POST"])
@@ -4226,11 +4251,28 @@ def costing_data():
                         _ingredient_json(r[1], r[2], r[5], r[3], r[6], r[4])
                     )
 
+            cur.execute("SELECT id, name, note FROM competitors ORDER BY id")
+            competitors = [{"id": r[0], "name": r[1], "note": r[2] or ""} for r in cur.fetchall()]
+
+            cur.execute("""
+            SELECT menu_product_id, competitor_id, price, updated_at
+            FROM competitor_prices
+            """)
+            competitor_prices = [
+                {
+                    "menu_product_id": r[0], "competitor_id": r[1], "price": float(r[2]),
+                    "updated_at": r[3].isoformat() if r[3] else ""
+                }
+                for r in cur.fetchall()
+            ]
+
     return jsonify({
         "menu": menu,
         "stock": stock,
         "recipes": {str(k): v for k, v in recipes.items()},
-        "preparations": list(preparations.values())
+        "preparations": list(preparations.values()),
+        "competitors": competitors,
+        "competitor_prices": competitor_prices
     })
 
 
@@ -4452,6 +4494,123 @@ def costing_delete_preparation():
             cur.execute("DELETE FROM preparations WHERE id = %s", (prep_id,))
 
     return jsonify({"success": True})
+
+
+@app.route("/admin/costing/competitor", methods=["POST"])
+def costing_save_competitor():
+    """Body : {id?, name, note} → crée ou renomme un concurrent. Retour : {success, id}"""
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json or {}
+    name = (data.get("name") or "").strip()
+    note = (data.get("note") or "").strip()
+
+    if not name:
+        return jsonify({"error": "Nom du concurrent obligatoire"}), 400
+
+    try:
+        comp_id = int(data["id"]) if data.get("id") not in (None, "") else None
+    except (TypeError, ValueError):
+        return jsonify({"error": "Concurrent invalide"}), 400
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+            SELECT id FROM competitors
+            WHERE LOWER(name) = LOWER(%s) AND (%s IS NULL OR id <> %s)
+            """, (name, comp_id, comp_id))
+
+            if cur.fetchone():
+                return jsonify({"error": f"« {name} » existe déjà"}), 400
+
+            if comp_id:
+                cur.execute("UPDATE competitors SET name=%s, note=%s WHERE id=%s", (name, note, comp_id))
+                if cur.rowcount == 0:
+                    return jsonify({"error": "Concurrent introuvable"}), 404
+            else:
+                cur.execute(
+                    "INSERT INTO competitors (name, note) VALUES (%s,%s) RETURNING id",
+                    (name, note)
+                )
+                comp_id = cur.fetchone()[0]
+
+    return jsonify({"success": True, "id": comp_id})
+
+
+@app.route("/admin/costing/competitor/delete", methods=["POST"])
+def costing_delete_competitor():
+    """Body : {id} → supprime le concurrent et tous ses prix."""
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    try:
+        comp_id = int((request.json or {}).get("id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Concurrent invalide"}), 400
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM competitor_prices WHERE competitor_id = %s", (comp_id,))
+            cur.execute("DELETE FROM competitors WHERE id = %s", (comp_id,))
+
+    return jsonify({"success": True})
+
+
+@app.route("/admin/costing/competitor-price", methods=["POST"])
+def costing_save_competitor_price():
+    """
+    Body : {menu_product_id, competitor_id, price}
+    price vide / null → le prix est supprimé (le concurrent ne vend pas ce plat).
+    """
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json or {}
+
+    try:
+        menu_id = int(data.get("menu_product_id"))
+        comp_id = int(data.get("competitor_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Données invalides"}), 400
+
+    raw = data.get("price")
+    price = None
+
+    if raw not in (None, ""):
+        try:
+            price = float(str(raw).replace(",", "."))
+        except ValueError:
+            return jsonify({"error": "Prix invalide"}), 400
+
+        if price <= 0 or price > 1000:
+            return jsonify({"error": "Prix invalide"}), 400
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            if price is None:
+                cur.execute("""
+                DELETE FROM competitor_prices
+                WHERE menu_product_id = %s AND competitor_id = %s
+                """, (menu_id, comp_id))
+                return jsonify({"success": True, "deleted": True})
+
+            cur.execute("""
+            INSERT INTO competitor_prices (menu_product_id, competitor_id, price, updated_at)
+            VALUES (%s,%s,%s,NOW())
+            ON CONFLICT (menu_product_id, competitor_id)
+            DO UPDATE SET price = EXCLUDED.price, updated_at = NOW()
+            RETURNING updated_at
+            """, (menu_id, comp_id, price))
+
+            updated_at = cur.fetchone()[0]
+
+    return jsonify({"success": True, "price": price, "updated_at": updated_at.isoformat()})
 
 
 @app.route("/admin/costing/purchase-tva", methods=["POST"])
