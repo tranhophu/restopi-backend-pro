@@ -502,6 +502,14 @@ def init_stock():
             ADD COLUMN IF NOT EXISTS purchase_tva FLOAT DEFAULT 5.5;
             """)
 
+            # contenu d'une unité stock (ex : 1 chai = 907 g) → fiches en g / ml
+            # sans changer l'unité de comptage du stock
+            cur.execute("""
+            ALTER TABLE stock_products
+            ADD COLUMN IF NOT EXISTS content_qty FLOAT,
+            ADD COLUMN IF NOT EXISTS content_unit TEXT;
+            """)
+
             # une fiche par plat du menu (table products)
             # portions : nb de portions produites par la recette (ex : sauce pour 20 plats)
             # extra_cost : coût HT fixe ajouté (gaz, garniture non suivie en stock…)
@@ -4205,7 +4213,8 @@ def costing_data():
 
             cur.execute("""
             SELECT name, supplier, purchase_unit, stock_unit, conversion_factor,
-                   last_purchase_price, average_price, COALESCE(purchase_tva, 5.5)
+                   last_purchase_price, average_price, COALESCE(purchase_tva, 5.5),
+                   content_qty, content_unit
             FROM stock_products
             ORDER BY supplier, name
             """)
@@ -4217,6 +4226,8 @@ def costing_data():
                     "last_purchase_price": float(r[5] or 0),
                     "average_price": float(r[6] or 0),
                     "purchase_tva": float(r[7]),
+                    "content_qty": float(r[8]) if r[8] else None,
+                    "content_unit": r[9] or "",
                 }
                 for r in cur.fetchall()
             ]
@@ -4721,6 +4732,51 @@ def costing_purchase_tva():
                 return jsonify({"error": "Produit introuvable"}), 404
 
     return jsonify({"success": True})
+
+
+_CONTENT_UNITS = {"g": "g", "kg": "kg", "ml": "ml", "cl": "cl", "l": "L"}
+
+
+@app.route("/admin/costing/content", methods=["POST"])
+def costing_content():
+    """
+    Body : {product_name, supplier, content_qty, content_unit}
+    Contenu d'une unité stock (ex : 1 chai = 907 g). content_qty vide / 0 → effacé.
+    """
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json or {}
+    raw_qty = str(data.get("content_qty") or "").strip().replace(",", ".")
+
+    if raw_qty in ("", "0"):
+        qty, unit = None, None
+    else:
+        try:
+            qty = float(raw_qty)
+        except ValueError:
+            return jsonify({"error": "Contenu invalide"}), 400
+
+        unit = _CONTENT_UNITS.get(str(data.get("content_unit") or "").strip().lower())
+
+        if qty <= 0:
+            return jsonify({"error": "Contenu invalide (nombre > 0)"}), 400
+        if not unit:
+            return jsonify({"error": "Unité de contenu invalide (g, kg, ml, cl, L)"}), 400
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            UPDATE stock_products SET content_qty = %s, content_unit = %s, updated_at = NOW()
+            WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
+            AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+            """, (qty, unit, data.get("product_name") or "", data.get("supplier") or ""))
+
+            if cur.rowcount == 0:
+                return jsonify({"error": "Produit introuvable"}), 404
+
+    return jsonify({"success": True, "content_qty": qty, "content_unit": unit or ""})
 
 
 # =========================
