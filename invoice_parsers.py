@@ -725,8 +725,115 @@ def parse_nhuy(text):
     return _finalize(result)
 
 
+# =========================
+# AUCHAN (facture drive / magasin) — prix HT + colonne TTC par ligne
+# =========================
+
+# "3228857001347 HARRYS BRIOC TR CHOCO SAD 485G 3,00 1,80 1 1,20 5,50 1,27"
+#  EAN           désignation                   P.U.HT remise.U qté net.HT TVA net.TTC
+_AUCHAN_LINE = re.compile(
+    rf"^(?P<ean>\d{{8,14}})\s+(?P<desc>.+?)\s+"
+    rf"(?P<pu>\d+,\d{{2}})\s+"
+    rf"(?:(?P<remise>\d+,\d{{2}})\s+)?"
+    rf"(?P<qty>\d+(?:,\d{{1,3}})?)\s+"
+    rf"(?P<net>{_TOTAL})\s+"
+    rf"(?P<tva>\d+,\d{{2}})\s+"
+    rf"(?P<ttc>{_TOTAL})$"
+)
+
+# "Eco-participation : 0,10 0,20 0,21"  (unitaire HT, total HT, total TTC)
+_AUCHAN_ECO = re.compile(r"^.co-participation\s*:.*?(?P<ttc>-?\d+,\d{2})$", re.I)
+
+
+def is_auchan(text):
+    return "Groupe Auchan" in text or "AUCHAN HYPERMARCHE" in text or re.search(r"\bAHY\d{8,}", text)
+
+
+def parse_auchan(text):
+    result = _empty("auchan", "Auchan")
+
+    m = re.search(r"\b(AHY\d{8,})\b", text)
+    if m:
+        result["invoice_number"] = m.group(1)
+
+    # libellé et date sur des lignes différentes (mise en page en 2 colonnes) :
+    # « Facture éditée le : » … « 08/11/2026 » puis « Date de commande : » … « 06/11/2026 »
+    m = re.search(r"dit.e le\s*:.*?(\d{2}/\d{2}/\d{4})", text, re.S)
+    if m:
+        result["invoice_date"] = _iso(m.group(1))
+
+    m = re.search(r"Date de commande\s*:.*?(\d{2}/\d{2}/\d{4})", text, re.S)
+    if m:
+        result["delivery_date"] = _iso(m.group(1))   # date d'achat réelle
+
+    m = re.search(r"Total . payer[^\d\n]*(\d{1,3}(?: \d{3})*,\d{2})", text)
+    if m:
+        result["total_ttc"] = _num(m.group(1))
+
+    for raw in text.split("\n"):
+        line = raw.strip()
+
+        em = _AUCHAN_ECO.match(line)
+        if em:
+            amount = _num(em.group("ttc"))
+            if amount:
+                result["lines"].append(_line(
+                    "ECO-PART", "Éco-participation", 1, amount, amount, kind="discount"
+                ))
+            continue
+
+        lm = _AUCHAN_LINE.match(line)
+        if not lm:
+            continue
+
+        ean = lm.group("ean")
+        desc = lm.group("desc")
+        rate = _num(lm.group("tva"))
+        qty = _num(lm.group("qty"))
+        pu_ht = _num(lm.group("pu"))
+        remise_ht = _num(lm.group("remise")) if lm.group("remise") else 0.0
+        net_ht = _num(lm.group("net"))
+        total_ttc = _num(lm.group("ttc"))   # montant TTC imprimé : pas d'arrondi de conversion
+
+        if qty == 0:
+            continue
+
+        if abs((pu_ht - remise_ht) * qty - net_ht) > max(0.05, 0.01 * abs(net_ht)):
+            result["warnings"].append(
+                f"{ean} {desc} : ligne ambiguë ({lm.group('pu')} − {lm.group('remise') or '0'}) "
+                f"× {lm.group('qty')} ≠ {lm.group('net')} € HT, à vérifier"
+            )
+
+        if total_ttc < 0:
+            # remise de lot plus grande que l'article (promo répartie sur d'autres articles) :
+            # article au prix normal + ligne de remise séparée
+            gross_ttc = round(_ttc(pu_ht * qty, rate), 2)
+            result["lines"].append(_line(ean, desc, qty, gross_ttc / qty, gross_ttc, rate))
+            result["lines"].append(_line(
+                "REMISE", f"Remise lot {desc}", 1, total_ttc - gross_ttc, total_ttc - gross_ttc,
+                rate, kind="discount",
+            ))
+            result["warnings"].append(
+                f"{ean} {desc} : remise lot {remise_ht:.2f} € HT/u supérieure au prix, "
+                f"article compté au prix normal + ligne de remise {total_ttc - gross_ttc:.2f} €"
+            )
+            continue
+
+        if remise_ht:
+            result["warnings"].append(
+                f"{ean} {desc} : remise {lm.group('remise')} € HT/u déduite du prix"
+            )
+
+        result["lines"].append(_line(ean, desc, qty, total_ttc / qty, total_ttc, rate))
+
+    return _finalize(result)
+
+
 def parse_supplier_invoice(pdf_bytes):
     text = extract_text(pdf_bytes)
+
+    if is_auchan(text):
+        return parse_auchan(text)
 
     if is_metro(text):
         # filigrane « Duplicata » en gros caractères gris mélangé au texte
@@ -750,6 +857,6 @@ def parse_supplier_invoice(pdf_bytes):
     result = _empty(None, "")
     result["lines_total"] = 0
     result["warnings"].append(
-        "Format de facture non reconnu (gérés : Yen Anh, Metro, Exostar, Emballage futé, Delidrinks, Nhu Y)"
+        "Format de facture non reconnu (gérés : Yen Anh, Metro, Exostar, Emballage futé, Delidrinks, Nhu Y, Auchan)"
     )
     return result
