@@ -2162,6 +2162,129 @@ def _save_stock_products(updates):
     return _push_stock_to_sheet(sheet_changes) if sheet_changes else []
 
 
+@app.route("/admin/stock/inventory", methods=["POST"])
+def stock_inventory():
+    """
+    Inventaire d'un fournisseur (onglet Google Sheet) depuis l'outil « Inventaire » de stock.html.
+    Body : {supplier, date: "YYYY-MM-DD", counts: [{id, stock_quantity}]}   (quantités en unité stock)
+
+    Même effet qu'un contrôle saisi dans Google Sheet puis synchronisé :
+    - stock_quantity + stock_date (date du contrôle) pour TOUS les produits du fournisseur
+      (produit non compté = stock inchangé, confirmé à la date du contrôle)
+    - snapshot du jour + mouvement CONSUMPTION / INVENTORY_ADJUSTMENT pour chaque écart
+    - Google Sheet : colonne « Stock Réel » des écarts + date du contrôle en D2
+    """
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json or {}
+    supplier_in = (data.get("supplier") or "").strip()
+
+    try:
+        inv_date = datetime.strptime(data.get("date") or "", "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify({"error": "Date d'inventaire invalide"}), 400
+
+    if inv_date > datetime.now(paris_tz).date():
+        return jsonify({"error": "La date d'inventaire ne peut pas être dans le futur"}), 400
+
+    if not supplier_in:
+        return jsonify({"error": "Fournisseur obligatoire"}), 400
+
+    counts = {}
+    for c in data.get("counts") or []:
+        try:
+            qty = float(c.get("stock_quantity"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "Quantité invalide"}), 400
+        if qty < 0:
+            return jsonify({"error": "Quantité négative interdite"}), 400
+        counts[int(c.get("id"))] = qty
+
+    sheet_changes = []
+    summary = {"counted": 0, "unchanged": 0, "adjusted": 0}
+
+    # transaction : tout l'inventaire est enregistré, ou rien (get_conn() est en autocommit)
+    conn = get_conn()
+    conn.autocommit = False
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+            SELECT id, name, supplier, stock_quantity, purchase_unit, stock_date
+            FROM stock_products
+            WHERE LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+            """, (supplier_in,))
+            products = cur.fetchall()
+
+            if not products:
+                return jsonify({"error": f"Aucun produit chez « {supplier_in} »"}), 404
+
+            supplier = products[0][2]
+
+            # vérification AVANT toute écriture (sortie du bloc = commit)
+            for pid, name, _, _, _, old_date in products:
+                if pid in counts and old_date and inv_date < old_date:
+                    return jsonify({
+                        "error": f"« {name} » a déjà un contrôle plus récent ({old_date.strftime('%d/%m/%Y')}) : "
+                                 f"choisissez une date ≥ à celle-ci"
+                    }), 400
+
+            for pid, name, _, old_qty, purchase_unit, old_date in products:
+                old_qty = float(old_qty or 0)
+
+                if pid in counts:
+                    new_qty = counts[pid]
+                    summary["counted"] += 1
+                else:
+                    new_qty = old_qty
+                    summary["unchanged"] += 1
+
+                cur.execute("""
+                INSERT INTO stock_snapshots (snapshot_date, product_name, supplier, stock_quantity, purchase_unit)
+                VALUES (%s,%s,%s,%s,%s)
+                ON CONFLICT (snapshot_date, LOWER(product_name), LOWER(supplier))
+                DO UPDATE SET stock_quantity = EXCLUDED.stock_quantity,
+                              purchase_unit = EXCLUDED.purchase_unit,
+                              created_at = NOW()
+                """, (inv_date, name, supplier, new_qty, purchase_unit))
+
+                cur.execute("""
+                UPDATE stock_products
+                SET stock_quantity = %s,
+                    stock_date = GREATEST(COALESCE(stock_date, %s), %s),
+                    updated_at = NOW()
+                WHERE id = %s
+                """, (new_qty, inv_date, inv_date, pid))
+
+                delta = new_qty - old_qty
+                if abs(delta) > 1e-9:
+                    summary["adjusted"] += 1
+                    cur.execute("""
+                    INSERT INTO stock_movements
+                    (product_name, supplier, movement_type, quantity, total_price,
+                     purchase_date, purchase_unit, note)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                    """, (
+                        name, supplier,
+                        "CONSUMPTION" if delta < 0 else "INVENTORY_ADJUSTMENT",
+                        delta, 0, inv_date, purchase_unit,
+                        "Inventaire RestoPi"
+                    ))
+                    sheet_changes.append((supplier, name, {"Stock Réel": new_qty}))
+    finally:
+        conn.close()
+
+    # Google Sheet (source of truth) : stocks + date du contrôle (D2)
+    sheet_errors = _push_stock_to_sheet(sheet_changes) if sheet_changes else []
+    try:
+        spreadsheet.worksheet(supplier).update_acell("D2", inv_date.strftime("%d/%m/%Y"))
+    except Exception as e:
+        sheet_errors.append(f"Date de contrôle (D2) non écrite dans l'onglet « {supplier} » : {e}")
+
+    return jsonify({"success": True, "summary": summary, "sheet_errors": sheet_errors})
+
+
 @app.route("/admin/stock/update", methods=["POST"])
 def update_stock_product():
 
