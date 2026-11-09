@@ -4734,7 +4734,7 @@ def costing_purchase_tva():
     return jsonify({"success": True})
 
 
-_CONTENT_UNITS = {"g": "g", "kg": "kg", "ml": "ml", "cl": "cl", "l": "L"}
+_CONTENT_UNITS = {"g": "g", "kg": "kg", "ml": "ml", "cl": "cl", "l": "L", "pce": "pce"}
 
 
 @app.route("/admin/costing/content", methods=["POST"])
@@ -4763,7 +4763,7 @@ def costing_content():
         if qty <= 0:
             return jsonify({"error": "Contenu invalide (nombre > 0)"}), 400
         if not unit:
-            return jsonify({"error": "Unité de contenu invalide (g, kg, ml, cl, L)"}), 400
+            return jsonify({"error": "Unité de contenu invalide (g, kg, ml, cl, L, pce)"}), 400
 
     with get_conn() as conn:
         with conn.cursor() as cur:
