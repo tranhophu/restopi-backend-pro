@@ -1400,7 +1400,9 @@ def get_products():
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM products")
+            # seulement les plats en vente sur le site ; les brouillons
+            # (active = FALSE) se gèrent dans « Coût des plats »
+            cur.execute("SELECT * FROM products WHERE active = TRUE")
             rows = cur.fetchall()
 
     result = []
@@ -4198,7 +4200,7 @@ def costing_data():
         with conn.cursor() as cur:
 
             cur.execute("""
-            SELECT id, name, price, category, tva, active
+            SELECT id, name, price, category, tva, active, img
             FROM products
             ORDER BY category, name
             """)
@@ -4206,7 +4208,8 @@ def costing_data():
                 {
                     "id": r[0], "name": r[1], "price": float(r[2] or 0),
                     "category": r[3] or "", "tva": float(r[4] if r[4] is not None else 10),
-                    "active": r[5] is not False
+                    "active": r[5] is not False,
+                    "img": r[6] or "",
                 }
                 for r in cur.fetchall()
             ]
@@ -4732,6 +4735,77 @@ def costing_purchase_tva():
                 return jsonify({"error": "Produit introuvable"}), 404
 
     return jsonify({"success": True})
+
+
+@app.route("/admin/costing/dish", methods=["POST"])
+def costing_dish():
+    """
+    Créer / modifier un plat de la carte (table products) depuis « Coût des plats ».
+    Body : {id?, name, price, category, tva, img?, active?}
+    Nouveau plat → active = FALSE par défaut (brouillon, invisible pour les clients).
+    active = TRUE → visible sur le site et commandable (checkout ne prend que les plats actifs).
+    """
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json or {}
+    name = (data.get("name") or "").strip()
+    category = (data.get("category") or "").strip()
+    img = (data.get("img") or "").strip() or None
+
+    try:
+        price = round(float(str(data.get("price")).replace(",", ".")), 2)
+        tva = float(str(data.get("tva") if data.get("tva") not in (None, "") else 10).replace(",", "."))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Prix ou TVA invalide"}), 400
+
+    if not name:
+        return jsonify({"error": "Nom du plat obligatoire"}), 400
+    if not category:
+        return jsonify({"error": "Catégorie obligatoire"}), 400
+    if price <= 0:
+        return jsonify({"error": "Prix TTC invalide (> 0)"}), 400
+    if tva not in (0, 5.5, 10, 20):
+        return jsonify({"error": "TVA invalide (0 ; 5,5 ; 10 ; 20)"}), 400
+
+    product_id = data.get("id")
+    active = bool(data.get("active", False))
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT id FROM products
+            WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s)) AND (%s::int IS NULL OR id <> %s::int)
+            """, (name, product_id, product_id))
+            if cur.fetchone():
+                return jsonify({"error": f"Un plat « {name} » existe déjà"}), 400
+
+            if product_id:
+                cur.execute("""
+                UPDATE products
+                SET name = %s, price = %s, category = %s, tva = %s, img = %s, active = %s
+                WHERE id = %s
+                RETURNING id
+                """, (name, price, category, tva, img, active, int(product_id)))
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "Plat introuvable"}), 404
+            else:
+                cur.execute("""
+                INSERT INTO products (name, price, category, tva, img, active, featured)
+                VALUES (%s, %s, %s, %s, %s, %s, FALSE)
+                RETURNING id
+                """, (name, price, category, tva, img, active))
+                row = cur.fetchone()
+
+    return jsonify({
+        "success": True,
+        "dish": {
+            "id": row[0], "name": name, "price": price, "category": category,
+            "tva": tva, "img": img or "", "active": active,
+        },
+    })
 
 
 _CONTENT_UNITS = {"g": "g", "kg": "kg", "ml": "ml", "cl": "cl", "l": "L", "pce": "pce"}
