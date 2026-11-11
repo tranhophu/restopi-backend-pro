@@ -447,6 +447,24 @@ def init_stock():
             );
             """)
 
+            # inventaires RestoPi : chaque produit compté (pour relire / vérifier après coup)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_inventory_lines (
+                id SERIAL PRIMARY KEY,
+                created_at TIMESTAMP NOT NULL,
+                inventory_date DATE NOT NULL,
+                supplier TEXT NOT NULL,
+                product_id INTEGER,
+                product_name TEXT NOT NULL,
+                theoretical FLOAT,
+                counted FLOAT NOT NULL
+            );
+            """)
+            cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_inventory_lines_session
+            ON stock_inventory_lines (created_at, supplier);
+            """)
+
             # prix référence
             cur.execute("""
             CREATE TABLE IF NOT EXISTS stock_reference_prices (
@@ -2236,6 +2254,12 @@ def stock_inventory():
                 if pid in counts:
                     new_qty = counts[pid]
                     summary["counted"] += 1
+                    # trace de la saisie (NOW() = même horodatage pour toute la transaction)
+                    cur.execute("""
+                    INSERT INTO stock_inventory_lines
+                    (created_at, inventory_date, supplier, product_id, product_name, theoretical, counted)
+                    VALUES (NOW(), %s, %s, %s, %s, %s, %s)
+                    """, (inv_date, supplier, pid, name, old_qty, new_qty))
                 else:
                     new_qty = old_qty
                     summary["unchanged"] += 1
@@ -2283,6 +2307,120 @@ def stock_inventory():
         sheet_errors.append(f"Date de contrôle (D2) non écrite dans l'onglet « {supplier} » : {e}")
 
     return jsonify({"success": True, "summary": summary, "sheet_errors": sheet_errors})
+
+
+@app.route("/admin/stock/inventory/history", methods=["GET"])
+def stock_inventory_history():
+    """
+    Inventaires validés depuis RestoPi (les N derniers jours), un par fournisseur et par validation.
+    - sessions enregistrées dans stock_inventory_lines : tous les produits comptés
+    - plus anciennes (avant ce journal) : seulement les écarts (stock_movements « Inventaire RestoPi »)
+    """
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    try:
+        days = max(1, min(int(request.args.get("days", 30)), 365))
+    except ValueError:
+        days = 30
+
+    sessions = {}
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+        SELECT created_at, inventory_date, supplier, COUNT(*),
+               SUM(CASE WHEN ABS(counted - COALESCE(theoretical, 0)) > 1e-9 THEN 1 ELSE 0 END)
+        FROM stock_inventory_lines
+        WHERE created_at > NOW() - (%s * INTERVAL '1 day')
+        GROUP BY 1, 2, 3
+        """, (days,))
+        for at, d, supplier, n, diffs in cur.fetchall():
+            sessions[(at, supplier.lower())] = {
+                "at": at.isoformat(), "date": d.isoformat(), "supplier": supplier,
+                "counted": n, "diffs": int(diffs or 0), "complete": True,
+            }
+
+        cur.execute("""
+        SELECT created_at, purchase_date, supplier, COUNT(*)
+        FROM stock_movements
+        WHERE note = 'Inventaire RestoPi'
+        AND created_at > NOW() - (%s * INTERVAL '1 day')
+        GROUP BY 1, 2, 3
+        """, (days,))
+        for at, d, supplier, n in cur.fetchall():
+            key = (at, supplier.lower())
+            if key in sessions:
+                continue
+            sessions[key] = {
+                "at": at.isoformat(), "date": d.isoformat() if d else None, "supplier": supplier,
+                "counted": None, "diffs": n, "complete": False,
+            }
+
+    out = sorted(sessions.values(), key=lambda s: s["at"], reverse=True)
+    return jsonify(out)
+
+
+@app.route("/admin/stock/inventory/history/detail", methods=["GET"])
+def stock_inventory_history_detail():
+    """
+    Détail d'une validation : quantité comptée, théorique avant, et les mouvements
+    enregistrés depuis (pour expliquer un stock actuel différent du comptage).
+    """
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    supplier = (request.args.get("supplier") or "").strip()
+    try:
+        at = datetime.fromisoformat(request.args.get("at") or "")
+    except ValueError:
+        return jsonify({"error": "Horodatage invalide"}), 400
+
+    lines = []
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+        SELECT product_id, product_name, theoretical, counted
+        FROM stock_inventory_lines
+        WHERE created_at = %s AND LOWER(supplier) = LOWER(%s)
+        ORDER BY LOWER(product_name)
+        """, (at, supplier))
+        rows = cur.fetchall()
+
+        if rows:
+            for pid, name, theo, counted in rows:
+                lines.append({"product_id": pid, "name": name, "theoretical": theo, "counted": counted})
+        else:
+            # ancienne validation : seuls les écarts sont connus
+            cur.execute("""
+            SELECT m.product_name, m.quantity, p.id
+            FROM stock_movements m
+            LEFT JOIN stock_products p
+              ON LOWER(TRIM(p.name)) = LOWER(TRIM(m.product_name))
+             AND LOWER(TRIM(p.supplier)) = LOWER(TRIM(m.supplier))
+            WHERE m.note = 'Inventaire RestoPi'
+            AND m.created_at = %s AND LOWER(m.supplier) = LOWER(%s)
+            ORDER BY LOWER(m.product_name)
+            """, (at, supplier))
+            for name, delta, pid in cur.fetchall():
+                lines.append({"product_id": pid, "name": name, "theoretical": None, "counted": None,
+                              "delta": delta})
+
+        # mouvements postérieurs à la validation (achats, synchro Google Sheet, autre inventaire…)
+        for line in lines:
+            cur.execute("""
+            SELECT created_at, movement_type, quantity, purchase_unit, note
+            FROM stock_movements
+            WHERE LOWER(TRIM(product_name)) = LOWER(TRIM(%s))
+            AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+            AND created_at > %s
+            ORDER BY created_at
+            LIMIT 10
+            """, (line["name"], supplier, at))
+            line["later"] = [
+                {"at": c.isoformat(), "type": t, "quantity": q, "unit": u,
+                 "note": (n or "").split("\n")[0][:80]}
+                for c, t, q, u, n in cur.fetchall()
+            ]
+
+    return jsonify({"complete": bool(rows), "lines": lines})
 
 
 @app.route("/admin/stock/update", methods=["POST"])
