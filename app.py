@@ -342,6 +342,11 @@ def init_stock():
                 LOWER(supplier)
             );
             """)
+            # suivi « à commander » : auto (dormant si pas d'achat récent) | active (toujours suivi) | inactive (jamais)
+            cur.execute("""
+            ALTER TABLE stock_products
+            ADD COLUMN IF NOT EXISTS order_tracking TEXT DEFAULT 'auto';
+            """)
             # mouvements
             cur.execute("""
             CREATE TABLE IF NOT EXISTS stock_movements (
@@ -1768,7 +1773,15 @@ def stock_products():
                 average_price,
                 last_purchase_price,
 
-                min_stock
+                min_stock,
+
+                COALESCE(order_tracking, 'auto'),
+
+                (SELECT MAX(m.purchase_date)
+                 FROM stock_movements m
+                 WHERE m.movement_type = 'ACHAT'
+                 AND LOWER(TRIM(m.product_name)) = LOWER(TRIM(stock_products.name))
+                 AND LOWER(TRIM(m.supplier)) = LOWER(TRIM(stock_products.supplier)))
             FROM stock_products
             ORDER BY name ASC
             """)
@@ -1797,11 +1810,38 @@ def stock_products():
 
             "average_price": r[10],
             "last_purchase_price": r[11],
-            "min_stock": r[12]
+            "min_stock": r[12],
+
+            "order_tracking": r[13],
+            "last_purchase_date": str(r[14]) if r[14] else ""
 
         })
 
     return jsonify(result)
+
+
+@app.route("/admin/stock/tracking", methods=["POST"])
+def stock_set_tracking():
+    """Suivi « à commander » d'un produit : auto | active | inactive."""
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json or {}
+    tracking = data.get("tracking")
+    if tracking not in ("auto", "active", "inactive"):
+        return jsonify({"error": "Valeur invalide"}), 400
+
+    try:
+        product_id = int(data.get("id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Produit invalide"}), 400
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE stock_products SET order_tracking = %s WHERE id = %s", (tracking, product_id))
+        if cur.rowcount == 0:
+            return jsonify({"error": "Produit introuvable"}), 404
+
+    return jsonify({"success": True})
 
 
 def _create_stock_products(items, fail_if_exists=False):
