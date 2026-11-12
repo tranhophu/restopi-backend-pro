@@ -19,6 +19,8 @@ from oauth2client.service_account import ServiceAccountCredentials
 import json
 from sync_stock import sync_stock
 from invoice_parsers import parse_supplier_invoice
+import sheet_duplicates
+import threading
 import difflib
 import unicodedata
 
@@ -4480,6 +4482,85 @@ def refresh_stock():
     result = sync_stock()
 
     return jsonify(result)
+
+
+# =========================
+# DOUBLONS & TRI GOOGLE SHEET
+# =========================
+
+_SORT_SHEET_LOCK = threading.Lock()
+
+
+def _supplier_worksheet(name):
+    name = (name or "").strip().lower()
+    for ws in sheet_duplicates.supplier_tabs(spreadsheet):
+        if ws.title.strip().lower() == name:
+            return ws
+    return None
+
+
+@app.route("/admin/stock/similar-products", methods=["GET"])
+def similar_products():
+    """
+    Produits en double / presque identiques dans Google Sheet (lecture seule).
+    ?supplier=Metro → un seul onglet ; sans paramètre → tous les onglets
+    + les noms présents chez plusieurs fournisseurs.
+    """
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    supplier = (request.args.get("supplier") or "").strip()
+
+    try:
+        if supplier:
+            ws = _supplier_worksheet(supplier)
+            if not ws:
+                return jsonify({"error": f"Onglet « {supplier} » introuvable dans Google Sheet"}), 404
+            tabs = [ws]
+        else:
+            tabs = sheet_duplicates.supplier_tabs(spreadsheet)
+
+        return jsonify({
+            "suppliers": [sheet_duplicates.analyse_tab(ws) for ws in tabs],
+            "cross_supplier": [] if supplier
+            else sheet_duplicates.cross_supplier_duplicates(spreadsheet, tabs),
+        })
+
+    except Exception as e:
+        return jsonify({"error": f"Google Sheet : {e}"}), 500
+
+
+@app.route("/admin/stock/sort-sheet", methods=["POST"])
+def sort_sheet():
+    """
+    Trie par nom les produits d'un onglet fournisseur de Google Sheet.
+    Lignes 1-2 (en-têtes, dates) inchangées. Body : {supplier}
+    """
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    supplier = ((request.json or {}).get("supplier") or "").strip()
+    if not supplier:
+        return jsonify({"error": "Fournisseur obligatoire"}), 400
+
+    ws = _supplier_worksheet(supplier)
+    if not ws:
+        return jsonify({"error": f"Onglet « {supplier} » introuvable dans Google Sheet"}), 404
+
+    if not _SORT_SHEET_LOCK.acquire(blocking=False):
+        return jsonify({"error": "Un tri est déjà en cours, réessayez dans quelques secondes"}), 409
+
+    try:
+        result = sheet_duplicates.sort_tab(spreadsheet, ws)
+        return jsonify({"success": True, "supplier": ws.title, **result})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Google Sheet : {e}"}), 500
+    finally:
+        _SORT_SHEET_LOCK.release()
 
 
 # =========================
