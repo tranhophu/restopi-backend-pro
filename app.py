@@ -2465,6 +2465,180 @@ def stock_inventory_history_detail():
     return jsonify({"complete": bool(rows), "lines": lines})
 
 
+# =========================
+# HISTORIQUE DES STOCKS (stock_snapshots)
+# Un snapshot = stock d'un produit à une date de contrôle, quelle que soit la source
+# (inventaire RestoPi ou contrôle saisi dans Google Sheet puis synchronisé).
+# =========================
+
+def _purchases_between(cur, supplier, start, end, name=None):
+    """
+    Achats / retours (ACHAT, RETOUR) d'un fournisseur avec start < purchase_date <= end.
+    → {product_lower: [(purchase_date, quantity, purchase_unit)]}   (start None = depuis toujours)
+    """
+    params = [supplier, end]
+    sql = """
+    SELECT LOWER(TRIM(product_name)), purchase_date, quantity, purchase_unit
+    FROM stock_movements
+    WHERE movement_type IN ('ACHAT', 'RETOUR')
+    AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+    AND purchase_date <= %s
+    """
+    if start is not None:
+        sql += " AND purchase_date > %s"
+        params.append(start)
+    if name is not None:
+        sql += " AND LOWER(TRIM(product_name)) = LOWER(TRIM(%s))"
+        params.append(name)
+    cur.execute(sql, params)
+    out = {}
+    for key, d, q, u in cur.fetchall():
+        out.setdefault(key, []).append((d, float(q or 0), u))
+    return out
+
+
+def _sum_purchases(items, after, until):
+    """Achats d'un produit entre deux contrôles, regroupés par unité d'achat."""
+    by_unit = {}
+    for d, q, u in items or []:
+        if (after is None or d > after) and d <= until:
+            k = (u or "").strip()
+            by_unit[k] = by_unit.get(k, 0) + q
+    return [{"quantity": round(q, 4), "unit": u} for u, q in by_unit.items() if abs(q) > 1e-9]
+
+
+@app.route("/admin/stock/snapshots", methods=["GET"])
+def stock_snapshots_list():
+    """Contrôles de stock (snapshots) des N derniers jours, un par date et par fournisseur."""
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    try:
+        days = max(1, min(int(request.args.get("days", 90)), 3650))
+    except ValueError:
+        days = 90
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+        SELECT s.snapshot_date, MIN(s.supplier), COUNT(*), MAX(s.created_at),
+               EXISTS (
+                   SELECT 1 FROM stock_inventory_lines l
+                   WHERE l.inventory_date = s.snapshot_date
+                   AND LOWER(TRIM(l.supplier)) = LOWER(TRIM(MIN(s.supplier)))
+               ) OR EXISTS (
+                   SELECT 1 FROM stock_movements m
+                   WHERE m.note = 'Inventaire RestoPi'
+                   AND m.purchase_date = s.snapshot_date
+                   AND LOWER(TRIM(m.supplier)) = LOWER(TRIM(MIN(s.supplier)))
+               )
+        FROM stock_snapshots s
+        WHERE s.snapshot_date >= CURRENT_DATE - %s
+        GROUP BY s.snapshot_date, LOWER(TRIM(s.supplier))
+        ORDER BY s.snapshot_date DESC, LOWER(TRIM(MIN(s.supplier)))
+        """, (days,))
+        rows = cur.fetchall()
+
+    return jsonify([
+        {
+            "date": d.isoformat(), "supplier": sup, "products": n,
+            "updated_at": at.isoformat() if at else None,
+            "source": "restopi" if restopi else "sheet",
+        }
+        for d, sup, n, at, restopi in rows
+    ])
+
+
+@app.route("/admin/stock/snapshots/detail", methods=["GET"])
+def stock_snapshots_detail():
+    """
+    Stock de chaque produit d'un fournisseur au contrôle du jour donné, comparé au contrôle précédent
+    du même produit, avec les achats reçus entre les deux (→ consommation réelle calculée côté page).
+    """
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    supplier = (request.args.get("supplier") or "").strip()
+    try:
+        snap_date = datetime.strptime(request.args.get("date") or "", "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify({"error": "Date invalide"}), 400
+    if not supplier:
+        return jsonify({"error": "Fournisseur obligatoire"}), 400
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+        SELECT s.product_name, s.stock_quantity, s.purchase_unit, prev.snapshot_date, prev.stock_quantity
+        FROM stock_snapshots s
+        LEFT JOIN LATERAL (
+            SELECT p.snapshot_date, p.stock_quantity
+            FROM stock_snapshots p
+            WHERE LOWER(TRIM(p.product_name)) = LOWER(TRIM(s.product_name))
+            AND LOWER(TRIM(p.supplier)) = LOWER(TRIM(s.supplier))
+            AND p.snapshot_date < s.snapshot_date
+            ORDER BY p.snapshot_date DESC
+            LIMIT 1
+        ) prev ON TRUE
+        WHERE s.snapshot_date = %s AND LOWER(TRIM(s.supplier)) = LOWER(TRIM(%s))
+        ORDER BY LOWER(s.product_name)
+        """, (snap_date, supplier))
+        rows = cur.fetchall()
+
+        prev_dates = [r[3] for r in rows if r[3]]
+        purchases = _purchases_between(cur, supplier, min(prev_dates) if prev_dates else None, snap_date)
+
+    lines = []
+    for name, qty, unit, prev_date, prev_qty in rows:
+        lines.append({
+            "name": name,
+            "quantity": qty,
+            "unit": unit,
+            "prev_date": prev_date.isoformat() if prev_date else None,
+            "prev_quantity": prev_qty,
+            "purchases": _sum_purchases(purchases.get(name.strip().lower()), prev_date, snap_date)
+                         if prev_date else [],
+        })
+    return jsonify({"date": snap_date.isoformat(), "supplier": supplier, "lines": lines})
+
+
+@app.route("/admin/stock/snapshots/product", methods=["GET"])
+def stock_snapshots_product():
+    """Évolution du stock d'un produit : tous ses contrôles, avec les achats entre deux contrôles."""
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    supplier = (request.args.get("supplier") or "").strip()
+    name = (request.args.get("name") or "").strip()
+    if not supplier or not name:
+        return jsonify({"error": "Produit et fournisseur obligatoires"}), 400
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+        SELECT snapshot_date, stock_quantity, purchase_unit
+        FROM stock_snapshots
+        WHERE LOWER(TRIM(product_name)) = LOWER(TRIM(%s))
+        AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+        ORDER BY snapshot_date
+        """, (name, supplier))
+        snaps = cur.fetchall()
+        purchases = (
+            _purchases_between(cur, supplier, None, snaps[-1][0], name=name).get(name.lower(), [])
+            if snaps else []
+        )
+
+    points = []
+    prev = None
+    for d, qty, unit in snaps:
+        points.append({
+            "date": d.isoformat(),
+            "quantity": qty,
+            "unit": unit,
+            "purchases": _sum_purchases(purchases, prev, d) if prev else [],
+        })
+        prev = d
+    points.reverse()  # plus récent d'abord
+    return jsonify({"name": name, "supplier": supplier, "points": points})
+
+
 @app.route("/admin/stock/update", methods=["POST"])
 def update_stock_product():
 
