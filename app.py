@@ -471,6 +471,12 @@ def init_stock():
             CREATE INDEX IF NOT EXISTS idx_stock_inventory_lines_session
             ON stock_inventory_lines (created_at, supplier);
             """)
+            # correction d'un comptage après validation : valeur d'origine gardée pour la trace
+            cur.execute("""
+            ALTER TABLE stock_inventory_lines
+            ADD COLUMN IF NOT EXISTS counted_original FLOAT,
+            ADD COLUMN IF NOT EXISTS corrected_at TIMESTAMP;
+            """)
 
             # import de liste de comptage : « nom écrit » (normalisé) → produit confirmé, partagé entre appareils
             cur.execute("""
@@ -2360,6 +2366,149 @@ def stock_inventory():
     return jsonify({"success": True, "summary": summary, "sheet_errors": sheet_errors})
 
 
+@app.route("/admin/stock/inventory/correct", methods=["POST"])
+def stock_inventory_correct():
+    """
+    Corrige une quantité comptée par erreur dans un inventaire déjà validé.
+    Body : {supplier, at (horodatage de la validation), product_id, counted (unité stock)}
+
+    Seulement si le produit n'a pas été recompté depuis (sinon le stock actuel ne dépend plus
+    de ce comptage : il faut corriger le contrôle le plus récent). Effets :
+    - ligne d'inventaire : nouveau compté (valeur d'origine gardée dans counted_original)
+    - mouvement CONSUMPTION / INVENTORY_ADJUSTMENT de cette validation recalculé (consommation juste)
+    - snapshots depuis la date du contrôle + stock actuel : + (nouveau − ancien)
+    - Google Sheet : Stock Réel
+    """
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.json or {}
+    supplier_in = (data.get("supplier") or "").strip()
+    try:
+        at = datetime.fromisoformat(data.get("at") or "")
+        product_id = int(data.get("product_id"))
+        counted = float(data.get("counted"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Données invalides"}), 400
+    if counted < 0:
+        return jsonify({"error": "Quantité négative interdite"}), 400
+
+    conn = get_conn()
+    conn.autocommit = False
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+            SELECT id, inventory_date, product_name, theoretical, counted
+            FROM stock_inventory_lines
+            WHERE created_at = %s AND LOWER(supplier) = LOWER(%s) AND product_id = %s
+            FOR UPDATE
+            """, (at, supplier_in, product_id))
+            line = cur.fetchone()
+            if not line:
+                return jsonify({"error": "Ligne d'inventaire introuvable"}), 404
+            line_id, inv_date, line_name, theoretical, old_counted = line
+            old_counted = float(old_counted or 0)
+            fix = counted - old_counted
+            if abs(fix) < 1e-9:
+                return jsonify({"success": True, "unchanged": True})
+
+            cur.execute("""
+            SELECT name, supplier, stock_quantity, purchase_unit
+            FROM stock_products WHERE id = %s
+            FOR UPDATE
+            """, (product_id,))
+            prod = cur.fetchone()
+            if not prod:
+                return jsonify({"error": "Produit supprimé : correction impossible"}), 404
+            name, supplier, stock_qty, purchase_unit = prod
+
+            cur.execute("""
+            SELECT created_at, inventory_date FROM stock_inventory_lines
+            WHERE product_id = %s AND created_at > %s
+            ORDER BY created_at DESC LIMIT 1
+            """, (product_id, at))
+            newer = cur.fetchone()
+            if newer:
+                return jsonify({
+                    "error": f"« {name} » a été recompté depuis (inventaire du {newer[1].strftime('%d/%m/%Y')}, "
+                             f"validé le {newer[0].strftime('%d/%m/%Y %H:%M')} UTC) : corrigez ce dernier inventaire."
+                }), 409
+            # stock recompté depuis via Google Sheet (« Stock Réel » modifié → mouvement d'ajustement)
+            cur.execute("""
+            SELECT created_at FROM stock_movements
+            WHERE movement_type IN ('CONSUMPTION', 'INVENTORY_ADJUSTMENT')
+            AND created_at > %s
+            AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+            AND LOWER(TRIM(product_name)) IN (LOWER(TRIM(%s)), LOWER(TRIM(%s)))
+            ORDER BY created_at DESC LIMIT 1
+            """, (at, supplier, line_name, name))
+            later_adj = cur.fetchone()
+            if later_adj:
+                return jsonify({
+                    "error": f"« {name} » a été recompté depuis (ajustement du "
+                             f"{later_adj[0].strftime('%d/%m/%Y %H:%M')} UTC, Google Sheet ?) : "
+                             f"corrigez le stock dans le contrôle le plus récent."
+                }), 409
+
+            # 1) ligne d'inventaire (la toute première valeur saisie est gardée)
+            cur.execute("""
+            UPDATE stock_inventory_lines
+            SET counted = %s,
+                counted_original = COALESCE(counted_original, counted),
+                corrected_at = NOW()
+            WHERE id = %s
+            """, (counted, line_id))
+
+            # 2) mouvement d'inventaire de cette validation : écart = compté − théorique
+            new_delta = counted - float(theoretical or 0)
+            cur.execute("""
+            SELECT id FROM stock_movements
+            WHERE note = 'Inventaire RestoPi' AND created_at = %s
+            AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+            AND LOWER(TRIM(product_name)) IN (LOWER(TRIM(%s)), LOWER(TRIM(%s)))
+            LIMIT 1
+            """, (at, supplier, line_name, name))
+            mv = cur.fetchone()
+            mv_type = "CONSUMPTION" if new_delta < 0 else "INVENTORY_ADJUSTMENT"
+            if mv and abs(new_delta) < 1e-9:
+                cur.execute("DELETE FROM stock_movements WHERE id = %s", (mv[0],))
+            elif mv:
+                cur.execute("""
+                UPDATE stock_movements SET quantity = %s, movement_type = %s WHERE id = %s
+                """, (new_delta, mv_type, mv[0]))
+            elif abs(new_delta) > 1e-9:
+                cur.execute("""
+                INSERT INTO stock_movements
+                (product_name, supplier, movement_type, quantity, total_price,
+                 purchase_date, purchase_unit, note, created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (name, supplier, mv_type, new_delta, 0, inv_date, purchase_unit,
+                      "Inventaire RestoPi", at))
+
+            # 3) stock aux dates de contrôle depuis (produit non recompté → tous décalés de la même erreur)
+            cur.execute("""
+            UPDATE stock_snapshots
+            SET stock_quantity = COALESCE(stock_quantity, 0) + %s, created_at = NOW()
+            WHERE snapshot_date >= %s
+            AND LOWER(supplier) = LOWER(%s)
+            AND LOWER(product_name) IN (LOWER(%s), LOWER(%s))
+            """, (fix, inv_date, supplier, line_name, name))
+
+            # 4) stock actuel
+            new_stock = float(stock_qty or 0) + fix
+            cur.execute("""
+            UPDATE stock_products SET stock_quantity = %s, updated_at = NOW() WHERE id = %s
+            """, (new_stock, product_id))
+    finally:
+        conn.close()
+
+    sheet_errors = _push_stock_to_sheet([(supplier, name, {"Stock Réel": new_stock})])
+    return jsonify({
+        "success": True, "old_counted": old_counted, "counted": counted,
+        "stock_quantity": new_stock, "sheet_errors": sheet_errors,
+    })
+
+
 @app.route("/admin/stock/inventory/aliases", methods=["GET"])
 def stock_inventory_aliases_get():
     """Associations « nom écrit » → produit, confirmées lors des imports de liste de comptage."""
@@ -2488,16 +2637,31 @@ def stock_inventory_history_detail():
     lines = []
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("""
-        SELECT product_id, product_name, theoretical, counted
-        FROM stock_inventory_lines
-        WHERE created_at = %s AND LOWER(supplier) = LOWER(%s)
-        ORDER BY LOWER(product_name)
+        SELECT l.product_id, l.product_name, l.theoretical, l.counted, l.counted_original, l.corrected_at,
+               (
+                 EXISTS (SELECT 1 FROM stock_inventory_lines n
+                         WHERE n.product_id = l.product_id AND n.created_at > l.created_at)
+                 OR EXISTS (SELECT 1 FROM stock_movements m
+                            WHERE m.movement_type IN ('CONSUMPTION', 'INVENTORY_ADJUSTMENT')
+                            AND m.created_at > l.created_at
+                            AND LOWER(TRIM(m.supplier)) = LOWER(TRIM(l.supplier))
+                            AND LOWER(TRIM(m.product_name)) = LOWER(TRIM(l.product_name)))
+               ) AS superseded
+        FROM stock_inventory_lines l
+        WHERE l.created_at = %s AND LOWER(l.supplier) = LOWER(%s)
+        ORDER BY LOWER(l.product_name)
         """, (at, supplier))
         rows = cur.fetchall()
 
         if rows:
-            for pid, name, theo, counted in rows:
-                lines.append({"product_id": pid, "name": name, "theoretical": theo, "counted": counted})
+            for pid, name, theo, counted, original, corrected_at, superseded in rows:
+                lines.append({
+                    "product_id": pid, "name": name, "theoretical": theo, "counted": counted,
+                    "counted_original": original,
+                    "corrected_at": corrected_at.isoformat() if corrected_at else None,
+                    # recompté depuis (autre inventaire / contrôle Google Sheet plus récent) : correction impossible
+                    "superseded": bool(superseded),
+                })
         else:
             # ancienne validation : seuls les écarts sont connus
             cur.execute("""
