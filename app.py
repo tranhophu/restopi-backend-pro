@@ -472,6 +472,15 @@ def init_stock():
             ON stock_inventory_lines (created_at, supplier);
             """)
 
+            # import de liste de comptage : « nom écrit » (normalisé) → produit confirmé, partagé entre appareils
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_inventory_aliases (
+                alias_key TEXT PRIMARY KEY,
+                product_id INTEGER NOT NULL,
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+            """)
+
             # prix référence
             cur.execute("""
             CREATE TABLE IF NOT EXISTS stock_reference_prices (
@@ -2349,6 +2358,66 @@ def stock_inventory():
         sheet_errors.append(f"Date de contrôle (D2) non écrite dans l'onglet « {supplier} » : {e}")
 
     return jsonify({"success": True, "summary": summary, "sheet_errors": sheet_errors})
+
+
+@app.route("/admin/stock/inventory/aliases", methods=["GET"])
+def stock_inventory_aliases_get():
+    """Associations « nom écrit » → produit, confirmées lors des imports de liste de comptage."""
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT a.alias_key, a.product_id
+            FROM stock_inventory_aliases a
+            JOIN stock_products p ON p.id = a.product_id
+            """)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    return jsonify({"aliases": {k: pid for k, pid in rows}})
+
+
+@app.route("/admin/stock/inventory/aliases", methods=["POST"])
+def stock_inventory_aliases_save():
+    """Body : {aliases: {"nom normalise": product_id, ...}} → ajout / mise à jour."""
+
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    aliases = (request.json or {}).get("aliases") or {}
+    if not isinstance(aliases, dict):
+        return jsonify({"error": "Format invalide"}), 400
+
+    clean = []
+    for key, pid in aliases.items():
+        key = str(key or "").strip().lower()[:200]
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if key:
+            clean.append((key, pid))
+
+    if clean:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                for key, pid in clean:
+                    cur.execute("""
+                    INSERT INTO stock_inventory_aliases (alias_key, product_id, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (alias_key)
+                    DO UPDATE SET product_id = EXCLUDED.product_id, updated_at = NOW()
+                    """, (key, pid))
+        finally:
+            conn.close()
+
+    return jsonify({"success": True, "saved": len(clean)})
 
 
 @app.route("/admin/stock/inventory/history", methods=["GET"])
