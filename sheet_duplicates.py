@@ -175,6 +175,85 @@ def cross_supplier_duplicates(spreadsheet, tabs=None):
     return sorted(cross, key=lambda v: sort_key(v[0]["name"]))
 
 
+# =========================
+# AJOUT D'UN PRODUIT PRÈS DES PRODUITS SIMILAIRES
+# =========================
+
+NEAR_THRESHOLD = 0.55  # en dessous : aucun produit assez proche → ajout en fin de liste
+
+
+def _near_score(new_name, existing_name):
+    """proximité pour le placement (plus large que la détection de doublons)"""
+    score, _ = similarity(new_name, existing_name)
+    ba, bb = base_words(new_name), base_words(existing_name)
+    if ba and bb:
+        common = ba & bb
+        score = max(score, len(common) / len(ba | bb))
+        # même premier mot significatif (« vinaigre blanc 10l » ↔ « vinaigre alcool ») : petit bonus
+        fa = next((w for w in normalize(new_name).split() if w in ba), None)
+        fb = next((w for w in normalize(existing_name).split() if w in bb), None)
+        if fa and fa == fb:
+            score = max(score, 0.5 + 0.5 * len(common) / len(ba | bb))
+    return score
+
+
+def insert_rows_near_similar(ws, rows):
+    """
+    Ajoute des lignes produits dans l'onglet : chaque ligne est insérée juste sous le
+    produit existant le plus proche (même nom, autre taille…). Sans produit proche,
+    la ligne va à la fin de la liste.
+    rows : listes de valeurs dont la 1re = nom du produit (colonne Produit = A).
+    Retourne [(nom, nom du voisin ou None)].
+    """
+    values = ws.get_all_values()
+    col, _ = read_tab_names(ws, values)
+
+    if col != 0:
+        # structure inattendue : comportement historique
+        ws.append_rows(rows, value_input_option="RAW")
+        return [(r[0], None) for r in rows]
+
+    # [(numéro de ligne 1-indexé, nom)] des lignes produits remplies
+    existing = [
+        (FIRST_DATA_ROW + i, (r[0] if r else "").strip())
+        for i, r in enumerate(values[FIRST_DATA_ROW - 1:])
+    ]
+    existing = [(n, name) for n, name in existing if name]
+    last_row = existing[-1][0] if existing else FIRST_DATA_ROW - 1
+
+    placed = []
+
+    for row in rows:
+        new_name = str(row[0]).strip()
+        best_score, best_row, best_name = 0, None, None
+        for n, name in existing:
+            s = _near_score(new_name, name)
+            # à score égal, la ligne la plus basse : on se range à la fin du groupe
+            if s >= best_score:
+                best_score, best_row, best_name = s, n, name
+
+        if best_row is not None and best_score >= NEAR_THRESHOLD:
+            target = best_row + 1  # juste sous le produit le plus proche
+            neighbour = best_name
+        else:
+            target = last_row + 1
+            neighbour = None
+
+        try:
+            ws.insert_rows([row], row=target, value_input_option="RAW", inherit_from_before=True)
+        except TypeError:  # ancienne version de gspread
+            ws.insert_rows([row], row=target, value_input_option="RAW")
+
+        # numéros de ligne décalés sous l'insertion
+        existing = [(n + 1 if n >= target else n, name) for n, name in existing]
+        existing.append((target, new_name))
+        existing.sort()
+        last_row = existing[-1][0]
+        placed.append((new_name, neighbour))
+
+    return placed
+
+
 def _formulas_in_data(ws, n_rows, n_cols):
     """une formule (références relatives) serait faussée par le tri"""
     rng = f"A{FIRST_DATA_ROW}:{gspread.utils.rowcol_to_a1(n_rows, n_cols)}"
@@ -221,7 +300,10 @@ def sort_tab(spreadsheet, ws):
     col_range = {"sheetId": ws.id, "dimension": "COLUMNS",
                  "startIndex": helper, "endIndex": helper + 1}
 
-    spreadsheet.batch_update({"requests": [{"insertDimension": {"range": col_range}}]})
+    # appendDimension : insertDimension refuse un index = nombre de colonnes
+    spreadsheet.batch_update({"requests": [{"appendDimension": {
+        "sheetId": ws.id, "dimension": "COLUMNS", "length": 1,
+    }}]})
     try:
         ws.update(
             values=keys,

@@ -1937,7 +1937,8 @@ def _create_stock_products(items, fail_if_exists=False):
                 )
 
         for supplier, rows in rows_by_supplier.items():
-            sheets[supplier].append_rows(rows)
+            # sous le produit le plus proche plutôt qu'en bas de l'onglet
+            sheet_duplicates.insert_rows_near_similar(sheets[supplier], rows)
 
         sync_stock()
     except Exception as e:
@@ -4756,7 +4757,8 @@ def stock_invoices_import():
                                  f"créez-le (mêmes colonnes que les autres fournisseurs) puis relancez l'import"
                     }), 400
 
-                sheet.append_rows(rows)
+                # sous le produit le plus proche plutôt qu'en bas de l'onglet
+                sheet_duplicates.insert_rows_near_similar(sheet, rows)
 
             if rows_by_supplier:
                 sync_stock()
