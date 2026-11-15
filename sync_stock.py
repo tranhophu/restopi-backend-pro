@@ -131,9 +131,6 @@ def ensure_control_date_column(sheet, cur, values=None):
         return False
 
     pcol = headers.index("Produit")
-    col = max(len(r) for r in values) + 1  # après la dernière colonne utilisée
-    if sheet.col_count < col:
-        sheet.add_cols(col - sheet.col_count)
 
     ctrl_col, _ = tab_date_columns(headers)  # date de l'onglet (D2 d'origine)
     tab_date = parse_sheet_date(values[1][ctrl_col]) if len(values) > 1 and len(values[1]) > ctrl_col else None
@@ -144,23 +141,55 @@ def ensure_control_date_column(sheet, cur, values=None):
     """, (sheet.title,))
     db_dates = dict(cur.fetchall())
 
-    column = [[CONTROL_DATE_HEADER]] + [[""]] * (FIRST_DATA_ROW - 2)
+    column = [CONTROL_DATE_HEADER] + [""] * (FIRST_DATA_ROW - 2)
     for r in values[FIRST_DATA_ROW - 1:]:
         name = r[pcol].strip() if len(r) > pcol else ""
         d = (db_dates.get(name.lower()) or tab_date) if name else None
-        column.append([fmt_sheet_date(d)])
+        column.append(fmt_sheet_date(d))
+    column = column[: max(len(values), 1)]
 
-    sheet.update(
-        values=column,
-        range_name=gspread.utils.rowcol_to_a1(1, col),
-        value_input_option="RAW",  # texte « 15/11/2026 » tel quel, quelle que soit la langue du Sheet
-    )
+    # nouvelle colonne insérée juste après « Produit » (entre A et B) ;
+    # RAW : texte « 15/11/2026 » tel quel, quelle que soit la langue du Sheet
+    sheet.insert_cols([column], col=pcol + 2, value_input_option="RAW")
 
-    # contenu local complété : pas besoin de relire l'onglet
-    for row, cell in zip(values, column):
-        row.extend([""] * (col - 1 - len(row)))
-        row.append(cell[0])
+    # contenu local mis à jour de la même façon : pas besoin de relire l'onglet
+    for i, row in enumerate(values):
+        row.extend([""] * (pcol + 1 - len(row)))
+        row.insert(pcol + 1, column[i] if i < len(column) else "")
     return True
+
+
+def control_date_move_request(sheet, values):
+    """
+    Colonne « Date contrôle » pas juste après « Produit » (ex. créée en fin de tableau
+    par une version précédente) → requête Google « moveDimension » pour la placer entre A et B,
+    et même déplacement appliqué au contenu local `values`. None si déjà en place.
+    """
+    if not values:
+        return None
+    headers = [str(h).strip() for h in values[0]]
+    if CONTROL_DATE_HEADER not in headers or "Produit" not in headers:
+        return None
+
+    src = headers.index(CONTROL_DATE_HEADER)
+    pcol = headers.index("Produit")
+    if src == pcol + 1:
+        return None
+
+    # contenu local : retirer la colonne puis la réinsérer juste après Produit
+    for row in values:
+        row.extend([""] * (src + 1 - len(row)))
+        cell = row.pop(src)
+        new_pcol = pcol - 1 if src < pcol else pcol
+        row.insert(new_pcol + 1, cell)
+
+    return {
+        "moveDimension": {
+            "source": {"sheetId": sheet.id, "dimension": "COLUMNS", "startIndex": src, "endIndex": src + 1},
+            # position de destination exprimée AVANT le retrait de la colonne : juste après Produit
+            "destinationIndex": pcol + 1,
+        }
+    }
 
 
 def _rows_as_records(values):
@@ -232,17 +261,24 @@ def sync_stock():
             f"Lecture Google Sheet incomplète ({len(value_ranges)}/{len(worksheets)} onglets) : synchro annulée"
         )
 
+    column_moves = []  # déplacements « Date contrôle » → entre A et B, envoyés en 1 seul appel
+
     for sheet, vr in zip(worksheets, value_ranges):
 
         supplier = sheet.title
         values = vr.get("values", [])
 
-        # colonne « Date contrôle » : créée au besoin (une seule fois par onglet, 1 écriture)
+        # colonne « Date contrôle » : créée au besoin entre A et B (une seule fois par onglet)
         headers = [str(h).strip() for h in values[0]] if values else []
         has_row_dates = CONTROL_DATE_HEADER in headers
         if len(values) > 1 and not has_row_dates:
             with conn.cursor() as cur:
                 has_row_dates = ensure_control_date_column(sheet, cur, values)
+        elif has_row_dates:
+            # créée ailleurs (fin de tableau, version précédente) → replacée entre A et B
+            move = control_date_move_request(sheet, values)
+            if move:
+                column_moves.append(move)
 
         rows = _rows_as_records(values)
 
@@ -505,9 +541,15 @@ def sync_stock():
                         ))
 
                 synced += 1
-    
 
-   
+    # « Date contrôle » replacée entre A et B dans les onglets concernés (1 seul appel Google).
+    # Sans gravité si ça échoue : le backend trouve les colonnes par leur en-tête.
+    if column_moves:
+        try:
+            spreadsheet.batch_update({"requests": column_moves})
+        except Exception as e:
+            print("Déplacement colonne « Date contrôle » impossible :", e)
+
     # =========================
     # DELETE PRODUITS ABSENTS GOOGLE SHEET
     # =========================
