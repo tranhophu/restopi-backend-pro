@@ -487,6 +487,18 @@ def init_stock():
             );
             """)
 
+            # brouillons d'inventaire partagés entre appareils (téléphone au stock → laptop au bureau)
+            # draft_key = clé localStorage du navigateur ; data NULL = brouillon effacé (propagé aux autres appareils)
+            # ts = horodatage (ms) de la modification côté appareil : le plus récent gagne
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_inventory_drafts (
+                draft_key TEXT PRIMARY KEY,
+                data TEXT,
+                ts BIGINT NOT NULL,
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+            """)
+
             # prix référence
             cur.execute("""
             CREATE TABLE IF NOT EXISTS stock_reference_prices (
@@ -2474,6 +2486,68 @@ def stock_inventory():
         sheet_errors.append(f"Date de contrôle (D2) non écrite dans l'onglet « {supplier} » : {e}")
 
     return jsonify({"success": True, "summary": summary, "sheet_errors": sheet_errors})
+
+
+INVENTORY_DRAFT_PREFIXES = (
+    "stock_inventory_draft__",   # comptages par fournisseur
+    "stock_inventory_skip__",    # produits ⏭ passés par fournisseur
+    "stock_inventory_import_draft",  # liste de comptage collée + corrections
+)
+
+
+@app.route("/admin/stock/inventory/drafts", methods=["GET"])
+def stock_inventory_drafts_get():
+    """Tous les brouillons d'inventaire : {key: {data, ts}} (data None = effacé)."""
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    with get_conn() as conn, conn.cursor() as cur:
+        # brouillons effacés depuis plus de 30 jours : inutile de les garder
+        cur.execute("""
+        DELETE FROM stock_inventory_drafts
+        WHERE data IS NULL AND updated_at < NOW() - INTERVAL '30 days'
+        """)
+        cur.execute("SELECT draft_key, data, ts FROM stock_inventory_drafts")
+        rows = cur.fetchall()
+
+    return jsonify({k: {"data": d, "ts": int(ts)} for k, d, ts in rows})
+
+
+@app.route("/admin/stock/inventory/drafts", methods=["POST"])
+def stock_inventory_drafts_save():
+    """
+    Enregistre des brouillons. Body : {items: [{key, data (texte JSON ou null), ts}]}
+    Une version plus ancienne que celle du serveur est ignorée (le plus récent gagne).
+    """
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    items = (request.get_json(silent=True) or {}).get("items") or []
+    saved = 0
+
+    with get_conn() as conn, conn.cursor() as cur:
+        for it in items[:200]:
+            key = str(it.get("key") or "")
+            data = it.get("data")
+            try:
+                ts = int(it.get("ts"))
+            except (TypeError, ValueError):
+                continue
+            if not key.startswith(INVENTORY_DRAFT_PREFIXES) or len(key) > 300:
+                continue
+            if data is not None and (not isinstance(data, str) or len(data) > 2_000_000):
+                continue
+
+            cur.execute("""
+            INSERT INTO stock_inventory_drafts (draft_key, data, ts, updated_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (draft_key) DO UPDATE
+            SET data = EXCLUDED.data, ts = EXCLUDED.ts, updated_at = NOW()
+            WHERE stock_inventory_drafts.ts < EXCLUDED.ts
+            """, (key, data, ts))
+            saved += cur.rowcount
+
+    return jsonify({"success": True, "saved": saved})
 
 
 @app.route("/admin/stock/inventory/correct", methods=["POST"])
