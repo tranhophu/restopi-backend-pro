@@ -100,13 +100,15 @@ def fmt_sheet_date(d):
     return d.strftime("%d/%m/%Y") if d else ""
 
 
-def ensure_control_date_column(sheet, cur):
+def ensure_control_date_column(sheet, cur, values=None):
     """
     Ajoute la colonne « Date contrôle » à l'onglet si elle manque, remplie avec la date
     de contrôle actuelle de chaque produit (base RestoPi, sinon D2) : rien ne change au départ.
+    values : contenu de l'onglet déjà lu (évite un appel Google) ; complété sur place.
     Retourne True si la colonne existe (ou vient d'être créée).
     """
-    values = sheet.get_all_values()
+    if values is None:
+        values = sheet.get_all_values()
     if not values:
         return False
 
@@ -140,7 +142,23 @@ def ensure_control_date_column(sheet, cur):
         range_name=gspread.utils.rowcol_to_a1(1, col),
         value_input_option="RAW",  # texte « 15/11/2026 » tel quel, quelle que soit la langue du Sheet
     )
+
+    # contenu local complété : pas besoin de relire l'onglet
+    for row, cell in zip(values, column):
+        row.extend([""] * (col - 1 - len(row)))
+        row.append(cell[0])
     return True
+
+
+def _rows_as_records(values):
+    """comme worksheet.get_all_records(), à partir du contenu déjà lu"""
+    if not values:
+        return []
+    headers = [str(h).strip() for h in values[0]]
+    return [
+        {h: (r[i] if i < len(r) else "") for i, h in enumerate(headers) if h}
+        for r in values[1:]
+    ]
 
 def sync_stock():
 
@@ -187,30 +205,41 @@ def sync_stock():
     sheet_products = set()
 
 
-    for sheet in worksheets:
+    worksheets = [ws for ws in worksheets if ws.title.strip().lower() != "infos"]
 
-        if sheet.title.strip().lower() == "infos":
-            continue
+    # UN SEUL appel Google pour lire tous les onglets (avant : 3 appels par onglet →
+    # synchro trop lente pour le délai du serveur + quota Google de 60 lectures / minute)
+    quoted = ["'" + ws.title.replace("'", "''") + "'" for ws in worksheets]
+    value_ranges = spreadsheet.values_batch_get(quoted).get("valueRanges", []) if worksheets else []
+
+    # sécurité : un onglet non lu ferait supprimer ses produits (« absents du Google Sheet ») plus bas
+    if len(value_ranges) != len(worksheets):
+        conn.close()
+        raise RuntimeError(
+            f"Lecture Google Sheet incomplète ({len(value_ranges)}/{len(worksheets)} onglets) : synchro annulée"
+        )
+
+    for sheet, vr in zip(worksheets, value_ranges):
 
         supplier = sheet.title
-        rows = sheet.get_all_records()
+        values = vr.get("values", [])
 
-        # colonne « Date contrôle » : créée au besoin (une seule fois par onglet)
-        has_row_dates = bool(rows) and CONTROL_DATE_HEADER in rows[0]
-        if rows and not has_row_dates:
+        # colonne « Date contrôle » : créée au besoin (une seule fois par onglet, 1 écriture)
+        headers = [str(h).strip() for h in values[0]] if values else []
+        has_row_dates = CONTROL_DATE_HEADER in headers
+        if len(values) > 1 and not has_row_dates:
             with conn.cursor() as cur:
-                has_row_dates = ensure_control_date_column(sheet, cur)
-            if has_row_dates:
-                rows = sheet.get_all_records()
+                has_row_dates = ensure_control_date_column(sheet, cur, values)
+
+        rows = _rows_as_records(values)
+
+        cell = lambda r, c: str(values[r][c]).strip() if len(values) > r and len(values[r]) > c else ""
 
         # D2 : date de l'onglet, seulement pour un onglet sans colonne « Date contrôle »
-        tab_stock_date = parse_sheet_date(
-            sheet.acell("D2").value
-        )
+        tab_stock_date = parse_sheet_date(cell(1, 3))
 
-        order_date = parse_sheet_date(
-            sheet.acell("E2").value
-        )
+        # E2 : date de commande
+        order_date = parse_sheet_date(cell(1, 4))
 
         for row in rows:
 
@@ -237,10 +266,7 @@ def sync_stock():
                 row.get("Unité achat", "")
             ).strip()
 
-            min_stock = row.get(
-                "Stock min",
-                0
-            ) or 0
+            min_stock = extract_number(row.get("Stock min", 0))  # « 1,5 » accepté
 
             stock_reel = extract_number(row.get("Stock Réel", 0))
             

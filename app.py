@@ -5146,7 +5146,12 @@ def refresh_stock():
             "error":"unauthorized"
         }), 403
 
-    result = sync_stock()
+    try:
+        result = sync_stock()
+    except Exception as e:
+        # message lisible dans la page (quota Google, onglet illisible…) au lieu d'une page d'erreur
+        app.logger.exception("Synchro Google Sheet")
+        return jsonify({"success": False, "error": f"{type(e).__name__} : {e}"}), 500
 
     return jsonify(result)
 
