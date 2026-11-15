@@ -415,6 +415,13 @@ def init_stock():
 
             ADD COLUMN IF NOT EXISTS conversion_factor FLOAT DEFAULT 1;
             """)
+
+            # ⏭ « passé » à l'inventaire RestoPi de cette date : la synchro Google Sheet
+            # n'applique pas la date du contrôle (D2) à ce produit
+            cur.execute("""
+            ALTER TABLE stock_products
+            ADD COLUMN IF NOT EXISTS skipped_control_date DATE;
+            """)
             # historique achat réel
 
             cur.execute("""
@@ -2438,6 +2445,11 @@ def stock_inventory():
                     """, (inv_date, supplier, pid, name, old_qty, new_qty))
                 elif pid in skipped:
                     summary["skipped"] += 1
+                    # mémorisé : la synchro Google Sheet ne doit pas le dater au contrôle (D2) de ce jour
+                    cur.execute(
+                        "UPDATE stock_products SET skipped_control_date = %s WHERE id = %s",
+                        (inv_date, pid),
+                    )
                     continue
                 else:
                     new_qty = old_qty
