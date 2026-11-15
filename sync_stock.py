@@ -100,6 +100,18 @@ def fmt_sheet_date(d):
     return d.strftime("%d/%m/%Y") if d else ""
 
 
+def tab_date_columns(headers):
+    """
+    Colonnes (0-indexées) des dates de la ligne 2 : date de contrôle de l'onglet sous « Stock Réel »
+    (D2 dans la disposition d'origine), date de commande sous « Commander » (E2).
+    Trouvées par en-tête : les colonnes peuvent être déplacées (ex. « Date contrôle » en B).
+    """
+    headers = [str(h).strip() for h in headers]
+    ctrl = headers.index("Stock Réel") if "Stock Réel" in headers else 3
+    order = headers.index("Commander") if "Commander" in headers else 4
+    return ctrl, order
+
+
 def ensure_control_date_column(sheet, cur, values=None):
     """
     Ajoute la colonne « Date contrôle » à l'onglet si elle manque, remplie avec la date
@@ -123,7 +135,8 @@ def ensure_control_date_column(sheet, cur, values=None):
     if sheet.col_count < col:
         sheet.add_cols(col - sheet.col_count)
 
-    tab_date = parse_sheet_date(values[1][3]) if len(values) > 1 and len(values[1]) > 3 else None  # D2
+    ctrl_col, _ = tab_date_columns(headers)  # date de l'onglet (D2 d'origine)
+    tab_date = parse_sheet_date(values[1][ctrl_col]) if len(values) > 1 and len(values[1]) > ctrl_col else None
 
     cur.execute("""
     SELECT LOWER(TRIM(name)), stock_date FROM stock_products
@@ -235,11 +248,13 @@ def sync_stock():
 
         cell = lambda r, c: str(values[r][c]).strip() if len(values) > r and len(values[r]) > c else ""
 
-        # D2 : date de l'onglet, seulement pour un onglet sans colonne « Date contrôle »
-        tab_stock_date = parse_sheet_date(cell(1, 3))
+        ctrl_col, order_col = tab_date_columns(values[0] if values else [])
 
-        # E2 : date de commande
-        order_date = parse_sheet_date(cell(1, 4))
+        # date de l'onglet (D2 d'origine), seulement pour un onglet sans colonne « Date contrôle »
+        tab_stock_date = parse_sheet_date(cell(1, ctrl_col))
+
+        # date de commande (E2 d'origine)
+        order_date = parse_sheet_date(cell(1, order_col))
 
         for row in rows:
 

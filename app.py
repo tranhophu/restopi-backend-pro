@@ -17,7 +17,7 @@ import secrets
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
-from sync_stock import sync_stock, ensure_control_date_column, CONTROL_DATE_HEADER
+from sync_stock import sync_stock, ensure_control_date_column, tab_date_columns, CONTROL_DATE_HEADER
 from invoice_parsers import parse_supplier_invoice
 import sheet_duplicates
 import threading
@@ -2509,8 +2509,10 @@ def stock_inventory():
             with get_conn() as c2, c2.cursor() as cur2:
                 ensure_control_date_column(sheet, cur2)
             sheet_errors = _push_stock_to_sheet(sheet_changes)
-            # D2 : simple information « dernier contrôle » (la synchro utilise la date de chaque ligne)
-            sheet.update_acell("D2", inv_date.strftime("%d/%m/%Y"))
+            # « dernier contrôle » en ligne 2 sous « Stock Réel » (D2 d'origine) : simple information,
+            # la synchro utilise la date de chaque ligne. Cellule trouvée par en-tête (colonnes déplaçables).
+            ctrl_col, _ = tab_date_columns(sheet.row_values(1))
+            sheet.update_acell(gspread.utils.rowcol_to_a1(2, ctrl_col + 1), inv_date.strftime("%d/%m/%Y"))
         except Exception as e:
             sheet_errors.append(f"Onglet « {supplier} » non mis à jour : {e}")
 
@@ -3151,12 +3153,16 @@ def delete_stock_product():
 
             all_rows = sheet.get_all_values()
 
+            # colonne « Produit » trouvée par en-tête (colonnes déplaçables), A par défaut
+            head = [str(h).strip() for h in (all_rows[0] if all_rows else [])]
+            pcol = head.index("Produit") if "Produit" in head else 0
+
             for idx, r in enumerate(all_rows):
 
-                if len(r) == 0:
+                if idx == 0 or len(r) <= pcol:
                     continue
 
-                if r[0].strip() == name:
+                if r[pcol].strip() == name:
 
                     sheet.delete_rows(idx + 1)
                     sync_stock()

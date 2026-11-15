@@ -197,25 +197,43 @@ def _near_score(new_name, existing_name):
     return score
 
 
+# ordre des valeurs d'une nouvelle ligne produit envoyée par app.py
+NEW_ROW_FIELDS = ["Produit", "Unité achat", "Stock min", "Stock Réel", "Commander", "Note"]
+
+
+def _row_for_headers(values_in_std_order, headers):
+    """
+    Place les valeurs (ordre NEW_ROW_FIELDS) sous les bons en-têtes de l'onglet :
+    les colonnes peuvent être dans n'importe quel ordre (ex. « Date contrôle » en B).
+    """
+    by_field = dict(zip(NEW_ROW_FIELDS, values_in_std_order))
+    row = [by_field.get(h, "") for h in headers]
+    while row and row[-1] == "":
+        row.pop()
+    return row
+
+
 def insert_rows_near_similar(ws, rows):
     """
     Ajoute des lignes produits dans l'onglet : chaque ligne est insérée juste sous le
     produit existant le plus proche (même nom, autre taille…). Sans produit proche,
     la ligne va à la fin de la liste.
-    rows : listes de valeurs dont la 1re = nom du produit (colonne Produit = A).
+    rows : listes de valeurs dans l'ordre NEW_ROW_FIELDS (Produit, Unité achat, …) ;
+    elles sont placées sous les en-têtes correspondants, quel que soit l'ordre des colonnes.
     Retourne [(nom, nom du voisin ou None)].
     """
     values = ws.get_all_values()
     col, _ = read_tab_names(ws, values)
 
-    if col != 0:
-        # structure inattendue : comportement historique
-        ws.append_rows(rows, value_input_option="RAW")
-        return [(r[0], None) for r in rows]
+    if col is None:
+        raise ValueError(f"Colonne « Produit » introuvable dans l'onglet « {ws.title} »")
+
+    headers = [str(h).strip() for h in values[0]]
+    rows = [(str(r[0]).strip(), _row_for_headers(r, headers)) for r in rows]
 
     # [(numéro de ligne 1-indexé, nom)] des lignes produits remplies
     existing = [
-        (FIRST_DATA_ROW + i, (r[0] if r else "").strip())
+        (FIRST_DATA_ROW + i, (r[col] if len(r) > col else "").strip())
         for i, r in enumerate(values[FIRST_DATA_ROW - 1:])
     ]
     existing = [(n, name) for n, name in existing if name]
@@ -223,8 +241,7 @@ def insert_rows_near_similar(ws, rows):
 
     placed = []
 
-    for row in rows:
-        new_name = str(row[0]).strip()
+    for new_name, row in rows:
         best_score, best_row, best_name = 0, None, None
         for n, name in existing:
             s = _near_score(new_name, name)
