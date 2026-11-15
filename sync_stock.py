@@ -116,6 +116,12 @@ def sync_stock():
         );
         """)
 
+        # ⏭ produit « passé » lors de l'inventaire RestoPi de cette date (voir /admin/stock/inventory)
+        cur.execute("""
+        ALTER TABLE stock_products
+        ADD COLUMN IF NOT EXISTS skipped_control_date DATE;
+        """)
+
     worksheets = spreadsheet.worksheets()
 
     synced = 0
@@ -171,7 +177,7 @@ def sync_stock():
             with conn.cursor() as cur:
 
                 cur.execute("""
-                SELECT id, stock_quantity, stock_date
+                SELECT id, stock_quantity, stock_date, skipped_control_date
                 FROM stock_products
                 WHERE LOWER(name)=%s
                 AND LOWER(supplier)=%s
@@ -198,6 +204,11 @@ def sync_stock():
 
                     elif stock_date and old_stock_date and stock_date > old_stock_date:
                         should_update_stock = True
+
+                    # ⏭ passé lors de l'inventaire de cette date : D2 (date du contrôle) ne le concerne pas.
+                    # Sinon la synchro le « confirme » à cette date → snapshot → semaine sans consommation.
+                    if should_update_stock and existing[3] and stock_date == existing[3]:
+                        should_update_stock = False
 
                     if should_update_stock:
                         # =========================
