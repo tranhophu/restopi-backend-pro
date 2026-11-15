@@ -3099,6 +3099,52 @@ def stock_delete_movement():
     return jsonify({"success": True, "deleted": len(rows)})
 
 
+@app.route("/admin/stock/update-movement-unit", methods=["POST"])
+def stock_update_movement_unit():
+    """
+    Corrige l'unité d'achat de lignes d'historique déjà enregistrées (ex : « pce » → « pq »).
+    Body : {"ids": [12, 13, ...], "purchase_unit": "pq"}
+    Quantité et prix inchangés ; prix moyen + dernier prix recalculés pour les ACHAT.
+    """
+
+    if not check_admin(request):
+        return jsonify({"error":"unauthorized"}), 403
+
+    data = request.json or {}
+    unit = (data.get("purchase_unit") or "").strip()
+
+    try:
+        ids = [int(i) for i in (data.get("ids") or [])]
+    except (TypeError, ValueError):
+        return jsonify({"error":"invalid ids"}), 400
+
+    if not ids:
+        return jsonify({"error":"no ids"}), 400
+    if not unit or len(unit) > 30:
+        return jsonify({"error":"invalid unit"}), 400
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+            UPDATE stock_movements
+            SET purchase_unit = %s
+            WHERE id = ANY(%s)
+            AND movement_type IN ('ACHAT', 'RETOUR')
+            RETURNING product_name, supplier
+            """, (unit, ids))
+
+            rows = cur.fetchall()
+
+            if not rows:
+                return jsonify({"error":"aucune ligne ACHAT/RETOUR trouvée"}), 404
+
+            for product_name, supplier in {(r[0], r[1]) for r in rows}:
+                _refresh_product_prices(cur, product_name, supplier)
+
+    return jsonify({"success": True, "updated": len(rows)})
+
+
 def _refresh_product_prices(cur, product_name, supplier):
     """Recalcule prix moyen (12 mois) + dernier prix d'achat depuis l'historique ACHAT."""
 
