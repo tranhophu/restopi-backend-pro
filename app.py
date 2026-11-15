@@ -2345,6 +2345,7 @@ def stock_inventory():
     Même effet qu'un contrôle saisi dans Google Sheet puis synchronisé :
     - stock_quantity + stock_date (date du contrôle) pour TOUS les produits du fournisseur
       (produit non compté = stock inchangé, confirmé à la date du contrôle)
+    - sauf ceux de « skip » : [id, ...] (⏭ passés) → rien n'est écrit pour eux
     - snapshot du jour + mouvement CONSUMPTION / INVENTORY_ADJUSTMENT pour chaque écart
     - Google Sheet : colonne « Stock Réel » des écarts + date du contrôle en D2
     """
@@ -2376,8 +2377,15 @@ def stock_inventory():
             return jsonify({"error": "Quantité négative interdite"}), 400
         counts[int(c.get("id"))] = qty
 
+    # ⏭ passés : ni snapshot, ni date de contrôle → la consommation se calcule
+    # entre le dernier vrai comptage et le prochain (pas de semaine à 0)
+    try:
+        skipped = {int(i) for i in (data.get("skip") or [])}
+    except (TypeError, ValueError):
+        return jsonify({"error": "Liste « passés » invalide"}), 400
+
     sheet_changes = []
-    summary = {"counted": 0, "unchanged": 0, "adjusted": 0}
+    summary = {"counted": 0, "unchanged": 0, "adjusted": 0, "skipped": 0}
 
     # transaction : tout l'inventaire est enregistré, ou rien (get_conn() est en autocommit)
     conn = get_conn()
@@ -2416,6 +2424,9 @@ def stock_inventory():
                     (created_at, inventory_date, supplier, product_id, product_name, theoretical, counted)
                     VALUES (NOW(), %s, %s, %s, %s, %s, %s)
                     """, (inv_date, supplier, pid, name, old_qty, new_qty))
+                elif pid in skipped:
+                    summary["skipped"] += 1
+                    continue
                 else:
                     new_qty = old_qty
                     summary["unchanged"] += 1
