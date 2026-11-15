@@ -17,7 +17,7 @@ import secrets
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
-from sync_stock import sync_stock
+from sync_stock import sync_stock, ensure_control_date_column, CONTROL_DATE_HEADER
 from invoice_parsers import parse_supplier_invoice
 import sheet_duplicates
 import threading
@@ -2231,6 +2231,8 @@ def _merge_stock_product(cur, supplier, old_name, new_name):
 
 
 def _sheet_number(v):
+    if isinstance(v, str):
+        return v  # texte (ex : « Date contrôle » 15/11/2026) écrit tel quel
     v = float(v or 0)
     return int(v) if v.is_integer() else v
 
@@ -2288,7 +2290,9 @@ def _push_stock_to_sheet(changes):
                     })
 
             if cells:
-                sheet.batch_update(cells, value_input_option="USER_ENTERED")
+                # RAW : nombres envoyés comme nombres ; dates « 15/11/2026 » gardées telles quelles
+                # (USER_ENTERED pourrait les réinterpréter selon la langue du Sheet : 05/11 → 11 mai)
+                sheet.batch_update(cells, value_input_option="RAW")
 
         except Exception as e:
             errors.append(f"Onglet « {supplier} » : {e}")
@@ -2361,12 +2365,12 @@ def stock_inventory():
     Inventaire d'un fournisseur (onglet Google Sheet) depuis l'outil « Inventaire » de stock.html.
     Body : {supplier, date: "YYYY-MM-DD", counts: [{id, stock_quantity}]}   (quantités en unité stock)
 
-    Même effet qu'un contrôle saisi dans Google Sheet puis synchronisé :
-    - stock_quantity + stock_date (date du contrôle) pour TOUS les produits du fournisseur
-      (produit non compté = stock inchangé, confirmé à la date du contrôle)
-    - sauf ceux de « skip » : [id, ...] (⏭ passés) → rien n'est écrit pour eux
-    - snapshot du jour + mouvement CONSUMPTION / INVENTORY_ADJUSTMENT pour chaque écart
-    - Google Sheet : colonne « Stock Réel » des écarts + date du contrôle en D2
+    Seuls les produits COMPTÉS sont touchés (valider 5 produits = 5 produits modifiés) :
+    - stock_quantity + stock_date (date du contrôle) + snapshot du jour
+    - mouvement CONSUMPTION / INVENTORY_ADJUSTMENT pour chaque écart
+    - Google Sheet : « Date contrôle » de leur ligne (+ « Stock Réel » si écart), D2 = info « dernier contrôle »
+    Produits non comptés ou « skip » (⏭ passés) : rien n'est écrit (stock, date, snapshot inchangés) ;
+    leur consommation se calcule au prochain vrai comptage.
     """
 
     if not check_admin(request):
@@ -2445,15 +2449,17 @@ def stock_inventory():
                     """, (inv_date, supplier, pid, name, old_qty, new_qty))
                 elif pid in skipped:
                     summary["skipped"] += 1
-                    # mémorisé : la synchro Google Sheet ne doit pas le dater au contrôle (D2) de ce jour
+                    # onglet encore sans colonne « Date contrôle » : la synchro ne doit pas
+                    # lui appliquer la date D2 de ce jour
                     cur.execute(
                         "UPDATE stock_products SET skipped_control_date = %s WHERE id = %s",
                         (inv_date, pid),
                     )
                     continue
                 else:
-                    new_qty = old_qty
+                    # non compté : on n'y touche pas (ni stock, ni date, ni snapshot)
                     summary["unchanged"] += 1
+                    continue
 
                 cur.execute("""
                 INSERT INTO stock_snapshots (snapshot_date, product_name, supplier, stock_quantity, purchase_unit)
@@ -2472,6 +2478,9 @@ def stock_inventory():
                 WHERE id = %s
                 """, (new_qty, inv_date, inv_date, pid))
 
+                # Google Sheet : date de contrôle de CETTE ligne (+ stock si écart)
+                sheet_fields = {CONTROL_DATE_HEADER: inv_date.strftime("%d/%m/%Y")}
+
                 delta = new_qty - old_qty
                 if abs(delta) > 1e-9:
                     summary["adjusted"] += 1
@@ -2486,16 +2495,24 @@ def stock_inventory():
                         delta, 0, inv_date, purchase_unit,
                         "Inventaire RestoPi"
                     ))
-                    sheet_changes.append((supplier, name, {"Stock Réel": new_qty}))
+                    sheet_fields["Stock Réel"] = new_qty
+
+                sheet_changes.append((supplier, name, sheet_fields))
     finally:
         conn.close()
 
-    # Google Sheet (source of truth) : stocks + date du contrôle (D2)
-    sheet_errors = _push_stock_to_sheet(sheet_changes) if sheet_changes else []
-    try:
-        spreadsheet.worksheet(supplier).update_acell("D2", inv_date.strftime("%d/%m/%Y"))
-    except Exception as e:
-        sheet_errors.append(f"Date de contrôle (D2) non écrite dans l'onglet « {supplier} » : {e}")
+    sheet_errors = []
+    if sheet_changes:
+        try:
+            sheet = spreadsheet.worksheet(supplier)
+            # colonne « Date contrôle » créée au besoin AVANT d'y écrire
+            with get_conn() as c2, c2.cursor() as cur2:
+                ensure_control_date_column(sheet, cur2)
+            sheet_errors = _push_stock_to_sheet(sheet_changes)
+            # D2 : simple information « dernier contrôle » (la synchro utilise la date de chaque ligne)
+            sheet.update_acell("D2", inv_date.strftime("%d/%m/%Y"))
+        except Exception as e:
+            sheet_errors.append(f"Onglet « {supplier} » non mis à jour : {e}")
 
     return jsonify({"success": True, "summary": summary, "sheet_errors": sheet_errors})
 

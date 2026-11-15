@@ -74,14 +74,73 @@ def parse_sheet_date(value):
     if not raw:
         return None
 
-    try:
-        return datetime.strptime(
-            raw,
-            "%d/%m/%Y"
-        ).date()
+    # 15/11/2026 (format du Sheet), 15/11/26, 2026-11-15
+    for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
 
-    except:
-        return None
+    return None
+
+
+# =========================
+# DATE DE CONTRÔLE PAR PRODUIT
+# Chaque ligne produit a sa propre date de contrôle (colonne « Date contrôle »).
+# La synchro n'applique le « Stock Réel » d'une ligne que si SA date est plus récente :
+# valider 5 produits le 15/11 ne touche que ces 5 produits.
+# D2 (date de l'onglet) ne sert plus que pour un onglet qui n'a pas encore la colonne.
+# =========================
+
+CONTROL_DATE_HEADER = "Date contrôle"
+FIRST_DATA_ROW = 3  # ligne 1 = en-têtes, ligne 2 = dates D2/E2
+
+
+def fmt_sheet_date(d):
+    return d.strftime("%d/%m/%Y") if d else ""
+
+
+def ensure_control_date_column(sheet, cur):
+    """
+    Ajoute la colonne « Date contrôle » à l'onglet si elle manque, remplie avec la date
+    de contrôle actuelle de chaque produit (base RestoPi, sinon D2) : rien ne change au départ.
+    Retourne True si la colonne existe (ou vient d'être créée).
+    """
+    values = sheet.get_all_values()
+    if not values:
+        return False
+
+    headers = [str(h).strip() for h in values[0]]
+    if CONTROL_DATE_HEADER in headers:
+        return True
+    if "Produit" not in headers:
+        return False
+
+    pcol = headers.index("Produit")
+    col = max(len(r) for r in values) + 1  # après la dernière colonne utilisée
+    if sheet.col_count < col:
+        sheet.add_cols(col - sheet.col_count)
+
+    tab_date = parse_sheet_date(values[1][3]) if len(values) > 1 and len(values[1]) > 3 else None  # D2
+
+    cur.execute("""
+    SELECT LOWER(TRIM(name)), stock_date FROM stock_products
+    WHERE LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+    """, (sheet.title,))
+    db_dates = dict(cur.fetchall())
+
+    column = [[CONTROL_DATE_HEADER]] + [[""]] * (FIRST_DATA_ROW - 2)
+    for r in values[FIRST_DATA_ROW - 1:]:
+        name = r[pcol].strip() if len(r) > pcol else ""
+        d = (db_dates.get(name.lower()) or tab_date) if name else None
+        column.append([fmt_sheet_date(d)])
+
+    sheet.update(
+        values=column,
+        range_name=gspread.utils.rowcol_to_a1(1, col),
+        value_input_option="RAW",  # texte « 15/11/2026 » tel quel, quelle que soit la langue du Sheet
+    )
+    return True
 
 def sync_stock():
 
@@ -136,7 +195,16 @@ def sync_stock():
         supplier = sheet.title
         rows = sheet.get_all_records()
 
-        stock_date = parse_sheet_date(
+        # colonne « Date contrôle » : créée au besoin (une seule fois par onglet)
+        has_row_dates = bool(rows) and CONTROL_DATE_HEADER in rows[0]
+        if rows and not has_row_dates:
+            with conn.cursor() as cur:
+                has_row_dates = ensure_control_date_column(sheet, cur)
+            if has_row_dates:
+                rows = sheet.get_all_records()
+
+        # D2 : date de l'onglet, seulement pour un onglet sans colonne « Date contrôle »
+        tab_stock_date = parse_sheet_date(
             sheet.acell("D2").value
         )
 
@@ -152,6 +220,13 @@ def sync_stock():
 
             if not product_name:
                 continue
+
+            # date de contrôle de CETTE ligne (vide = jamais contrôlé → stock du Sheet non appliqué)
+            stock_date = (
+                parse_sheet_date(row.get(CONTROL_DATE_HEADER, ""))
+                if has_row_dates
+                else tab_stock_date
+            )
 
             sheet_products.add((
                 product_name.strip().lower(),
