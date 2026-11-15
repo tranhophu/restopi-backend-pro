@@ -2038,15 +2038,26 @@ def rename_stock_product():
             old_db_name = row[0]
 
             # le nouveau nom ne doit pas exister (sauf simple changement de casse)
+            # … ou fusion demandée : l'ancien produit est absorbé par le produit existant
             if new_name.lower() != old_name.lower():
                 cur.execute("""
-                SELECT 1 FROM stock_products
+                SELECT name FROM stock_products
                 WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
                 AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
                 """, (new_name, supplier))
 
-                if cur.fetchone():
-                    return jsonify({"error": f"« {new_name} » existe déjà chez {supplier}"}), 400
+                existing = cur.fetchone()
+
+                if existing:
+                    if not data.get("merge"):
+                        return jsonify({
+                            "error": f"« {new_name} » existe déjà chez {supplier}",
+                            "can_merge": True,
+                        }), 400
+
+                    result = _merge_stock_product(cur, supplier, old_db_name, existing[0])
+                    conn.commit()
+                    return jsonify({"success": True, "merged": True, "supplier": supplier, **result})
 
             # 1. base (transaction non validée tant que Google Sheet n'est pas à jour)
             cur.execute("""
@@ -2111,6 +2122,93 @@ def rename_stock_product():
         conn.close()
 
     return jsonify({"success": True, "new_name": new_name, "supplier": supplier})
+
+
+def _merge_stock_product(cur, supplier, old_name, new_name):
+    """
+    Fusionne « old_name » dans « new_name » (même fournisseur, transaction de l'appelant) :
+    historique d'achats, prix de référence, codes facture, recettes, alias d'inventaire
+    passent sur le produit gardé ; l'ancien produit est supprimé (base + ligne Google Sheet).
+    Le stock du produit gardé ne change pas (l'ancien stock est renvoyé pour information).
+    Lève une exception en cas d'échec → l'appelant fait rollback.
+    """
+    cur.execute("""
+    SELECT id, stock_quantity, stock_unit, purchase_unit FROM stock_products
+    WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s)) AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+    """, (old_name, supplier))
+    old = cur.fetchone()
+
+    cur.execute("""
+    SELECT id FROM stock_products
+    WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s)) AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+    """, (new_name, supplier))
+    new = cur.fetchone()
+
+    if not old or not new or old[0] == new[0]:
+        raise ValueError("Produits à fusionner introuvables")
+
+    match = """
+    WHERE LOWER(TRIM(product_name)) = LOWER(TRIM(%s))
+    AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+    """
+
+    moved = {}
+    for table in (
+        "stock_movements",
+        "stock_reference_prices",
+        "stock_supplier_codes",
+        "recipe_ingredients",
+        "preparation_ingredients",
+    ):
+        cur.execute(f"UPDATE {table} SET product_name = %s {match}", (new_name, old_name, supplier))
+        moved[table] = cur.rowcount
+
+    # snapshots : unique par date → l'ancien est abandonné les jours où le gardé a déjà le sien
+    cur.execute("""
+    DELETE FROM stock_snapshots s
+    WHERE LOWER(TRIM(s.product_name)) = LOWER(TRIM(%s))
+    AND LOWER(TRIM(s.supplier)) = LOWER(TRIM(%s))
+    AND EXISTS (
+        SELECT 1 FROM stock_snapshots k
+        WHERE k.snapshot_date = s.snapshot_date
+        AND LOWER(TRIM(k.product_name)) = LOWER(TRIM(%s))
+        AND LOWER(TRIM(k.supplier)) = LOWER(TRIM(%s))
+    )
+    """, (old_name, supplier, new_name, supplier))
+    cur.execute(f"UPDATE stock_snapshots SET product_name = %s {match}", (new_name, old_name, supplier))
+
+    # unités : le produit gardé a les siennes
+    cur.execute(f"DELETE FROM stock_units {match}", (old_name, supplier))
+
+    # listes de comptage collées : « vinaigre alcool » reconnu comme le produit gardé
+    cur.execute("UPDATE stock_inventory_aliases SET product_id = %s WHERE product_id = %s", (new[0], old[0]))
+
+    cur.execute("DELETE FROM stock_products WHERE id = %s", (old[0],))
+
+    _refresh_product_prices(cur, new_name, supplier)
+
+    # Google Sheet en dernier : si ça échoue, l'appelant annule tout en base
+    sheet = spreadsheet.worksheet(supplier)
+    headers = [h.strip() for h in sheet.row_values(1)]
+    if "Produit" not in headers:
+        raise ValueError(f"Colonne « Produit » introuvable dans l'onglet « {supplier} »")
+    col = headers.index("Produit") + 1
+    target = old_name.strip().lower()
+    rows = [
+        i + 1
+        for i, value in enumerate(sheet.col_values(col))
+        if i > 0 and str(value).strip().lower() == target
+    ]
+    for r in sorted(rows, reverse=True):  # du bas vers le haut : numéros stables
+        sheet.delete_rows(r)
+
+    return {
+        "new_name": new_name,
+        "old_name": old_name,
+        "moved_movements": moved["stock_movements"],
+        "old_stock": float(old[1] or 0),
+        "old_stock_unit": old[2] or old[3] or "",
+    }
 
 
 def _sheet_number(v):
