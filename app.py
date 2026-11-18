@@ -484,6 +484,13 @@ def init_stock():
             ADD COLUMN IF NOT EXISTS counted_original FLOAT,
             ADD COLUMN IF NOT EXISTS corrected_at TIMESTAMP;
             """)
+            # détail du théorique : contrôle précédent + achats reçus depuis (NULL = ancienne validation)
+            cur.execute("""
+            ALTER TABLE stock_inventory_lines
+            ADD COLUMN IF NOT EXISTS prev_control_date DATE,
+            ADD COLUMN IF NOT EXISTS prev_stock FLOAT,
+            ADD COLUMN IF NOT EXISTS purchases_since FLOAT;
+            """)
 
             # import de liste de comptage : « nom écrit » (normalisé) → produit confirmé, partagé entre appareils
             cur.execute("""
@@ -2460,9 +2467,11 @@ def stock_inventory():
                     # trace de la saisie (NOW() = même horodatage pour toute la transaction)
                     cur.execute("""
                     INSERT INTO stock_inventory_lines
-                    (created_at, inventory_date, supplier, product_id, product_name, theoretical, counted)
-                    VALUES (NOW(), %s, %s, %s, %s, %s, %s)
-                    """, (inv_date, supplier, pid, name, theoretical, new_qty))
+                    (created_at, inventory_date, supplier, product_id, product_name, theoretical, counted,
+                     prev_control_date, prev_stock, purchases_since)
+                    VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (inv_date, supplier, pid, name, theoretical, new_qty,
+                          old_date, old_qty, round(theoretical - old_qty, 6)))
                 elif pid in skipped:
                     summary["skipped"] += 1
                     # onglet encore sans colonne « Date contrôle » : la synchro ne doit pas
@@ -2871,6 +2880,12 @@ def stock_inventory_history_detail():
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("""
         SELECT l.product_id, l.product_name, l.theoretical, l.counted, l.counted_original, l.corrected_at,
+               l.prev_control_date, l.prev_stock, l.purchases_since,
+               -- ancienne validation (colonnes NULL) : contrôle précédent retrouvé dans les snapshots
+               (SELECT MAX(s.snapshot_date) FROM stock_snapshots s
+                WHERE LOWER(TRIM(s.product_name)) = LOWER(TRIM(l.product_name))
+                AND LOWER(TRIM(s.supplier)) = LOWER(TRIM(l.supplier))
+                AND s.snapshot_date < l.inventory_date) AS prev_snapshot_date,
                (
                  EXISTS (SELECT 1 FROM stock_inventory_lines n
                          WHERE n.product_id = l.product_id AND n.created_at > l.created_at)
@@ -2887,9 +2902,16 @@ def stock_inventory_history_detail():
         rows = cur.fetchall()
 
         if rows:
-            for pid, name, theo, counted, original, corrected_at, superseded in rows:
+            for (pid, name, theo, counted, original, corrected_at,
+                 prev_date, prev_stock, purchases_since, prev_snap, superseded) in rows:
+                # purchases_since NULL = validation d'avant le théorique « achats inclus »
+                known = purchases_since is not None
+                prev = prev_date if known else prev_snap
                 lines.append({
                     "product_id": pid, "name": name, "theoretical": theo, "counted": counted,
+                    "prev_date": prev.isoformat() if prev else None,
+                    "prev_stock": prev_stock if known else theo,
+                    "purchases_since": purchases_since if known else None,
                     "counted_original": original,
                     "corrected_at": corrected_at.isoformat() if corrected_at else None,
                     # recompté depuis (autre inventaire / contrôle Google Sheet plus récent) : correction impossible
