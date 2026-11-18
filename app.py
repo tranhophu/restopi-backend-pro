@@ -3466,6 +3466,68 @@ def stock_update_movement_unit():
     return jsonify({"success": True, "updated": len(rows)})
 
 
+@app.route("/admin/stock/update-movement-expiry", methods=["POST"])
+def stock_update_movement_expiry():
+    """
+    Ajoute / corrige / efface la DLC de lignes d'achat déjà enregistrées (DLC oubliée à la saisie).
+    Body : {"ids": [12, 13, ...], "expiry_date": "YYYY-MM-DD" | null}   (null ou "" = effacer)
+    Quantité, prix et statut du lot inchangés.
+    """
+
+    if not check_admin(request):
+        return jsonify({"error":"unauthorized"}), 403
+
+    data = request.json or {}
+
+    try:
+        ids = [int(i) for i in (data.get("ids") or [])]
+    except (TypeError, ValueError):
+        return jsonify({"error":"invalid ids"}), 400
+
+    if not ids:
+        return jsonify({"error":"no ids"}), 400
+
+    raw = (data.get("expiry_date") or "").strip()
+    expiry = None
+    if raw:
+        try:
+            expiry = datetime.strptime(raw, "%Y-%m-%d").date()
+        except ValueError:
+            return jsonify({"error":"DLC invalide"}), 400
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            if expiry is not None:
+                # DLC antérieure à la date d'achat = faute de frappe probable
+                cur.execute("""
+                SELECT product_name, purchase_date FROM stock_movements
+                WHERE id = ANY(%s) AND movement_type = 'ACHAT'
+                AND purchase_date IS NOT NULL AND purchase_date > %s
+                LIMIT 1
+                """, (ids, expiry))
+                bad = cur.fetchone()
+                if bad:
+                    return jsonify({
+                        "error": f"DLC ({expiry.strftime('%d/%m/%Y')}) avant la date d'achat de "
+                                 f"« {bad[0]} » ({bad[1].strftime('%d/%m/%Y')})"
+                    }), 400
+
+            cur.execute("""
+            UPDATE stock_movements
+            SET expiry_date = %s
+            WHERE id = ANY(%s)
+            AND movement_type = 'ACHAT'
+            """, (expiry, ids))
+
+            if cur.rowcount == 0:
+                return jsonify({"error":"aucune ligne ACHAT trouvée"}), 404
+
+            updated = cur.rowcount
+
+    return jsonify({"success": True, "updated": updated})
+
+
 def _refresh_product_prices(cur, product_name, supplier):
     """Recalcule prix moyen (12 mois) + dernier prix d'achat depuis l'historique ACHAT."""
 
