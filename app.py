@@ -1824,10 +1824,18 @@ def stock_products():
 
             rows = cur.fetchall()
 
+            # achats reçus depuis le dernier contrôle (stock théorique de l'inventaire)
+            since_control = _purchases_since_control(cur)
+
     result = []
 
     for r in rows:
         result.append({
+
+            "purchases_since_control": [
+                {"date": d.isoformat(), "quantity": q, "unit": u}
+                for d, q, u in since_control.get(r[0], [])
+            ],
 
             "id": r[0],
             "name": r[1],
@@ -2367,7 +2375,8 @@ def stock_inventory():
 
     Seuls les produits COMPTÉS sont touchés (valider 5 produits = 5 produits modifiés) :
     - stock_quantity + stock_date (date du contrôle) + snapshot du jour
-    - mouvement CONSUMPTION / INVENTORY_ADJUSTMENT pour chaque écart
+    - mouvement CONSUMPTION / INVENTORY_ADJUSTMENT pour chaque écart, où
+      théorique = stock du dernier contrôle + achats reçus depuis (jusqu'à la date du contrôle)
     - Google Sheet : « Date contrôle » de leur ligne (+ « Stock Réel » si écart), D2 = info « dernier contrôle »
     Produits non comptés ou « skip » (⏭ passés) : rien n'est écrit (stock, date, snapshot inchangés) ;
     leur consommation se calcule au prochain vrai comptage.
@@ -2416,7 +2425,8 @@ def stock_inventory():
     try:
         with conn, conn.cursor() as cur:
             cur.execute("""
-            SELECT id, name, supplier, stock_quantity, purchase_unit, stock_date
+            SELECT id, name, supplier, stock_quantity, purchase_unit, stock_date,
+                   stock_unit, conversion_factor
             FROM stock_products
             WHERE LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
             """, (supplier_in,))
@@ -2428,25 +2438,31 @@ def stock_inventory():
             supplier = products[0][2]
 
             # vérification AVANT toute écriture (sortie du bloc = commit)
-            for pid, name, _, _, _, old_date in products:
+            for pid, name, _, _, _, old_date, _, _ in products:
                 if pid in counts and old_date and inv_date < old_date:
                     return jsonify({
                         "error": f"« {name} » a déjà un contrôle plus récent ({old_date.strftime('%d/%m/%Y')}) : "
                                  f"choisissez une date ≥ à celle-ci"
                     }), 400
 
-            for pid, name, _, old_qty, purchase_unit, old_date in products:
+            # achats reçus depuis le dernier contrôle → stock théorique = stock contrôlé + achats
+            purchases = _purchases_since_control(cur, [p[0] for p in products if p[0] in counts])
+
+            for pid, name, _, old_qty, purchase_unit, old_date, stock_unit, conv in products:
                 old_qty = float(old_qty or 0)
 
                 if pid in counts:
                     new_qty = counts[pid]
+                    theoretical = _theoretical_stock(
+                        old_qty, purchases.get(pid), inv_date, purchase_unit, stock_unit, conv
+                    )
                     summary["counted"] += 1
                     # trace de la saisie (NOW() = même horodatage pour toute la transaction)
                     cur.execute("""
                     INSERT INTO stock_inventory_lines
                     (created_at, inventory_date, supplier, product_id, product_name, theoretical, counted)
                     VALUES (NOW(), %s, %s, %s, %s, %s, %s)
-                    """, (inv_date, supplier, pid, name, old_qty, new_qty))
+                    """, (inv_date, supplier, pid, name, theoretical, new_qty))
                 elif pid in skipped:
                     summary["skipped"] += 1
                     # onglet encore sans colonne « Date contrôle » : la synchro ne doit pas
@@ -2481,7 +2497,10 @@ def stock_inventory():
                 # Google Sheet : date de contrôle de CETTE ligne (+ stock si écart)
                 sheet_fields = {CONTROL_DATE_HEADER: inv_date.strftime("%d/%m/%Y")}
 
-                delta = new_qty - old_qty
+                # écart = compté − théorique (achats inclus) → négatif = consommation réelle
+                delta = new_qty - theoretical
+                if abs(new_qty - old_qty) > 1e-9:
+                    sheet_fields["Stock Réel"] = new_qty
                 if abs(delta) > 1e-9:
                     summary["adjusted"] += 1
                     cur.execute("""
@@ -2495,7 +2514,6 @@ def stock_inventory():
                         delta, 0, inv_date, purchase_unit,
                         "Inventaire RestoPi"
                     ))
-                    sheet_fields["Stock Réel"] = new_qty
 
                 sheet_changes.append((supplier, name, sheet_fields))
     finally:
@@ -2943,6 +2961,68 @@ def _purchases_between(cur, supplier, start, end, name=None):
     for key, d, q, u in cur.fetchall():
         out.setdefault(key, []).append((d, float(q or 0), u))
     return out
+
+
+def _purchase_to_stock_factor(unit, purchase_unit, stock_unit, conversion_factor):
+    """
+    Facteur unité de l'achat → unité stock (même règle que rowUnits/stockConversion de stock.html).
+    None si l'unité de l'achat n'est ni l'unité stock ni l'unité d'achat du produit.
+    """
+    s_unit = (stock_unit or "").strip() or (purchase_unit or "").strip() or "unité"
+    p_unit = (purchase_unit or "").strip() or s_unit
+    u = (unit or "").strip().lower()
+    if not u or u == s_unit.lower():
+        return 1.0
+    if u == p_unit.lower():
+        if p_unit.lower() == s_unit.lower():
+            return 1.0
+        return float(conversion_factor or 1) or 1.0
+    return None
+
+
+def _purchases_since_control(cur, product_ids=None):
+    """
+    Achats / retours reçus APRÈS le dernier contrôle de chaque produit (purchase_date > stock_date).
+    → {product_id: [(purchase_date, quantity, purchase_unit)]}
+    Produit jamais contrôlé (stock_date NULL) : aucun achat (le théorique reste le stock enregistré).
+    """
+    sql = """
+    SELECT sp.id, m.purchase_date, m.quantity, m.purchase_unit
+    FROM stock_products sp
+    JOIN stock_movements m
+      ON LOWER(TRIM(m.product_name)) = LOWER(TRIM(sp.name))
+     AND LOWER(TRIM(m.supplier)) = LOWER(TRIM(sp.supplier))
+    WHERE m.movement_type IN ('ACHAT', 'RETOUR')
+    AND sp.stock_date IS NOT NULL
+    AND m.purchase_date > sp.stock_date
+    """
+    params = []
+    if product_ids is not None:
+        if not product_ids:
+            return {}
+        sql += " AND sp.id = ANY(%s)"
+        params.append(list(product_ids))
+    sql += " ORDER BY m.purchase_date"
+    cur.execute(sql, params)
+    out = {}
+    for pid, d, q, u in cur.fetchall():
+        out.setdefault(pid, []).append((d, float(q or 0), u))
+    return out
+
+
+def _theoretical_stock(old_qty, purchases, until, purchase_unit, stock_unit, conversion_factor):
+    """
+    Stock théorique au contrôle du jour `until` = stock du dernier contrôle + achats reçus depuis
+    (jusqu'à `until` inclus), en unité stock. Achat d'unité inconnue : ignoré.
+    """
+    total = float(old_qty or 0)
+    for d, q, u in purchases or []:
+        if d is None or d > until:
+            continue
+        f = _purchase_to_stock_factor(u, purchase_unit, stock_unit, conversion_factor)
+        if f is not None:
+            total += q * f
+    return round(total, 6)
 
 
 def _sum_purchases(items, after, until):
