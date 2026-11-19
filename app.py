@@ -1467,8 +1467,9 @@ def get_products():
     with get_conn() as conn:
         with conn.cursor() as cur:
             # seulement les plats en vente sur le site ; les brouillons
-            # (active = FALSE) se gèrent dans « Coût des plats »
-            cur.execute("SELECT * FROM products WHERE active = TRUE")
+            # (active = FALSE) se gèrent dans « Coût des plats ».
+            # ORDER BY : sans tri, un plat qu'on vient de publier (UPDATE) part en fin de liste
+            cur.execute("SELECT * FROM products WHERE active = TRUE ORDER BY category, LOWER(name)")
             rows = cur.fetchall()
 
     result = []
