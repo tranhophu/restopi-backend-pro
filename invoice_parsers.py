@@ -829,6 +829,221 @@ def parse_auchan(text):
     return _finalize(result)
 
 
+# =========================
+# GRAND FRAIS (ticket de caisse) — prix TTC, pas de code article
+# =========================
+
+_GF_ITEM = re.compile(r"^(?P<desc>.+?)\s+(?P<total>-?\d+\.\d{2})€$")
+_GF_WEIGHT = re.compile(r"^(?P<kg>\d+\.\d{3}) kg x (?P<pu>\d+\.\d{2}) €/kg$")
+_GF_TARE = re.compile(r"^Tare (?P<kg>\d+\.\d{3}) kg x \d+\.\d{2} €/kg (?P<amount>-\d+\.\d{2})€$")
+_GF_MULTI = re.compile(r"^(?P<qty>\d+) x (?P<pu>\d+\.\d{2})€$")
+_GF_OFFER = re.compile(r"^\d+\.\d{2} x (?P<pct>\d+\.\d{2})% (?P<amount>-\d+\.\d{2})€$")
+_GF_FOOTER = re.compile(
+    r"(?P<store>\d{4}) (?P<till>\d{3}) (?P<ticket>\d+) \d+ \d{2}:\d{2}:\d{2} "
+    r"(?P<day>\d{2})/(?P<month>[A-Z]{3})/(?P<year>\d{2})"
+)
+_GF_MONTHS = {
+    "JAN": 1, "FEV": 2, "FEB": 2, "MAR": 3, "AVR": 4, "APR": 4, "MAI": 5, "MAY": 5,
+    "JUN": 6, "JUL": 7, "AOU": 8, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
+# Seuls ces produits sont importés depuis Grand Frais ; le reste du ticket est ignoré.
+_GF_NOT_FRESH = r"(?!.*\b(?:MOULUE?|GRAINES?|POUDRE|SECHEE?|SIROP|TISANE|INFUSION)\b)"
+_GF_PRODUCTS = [
+    ("Salade", re.compile(
+        r"^(?!SALADE (?:DE|DU|DES|D|AU|AUX|CESAR|COMPOSEE|PIEMONTAISE|NICOISE|GRECQUE)\b)"
+        r".*\b(?:SALADE|BATAVIA|LAITUE|ROMAINE|SUCRINE|FEUILLE DE CHENE|LOLLO|FRISEE|SCAROLE)\b"
+    )),
+    ("Pousse de soja", re.compile(
+        r"\b(?:POUSSES? (?:DE )?SOJA|GERMES? (?:DE )?(?:SOJA|HARICOT|MUNGO)|SOJA GERME|HARICOT MUNGO)\b"
+    )),
+    ("Menthe", re.compile(rf"^{_GF_NOT_FRESH}MENTHE\b")),
+    ("Coriandre", re.compile(rf"^{_GF_NOT_FRESH}CORIANDRE\b")),
+]
+
+
+def _grand_frais_product(description):
+    """Nom du produit suivi pour cette ligne de ticket, None si la ligne est à ignorer."""
+    ascii_name = unicodedata.normalize("NFKD", description).encode("ascii", "ignore").decode().upper()
+    norm = re.sub(r"\s+", " ", ascii_name).strip()
+    for name, pattern in _GF_PRODUCTS:
+        if pattern.search(norm):
+            return name
+    return None
+
+
+def is_grand_frais(text):
+    return "grandfrais.com" in text.lower()
+
+
+def _grand_frais_rate(text, result):
+    """Tableau « CD TVA HT TTC » : le ticket n'indique pas le taux de chaque article."""
+    rows = re.findall(r"^\d+\s+(\d+[.,]\d+)%\s+(-?\d+\.\d{2})€\s+(-?\d+\.\d{2})€$", text, re.M)
+
+    if len(rows) == 1:
+        return _num(rows[0][0])
+
+    if rows:
+        ht = sum(_num(r[1]) for r in rows)
+        ttc = sum(_num(r[2]) for r in rows)
+        rate = round((ttc / ht - 1) * 100, 2)
+        result["warnings"].append(
+            f"Plusieurs taux de TVA sans détail par ligne : taux moyen {rate} % appliqué"
+        )
+        return rate
+
+    result["warnings"].append("Taux de TVA introuvable : 5,5 % appliqué")
+    return 5.5
+
+
+def parse_grand_frais(text):
+    result = _empty("grand_frais", "Grand Frais")
+
+    m = _GF_FOOTER.search(text)
+    if m:
+        year = 2000 + int(m.group("year"))
+        month = _GF_MONTHS.get(m.group("month"))
+        if not month:
+            # mois non reconnu → code-barres du ticket, terminé par JJMMAA
+            bm = re.search(r"^\d{14}\d{2}(\d{2})\d{2}$", text, re.M)
+            month = int(bm.group(1)) if bm else None
+        if month:
+            result["invoice_date"] = f"{year}-{month:02d}-{m.group('day')}"
+            # le n° de ticket seul peut revenir : magasin + caisse + ticket + date
+            result["invoice_number"] = (
+                f"{m.group('store')}-{m.group('till')}-{m.group('ticket')}-"
+                f"{year}{month:02d}{m.group('day')}"
+            )
+
+    m = re.search(r"\bTOTAL\s+(?:\d+\s+)?(\d+\.\d{2})€", text)
+    if m:
+        result["total_ttc"] = _num(m.group(1))
+
+    rate = _grand_frais_rate(text, result)
+
+    items = []
+    discounts = []
+    in_items = False
+
+    for raw in text.split("\n"):
+        line = raw.strip()
+
+        if not in_items:
+            in_items = line == "Prix"
+            continue
+
+        if re.match(r"^(?:\d+\s+)?TOTAL\b", line):
+            break
+
+        last = items[-1] if items else None
+
+        wm = _GF_WEIGHT.match(line)
+        if wm and last:
+            last.update(qty=_num(wm.group("kg")), pu=_num(wm.group("pu")), hint="kg")
+            continue
+
+        # le prix imprimé sur la ligne article est brut : la tare est à retirer
+        tm = _GF_TARE.match(line)
+        if tm and last:
+            last["qty"] = round(last["qty"] - _num(tm.group("kg")), 3)
+            last["total"] = round(last["total"] + _num(tm.group("amount")), 2)
+            continue
+
+        mm = _GF_MULTI.match(line)
+        if mm and last:
+            last.update(qty=int(mm.group("qty")), pu=_num(mm.group("pu")))
+            continue
+
+        om = _GF_OFFER.match(line)
+        if om and last:
+            amount = _num(om.group("amount"))
+            tracked = _grand_frais_product(last["desc"])
+            if last["total"] + amount > 0.001:
+                # remise partielle → prix réellement payé
+                last["total"] = round(last["total"] + amount, 2)
+                if last["hint"] != "kg":
+                    last["pu"] = last["total"] / last["qty"]
+                if tracked:
+                    result["warnings"].append(
+                        f"{last['desc']} : remise {om.group('pct')} % ({amount:.2f} €) déduite du prix"
+                    )
+            else:
+                # article offert → garde son prix normal (ne fausse pas le dernier prix d'achat)
+                discounts.append((f"Offert : {last['desc']}", amount, bool(tracked)))
+                if tracked:
+                    result["warnings"].append(
+                        f"{last['desc']} offert : compté au prix normal + ligne de remise {amount:.2f} €"
+                    )
+            continue
+
+        im = _GF_ITEM.match(line)
+        if not im:
+            continue   # rayon (« LES VERGERS DE CHASSENEUIL », « GFDDV »…), libellé d'offre
+
+        total = _num(im.group("total"))
+
+        if total < 0:
+            # bon de réduction sur tout le ticket : impossible à rattacher à un produit suivi
+            discounts.append((im.group("desc"), total, False))
+            result["warnings"].append(f"{im.group('desc')} ({total:.2f} €) : non importé")
+            continue
+
+        items.append({"desc": im.group("desc"), "qty": 1, "pu": total, "total": total, "hint": ""})
+
+    # contrôle sur le ticket complet, avant de retirer les articles non suivis
+    ticket_total = result["total_ttc"]
+    read_total = round(sum(i["total"] for i in items) + sum(d[1] for d in discounts), 2)
+    if ticket_total is not None and abs(read_total - ticket_total) > 0.05:
+        result["warnings"].append(
+            f"Total lu sur le ticket {read_total:.2f} € ≠ total ticket {ticket_total:.2f} €"
+        )
+
+    tracked_items = []
+    for item in items:
+        product = _grand_frais_product(item["desc"])
+        if product:
+            tracked_items.append({**item, "desc": product})
+
+    # même produit scanné plusieurs fois → une seule ligne
+    merged = {}
+    for item in tracked_items:
+        key = (item["desc"], item["hint"], round(item["pu"], 4))
+        if key in merged:
+            merged[key]["qty"] = round(merged[key]["qty"] + item["qty"], 3)
+            merged[key]["total"] = round(merged[key]["total"] + item["total"], 2)
+        else:
+            merged[key] = dict(item)
+
+    for item in merged.values():
+        result["lines"].append(_line(
+            _code_from_name(item["desc"], prefix="GF-"),
+            item["desc"],
+            item["qty"],
+            item["pu"],
+            item["total"],
+            rate,
+            unit_hint=item["hint"],
+        ))
+
+    for label, amount, tracked in discounts:
+        if tracked:
+            result["lines"].append(_line("REMISE", label, 1, amount, amount, rate, kind="discount"))
+
+    # les lignes gardées ne couvrent qu'une partie du ticket : pas de comparaison au total
+    result["total_ttc"] = None
+    _finalize(result)
+    result["total_ttc"] = ticket_total
+
+    if not result["lines"]:
+        result["warnings"] = [
+            "Aucune salade, pousse de soja, menthe ou coriandre sur ce ticket"
+            if w == "Aucune ligne article trouvée" else w
+            for w in result["warnings"]
+        ]
+
+    return result
+
+
 def parse_supplier_invoice(pdf_bytes):
     text = extract_text(pdf_bytes)
 
@@ -854,9 +1069,13 @@ def parse_supplier_invoice(pdf_bytes):
     if is_nhuy(text):
         return parse_nhuy(text)
 
+    if is_grand_frais(text):
+        return parse_grand_frais(text)
+
     result = _empty(None, "")
     result["lines_total"] = 0
     result["warnings"].append(
-        "Format de facture non reconnu (gérés : Yen Anh, Metro, Exostar, Emballage futé, Delidrinks, Nhu Y, Auchan)"
+        "Format de facture non reconnu (gérés : Yen Anh, Metro, Exostar, Emballage futé, Delidrinks, "
+        "Nhu Y, Auchan, Grand Frais)"
     )
     return result
