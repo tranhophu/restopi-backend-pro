@@ -17,7 +17,7 @@ import secrets
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
-from sync_stock import sync_stock, ensure_control_date_column, tab_date_columns, CONTROL_DATE_HEADER
+from sync_stock import sync_stock, ensure_control_date_column, tab_date_columns, parse_sheet_date, CONTROL_DATE_HEADER
 from invoice_parsers import parse_supplier_invoice
 import sheet_duplicates
 import threading
@@ -510,6 +510,39 @@ def init_stock():
                 data TEXT,
                 ts BIGINT NOT NULL,
                 updated_at TIMESTAMP DEFAULT NOW()
+            );
+            """)
+
+            # liste de comptage d'origine (texte collé), archivée à la validation pour vérifier après coup
+            # client_uid + date : un renvoi (réseau coupé) ne crée pas de doublon
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_inventory_source_lists (
+                id SERIAL PRIMARY KEY,
+                client_uid TEXT NOT NULL,
+                inventory_date DATE NOT NULL,
+                validated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                suppliers TEXT[] NOT NULL,
+                raw_text TEXT NOT NULL,
+                lines JSONB NOT NULL DEFAULT '[]'::jsonb,
+                UNIQUE (client_uid, inventory_date)
+            );
+            """)
+            cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_inventory_source_lists_date
+            ON stock_inventory_source_lists (inventory_date);
+            """)
+
+            # « Changer d'unité » : journal + copie des lignes avant conversion (pour pouvoir vérifier / restaurer)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_unit_changes (
+                id SERIAL PRIMARY KEY,
+                changed_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                product_name TEXT NOT NULL,
+                supplier TEXT NOT NULL,
+                old_unit TEXT NOT NULL,
+                new_unit TEXT NOT NULL,
+                factor FLOAT NOT NULL,
+                before_data JSONB NOT NULL
             );
             """)
 
@@ -2609,6 +2642,105 @@ def stock_inventory_drafts_save():
     return jsonify({"success": True, "saved": saved})
 
 
+def _purge_inventory_source_lists(cur, today):
+    """
+    Conservation des listes d'origine : 24 mois, sauf celles de la clôture du 31/12
+    (comptées du 15/12 au 15/01) gardées 10 ans.
+    """
+    cur.execute("""
+    DELETE FROM stock_inventory_source_lists
+    WHERE inventory_date < (%s::date - INTERVAL '10 years')
+       OR (
+            inventory_date < (%s::date - INTERVAL '24 months')
+            AND NOT (
+                (EXTRACT(MONTH FROM inventory_date) = 12 AND EXTRACT(DAY FROM inventory_date) >= 15)
+                OR (EXTRACT(MONTH FROM inventory_date) = 1 AND EXTRACT(DAY FROM inventory_date) <= 15)
+            )
+       )
+    """, (today, today))
+    return cur.rowcount
+
+
+@app.route("/admin/stock/inventory/source-lists", methods=["POST"])
+def stock_inventory_source_lists_save():
+    """
+    Archive la liste de comptage d'origine d'un inventaire validé.
+    Body : {uid, date: "YYYY-MM-DD", suppliers: [...], text, lines: [{raw, product_id, product, ...}]}
+    Même uid + même date : fournisseurs ajoutés à la liste existante (validation en plusieurs fois, renvoi).
+    """
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.get_json(silent=True) or {}
+    uid = str(data.get("uid") or "").strip()
+    text = data.get("text")
+    lines = data.get("lines") or []
+    suppliers = sorted({str(s).strip() for s in (data.get("suppliers") or []) if str(s).strip()})
+
+    try:
+        inv_date = datetime.strptime(data.get("date") or "", "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return jsonify({"error": "Date d'inventaire invalide"}), 400
+
+    if not uid or len(uid) > 64:
+        return jsonify({"error": "Identifiant de liste invalide"}), 400
+    if not suppliers:
+        return jsonify({"error": "Fournisseur obligatoire"}), 400
+    if not isinstance(text, str) or not text.strip() or len(text) > 200_000:
+        return jsonify({"error": "Texte de la liste invalide"}), 400
+    if not isinstance(lines, list) or len(lines) > 2000 or not all(isinstance(l, dict) for l in lines):
+        return jsonify({"error": "Lignes de la liste invalides"}), 400
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+        INSERT INTO stock_inventory_source_lists (client_uid, inventory_date, suppliers, raw_text, lines)
+        VALUES (%s, %s, %s, %s, %s::jsonb)
+        ON CONFLICT (client_uid, inventory_date) DO UPDATE
+        SET suppliers = ARRAY(
+                SELECT DISTINCT unnest(stock_inventory_source_lists.suppliers || EXCLUDED.suppliers)
+            ),
+            validated_at = NOW()
+        RETURNING id
+        """, (uid, inv_date, suppliers, text, json.dumps(lines, ensure_ascii=False)))
+        list_id = cur.fetchone()[0]
+        _purge_inventory_source_lists(cur, datetime.now(paris_tz).date())
+
+    return jsonify({"success": True, "id": list_id})
+
+
+@app.route("/admin/stock/inventory/source-lists", methods=["GET"])
+def stock_inventory_source_lists_get():
+    """Listes d'origine d'un contrôle : ?date=YYYY-MM-DD&supplier=..."""
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    supplier = (request.args.get("supplier") or "").strip()
+    try:
+        inv_date = datetime.strptime(request.args.get("date") or "", "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify({"error": "Date invalide"}), 400
+    if not supplier:
+        return jsonify({"error": "Fournisseur obligatoire"}), 400
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+        SELECT id, inventory_date, validated_at, suppliers, raw_text, lines
+        FROM stock_inventory_source_lists l
+        WHERE l.inventory_date = %s
+        AND EXISTS (SELECT 1 FROM unnest(l.suppliers) s WHERE LOWER(TRIM(s)) = LOWER(TRIM(%s)))
+        ORDER BY l.validated_at DESC
+        """, (inv_date, supplier))
+        rows = cur.fetchall()
+
+    return jsonify([
+        {
+            "id": i, "date": d.isoformat(), "validated_at": at.isoformat(),
+            "suppliers": sup, "text": text, "lines": lines,
+        }
+        for i, d, at, sup, text, lines in rows
+    ])
+
+
 @app.route("/admin/stock/inventory/correct", methods=["POST"])
 def stock_inventory_correct():
     """
@@ -2823,7 +2955,7 @@ def stock_inventory_history():
         return jsonify({"error": "unauthorized"}), 403
 
     try:
-        days = max(1, min(int(request.args.get("days", 30)), 365))
+        days = max(1, min(int(request.args.get("days", 30)), 3650))
     except ValueError:
         days = 30
 
@@ -3465,6 +3597,290 @@ def stock_update_movement_unit():
                 _refresh_product_prices(cur, product_name, supplier)
 
     return jsonify({"success": True, "updated": len(rows)})
+
+
+def _unit_change_sheet_check(supplier, name, fields, stock_date):
+    """Vérifie l'onglet AVANT toute écriture → message d'erreur, ou None si tout est prêt."""
+    sheet = spreadsheet.worksheet(supplier)
+    headers = [str(h).strip() for h in sheet.row_values(1)]
+
+    missing = [h for h in ["Produit", *fields] if h not in headers]
+    if missing:
+        return f"Colonne(s) introuvable(s) dans l'onglet « {supplier} » : {', '.join(missing)}"
+
+    target = name.strip().lower()
+    names = sheet.col_values(headers.index("Produit") + 1)
+    row = next((i + 1 for i, v in enumerate(names) if i > 0 and str(v).strip().lower() == target), None)
+    if not row:
+        return f"« {name} » introuvable dans l'onglet « {supplier} »"
+
+    # un contrôle saisi dans le Sheet et pas encore synchronisé serait écrasé par la conversion
+    if "Stock Réel" in fields and CONTROL_DATE_HEADER in headers:
+        values = sheet.row_values(row)
+        col = headers.index(CONTROL_DATE_HEADER)
+        sheet_date = parse_sheet_date(values[col]) if len(values) > col else None
+        if sheet_date and (not stock_date or sheet_date > stock_date):
+            return "Google Sheet contient un contrôle plus récent : cliquez « 🔄 Actualiser Google Sheet » puis recommencez."
+    return None
+
+
+@app.route("/admin/stock/change-unit", methods=["POST"])
+def stock_change_unit():
+    """
+    Change l'unité stock d'un produit. Body : {id, old_unit, new_unit, factor, dry_run}
+    factor : 1 ancienne unité = factor nouvelles unités.
+
+    - factor = 1 (même chose, autre nom : sac → pq) : seules les étiquettes changent, aucune quantité.
+      Possible aussi quand l'unité stock a déjà été modifiée à la main (new_unit = unité actuelle).
+    - factor ≠ 1 : stock, min, contrôles, consommations, inventaires et fiches sont convertis.
+      L'unité d'achat reste (on achète toujours en sac) : seule sa conversion change.
+    dry_run : calcule l'aperçu puis annule tout.
+    """
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.get_json(silent=True) or {}
+    old_unit = str(data.get("old_unit") or "").strip()
+    new_unit = str(data.get("new_unit") or "").strip()
+    dry_run = bool(data.get("dry_run"))
+
+    try:
+        product_id = int(data.get("id"))
+        factor = float(str(data.get("factor")).replace(",", "."))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Produit ou conversion invalide"}), 400
+
+    if not old_unit or not new_unit or len(old_unit) > 30 or len(new_unit) > 30:
+        return jsonify({"error": "Ancienne et nouvelle unité obligatoires"}), 400
+    if old_unit.lower() == new_unit.lower():
+        return jsonify({"error": "La nouvelle unité doit être différente de l'ancienne"}), 400
+    if not 0 < factor < 1_000_000:
+        return jsonify({"error": "Conversion invalide (nombre > 0)"}), 400
+
+    same = abs(factor - 1) < 1e-9
+    old_key = old_unit.lower()
+
+    conn = get_conn()
+    conn.autocommit = False  # tout est converti, ou rien
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT name, supplier, stock_quantity, min_stock, purchase_unit, stock_unit,
+                   conversion_factor, stock_date
+            FROM stock_products WHERE id = %s FOR UPDATE
+            """, (product_id,))
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "Produit introuvable"}), 404
+
+            name, supplier, stock, min_stock, purchase_unit, stock_unit, conv, stock_date = row
+            stock = float(stock or 0)
+            min_stock = float(min_stock or 0)
+            conv = float(conv or 1) or 1.0
+            current = (stock_unit or "").strip() or (purchase_unit or "").strip()
+            purchase = (purchase_unit or "").strip() or current
+
+            if same:
+                if current.lower() not in (old_key, new_unit.lower()):
+                    return jsonify({"error": f"L'unité stock actuelle est « {current} »"}), 400
+            else:
+                # évite aussi une double conversion (double clic, renvoi)
+                if current.lower() != old_key:
+                    return jsonify({
+                        "error": f"L'unité stock actuelle est « {current} », pas « {old_unit} ». "
+                                 "Une conversion ≠ 1 suppose que toutes les quantités sont encore en ancienne unité."
+                    }), 400
+                cur.execute("SELECT data FROM stock_inventory_drafts WHERE draft_key = %s",
+                            ("stock_inventory_draft__" + supplier.strip().lower(),))
+                draft = cur.fetchone()
+                try:
+                    counts = (json.loads(draft[0]) or {}).get("counts") or {} if draft and draft[0] else {}
+                except ValueError:
+                    counts = {}
+                if str(product_id) in counts:
+                    return jsonify({
+                        "error": "Ce produit a un comptage d'inventaire non validé : validez-le ou effacez-le d'abord."
+                    }), 409
+
+            purchase_is_old = purchase.lower() == old_key
+            new_purchase = new_unit if same and purchase_is_old else purchase
+            if new_purchase.lower() == new_unit.lower():
+                new_conv = 1.0
+            elif same:
+                new_conv = conv
+            elif purchase_is_old:
+                new_conv = factor
+            else:
+                new_conv = round(conv * factor, 6)
+
+            new_stock = round(stock * factor, 6)
+            new_min = round(min_stock * factor, 6)
+
+            match = "LOWER(TRIM(product_name)) = LOWER(TRIM(%s)) AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))"
+            who = (name, supplier)
+            scaled = lambda col: f"ROUND(({col} * %s)::numeric, 6)::double precision"
+
+            # copie avant conversion
+            before = {}
+            for key, table in (
+                ("movements", "stock_movements"), ("snapshots", "stock_snapshots"),
+                ("inventory_lines", "stock_inventory_lines"), ("recipe_ingredients", "recipe_ingredients"),
+                ("preparation_ingredients", "preparation_ingredients"),
+            ):
+                cur.execute(
+                    f"SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM {table} t WHERE {match}", who
+                )
+                before[key] = cur.fetchone()[0]
+            cur.execute("SELECT to_jsonb(t) FROM stock_products t WHERE id = %s", (product_id,))
+            before["product"] = cur.fetchone()[0]
+
+            counts = {"movements": 0, "snapshots": 0, "inventory_lines": 0, "ingredients": 0}
+
+            if not same:
+                # achat sans unité = compté en unité stock : il garde ce sens après la conversion
+                cur.execute(f"""
+                UPDATE stock_movements SET purchase_unit = %s
+                WHERE movement_type IN ('ACHAT', 'RETOUR') AND COALESCE(TRIM(purchase_unit), '') = ''
+                AND {match}
+                """, (old_unit, *who))
+
+                cur.execute(f"""
+                UPDATE stock_movements
+                SET quantity = {scaled('quantity')},
+                    purchase_unit = CASE WHEN LOWER(TRIM(purchase_unit)) = %s THEN %s ELSE purchase_unit END
+                WHERE movement_type IN ('CONSUMPTION', 'INVENTORY_ADJUSTMENT') AND {match}
+                """, (factor, old_key, new_unit, *who))
+                counts["movements"] += cur.rowcount
+
+                # achats en ancienne unité stock, quand l'unité d'achat est une autre (carton → pce)
+                if not purchase_is_old:
+                    cur.execute(f"""
+                    UPDATE stock_movements
+                    SET quantity = {scaled('quantity')},
+                        purchase_quantity = {scaled('purchase_quantity')},
+                        unit_price = unit_price / %s,
+                        purchase_unit = %s
+                    WHERE movement_type IN ('ACHAT', 'RETOUR') AND LOWER(TRIM(purchase_unit)) = %s
+                    AND {match}
+                    """, (factor, factor, factor, new_unit, old_key, *who))
+                    counts["movements"] += cur.rowcount
+
+                cur.execute(f"UPDATE stock_snapshots SET stock_quantity = {scaled('stock_quantity')} WHERE {match}",
+                            (factor, *who))
+                counts["snapshots"] = cur.rowcount
+
+                cur.execute(f"""
+                UPDATE stock_inventory_lines
+                SET theoretical = {scaled('theoretical')},
+                    counted = {scaled('counted')},
+                    counted_original = {scaled('counted_original')},
+                    prev_stock = {scaled('prev_stock')},
+                    purchases_since = {scaled('purchases_since')}
+                WHERE LOWER(TRIM(product_name)) = LOWER(TRIM(%s)) AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                """, (factor, factor, factor, factor, factor, *who))
+                counts["inventory_lines"] = cur.rowcount
+
+                for table in ("recipe_ingredients", "preparation_ingredients"):
+                    cur.execute(f"""
+                    UPDATE {table} SET quantity = {scaled('quantity')}
+                    WHERE (COALESCE(TRIM(unit), '') = '' OR LOWER(TRIM(unit)) = %s) AND {match}
+                    """, (factor, old_key, *who))
+                    counts["ingredients"] += cur.rowcount
+            else:
+                cur.execute(f"""
+                UPDATE stock_movements SET purchase_unit = %s
+                WHERE LOWER(TRIM(purchase_unit)) = %s AND {match}
+                """, (new_unit, old_key, *who))
+                counts["movements"] = cur.rowcount
+
+            # étiquettes restantes (la quantité est déjà dans la bonne unité)
+            cur.execute(f"""
+            UPDATE stock_snapshots SET purchase_unit = %s WHERE LOWER(TRIM(purchase_unit)) = %s AND {match}
+            """, (new_unit, old_key, *who))
+            if same:
+                counts["snapshots"] = cur.rowcount
+
+            for table in ("recipe_ingredients", "preparation_ingredients"):
+                cur.execute(f"""
+                UPDATE {table} SET unit = %s WHERE LOWER(TRIM(unit)) = %s AND {match}
+                """, (new_unit, old_key, *who))
+                if same:
+                    counts["ingredients"] += cur.rowcount
+
+            warnings = []
+            if not same:
+                cur.execute("SELECT content_qty FROM stock_products WHERE id = %s", (product_id,))
+                has_content = bool(cur.fetchone()[0])
+                if not has_content:
+                    other = 0
+                    for table in ("recipe_ingredients", "preparation_ingredients"):
+                        cur.execute(f"""
+                        SELECT COUNT(*) FROM {table}
+                        WHERE COALESCE(TRIM(unit), '') <> '' AND LOWER(TRIM(unit)) <> %s AND {match}
+                        """, (new_unit.lower(), *who))
+                        other += cur.fetchone()[0]
+                    if other:
+                        warnings.append(f"{other} ligne(s) de fiche technique dans une autre unité : à vérifier dans Coût des plats.")
+
+            cur.execute("""
+            UPDATE stock_products
+            SET stock_quantity = %s, min_stock = %s, stock_unit = %s, purchase_unit = %s,
+                conversion_factor = %s,
+                content_qty = CASE WHEN content_qty IS NULL THEN NULL ELSE content_qty / %s END,
+                average_price = COALESCE(average_price, 0) / %s,
+                updated_at = NOW()
+            WHERE id = %s
+            """, (new_stock, new_min, new_unit, new_purchase, new_conv, factor, factor, product_id))
+
+            # prix moyen recalculé depuis les achats (sans achat : converti ci-dessus, dernier prix gardé)
+            cur.execute(f"SELECT 1 FROM stock_movements WHERE movement_type = 'ACHAT' AND {match} LIMIT 1", who)
+            if cur.fetchone():
+                _refresh_product_prices(cur, name, supplier)
+
+            summary = {
+                "name": name, "supplier": supplier, "old_unit": old_unit, "new_unit": new_unit, "factor": factor,
+                "stock_before": stock, "stock_after": new_stock,
+                "min_before": min_stock, "min_after": new_min,
+                "purchase_before": purchase, "purchase_after": new_purchase,
+                "conversion_before": conv, "conversion_after": new_conv,
+                **counts, "warnings": warnings,
+            }
+
+            if dry_run:
+                conn.rollback()
+                return jsonify({"success": True, "dry_run": True, "summary": summary})
+
+            cur.execute("""
+            INSERT INTO stock_unit_changes (product_name, supplier, old_unit, new_unit, factor, before_data)
+            VALUES (%s,%s,%s,%s,%s,%s::jsonb)
+            """, (name, supplier, old_unit, new_unit, factor, json.dumps(before, ensure_ascii=False)))
+
+            # Google Sheet en dernier : si ça échoue, rien n'est gardé en base
+            fields = {}
+            if not same:
+                fields["Stock Réel"] = new_stock
+                fields["Stock min"] = new_min
+            if new_purchase != purchase:
+                fields["Unité achat"] = new_purchase
+            if fields:
+                error = _unit_change_sheet_check(supplier, name, fields, stock_date)
+                if error:
+                    conn.rollback()
+                    return jsonify({"error": error}), 409
+                sheet_errors = _push_stock_to_sheet([(supplier, name, fields)])
+                if sheet_errors:
+                    conn.rollback()
+                    return jsonify({"error": "Google Sheet non mis à jour : " + " · ".join(sheet_errors)}), 502
+
+            conn.commit()
+            return jsonify({"success": True, "summary": summary})
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": f"Changement d'unité impossible : {e}"}), 500
+
+    finally:
+        conn.close()
 
 
 @app.route("/admin/stock/update-movement-expiry", methods=["POST"])
