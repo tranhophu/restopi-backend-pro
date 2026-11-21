@@ -19,6 +19,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 import json
 from sync_stock import sync_stock, ensure_control_date_column, tab_date_columns, parse_sheet_date, CONTROL_DATE_HEADER
 from invoice_parsers import parse_supplier_invoice
+import menu_sync
 import sheet_duplicates
 import threading
 import difflib
@@ -233,7 +234,45 @@ def public_products():
             "featured": row[7]
         })
 
+    # plat à choix obligatoire (Duo/King, parfums) : à commander depuis « Notre carte »
+    rules = menu_sync.choice_rules(_menu_source(), result)
+    for product in result:
+        product["needs_choice"] = product["id"] in rules
+
     return jsonify(result)
+
+
+def _menu_source():
+    with open(menu_sync.SOURCE, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _stripe_items_metadata(items):
+    """Stripe limite chaque valeur de metadata à 500 caractères : panier découpé si besoin."""
+    compact = [
+        {"id": i["id"], "qty": i["qty"], **({"options": i["options"]} if i.get("options") else {})}
+        for i in items
+    ]
+    raw = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    if len(raw) <= 500:
+        return {"items": raw}
+    parts = [raw[i:i + 500] for i in range(0, len(raw), 500)]
+    if len(parts) > 40:
+        raise ValueError("Panier trop volumineux")
+    return {"items_parts": str(len(parts)), **{f"items_{n}": part for n, part in enumerate(parts)}}
+
+
+def _stripe_items_from_metadata(metadata):
+    if "items_parts" in metadata:
+        return json.loads("".join(metadata[f"items_{n}"] for n in range(int(metadata["items_parts"]))))
+    return json.loads(metadata["items"] if "items" in metadata else "[]")
+
+
+@app.route("/menu", methods=["GET"])
+def public_menu():
+    """Carte organisée (menu_source.json) avec les prix de la base : site et menu A4."""
+    return jsonify(menu_sync.build_public_menu(_menu_source(), list(load_products().values())))
+
 
 def init_db():
     with get_conn() as conn:
@@ -989,14 +1028,30 @@ def create_checkout_session():
     # 🔥 CALCUL TOTAL
     # =========================
     total_eur = 0
+    choice_rules = menu_sync.choice_rules(_menu_source(), list(products.values()))
 
     for item in items:
-        product_id = int(item.get("id"))
-        qty = int(item.get("qty", 1))
+        # quantité négative = total réduit : la commande entière est refusée
+        try:
+            product_id = int(item.get("id"))
+            raw_qty = item.get("qty", 1)
+            qty = int(raw_qty)
+            if qty <= 0 or float(raw_qty) != qty:
+                raise ValueError
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return jsonify({"error": "Quantité invalide dans le panier"}), 400
 
         product = products.get(str(product_id))
         if not product:
             continue
+
+        # choix obligatoires (viandes Duo/King…) vérifiés avant le paiement
+        try:
+            item["options"] = menu_sync.clean_options(choice_rules.get(product_id), item.get("options"))
+        except ValueError as e:
+            return jsonify({
+                "error": f"« {product['name']} » : {e}. Retirez-le du panier et choisissez-le depuis Notre carte."
+            }), 400
 
         total_eur += product["price"] * qty
 
@@ -1116,7 +1171,7 @@ def create_checkout_session():
         cancel_url=cancel_url,
         metadata={
             "client": json.dumps(client, ensure_ascii=False),
-            "items": json.dumps(items, ensure_ascii=False),
+            **_stripe_items_metadata(items),
             "points_used": str(valid_points)
         }
     )
@@ -1150,12 +1205,21 @@ def create_order_from_webhook(items, client, stripe_total, points_used=0):
       if not product or qty <= 0:
         continue
 
-      clean_items.append({
+      # commande déjà payée : les choix sont toujours transmis à la cuisine
+      options = [str(o)[:40] for o in (item.get("options") or [])]
+      line = {
         "id": int(product_id),
         "name": product["name"],
         "qty": qty,
         "price": product["price"]
-      })
+      }
+      if options:
+        # dans le nom : ticket, écran cuisine et email l'affichent sans autre changement
+        line["base_name"] = product["name"]
+        line["options"] = options
+        line["name"] = f"{product['name']} ({menu_sync.format_options(options)})"
+
+      clean_items.append(line)
 
     order_data = {
         "id": order_id,
@@ -1457,11 +1521,10 @@ def stripe_webhook():
         session = event["data"]["object"]
         metadata = session["metadata"]
 
-        items_raw = metadata["items"] if "items" in metadata else "[]"
         client_raw = metadata["client"] if "client" in metadata else "{}"
         points_raw = metadata["points_used"] if "points_used" in metadata else "0"
 
-        items = json.loads(items_raw)
+        items = _stripe_items_from_metadata(metadata)
         client = json.loads(client_raw)
         points_used = int(points_raw or 0)
         print("💰 PAIEMENT CONFIRMÉ")
@@ -1582,7 +1645,7 @@ def get_stats():
                 items = json.loads(items)
 
             for item in items:
-                name = item["name"]
+                name = item.get("base_name") or item["name"]
                 qty = item["qty"]
                 product_count[name] = product_count.get(name, 0) + qty
 

@@ -1,0 +1,275 @@
+{
+  "_aide": "Menu de référence = Menu_Au_Ptit_Vietnam_A4.pdf. variante : id = plat existant ; product = nouveau plat. choose = choix obligatoire du client (imprimé sur le ticket cuisine). print:false = vendu en ligne mais absent du menu papier.",
+  "aliases": { "49": 12, "50": 4, "51": 8, "52": 33, "53": 25 },
+  "retired": [40],
+  "midi": {
+    "title": "Menu Midi",
+    "hours": "Du lundi au samedi, 11h30 – 14h30",
+    "formules": [
+      { "name": "Bonne Affaire", "price": 17.0, "desc": "Entrée + Plat ou Plat + Dessert" },
+      { "name": "Excellente Affaire", "price": 21.0, "desc": "Entrée + Plat + Dessert" }
+    ],
+    "note": "Mix assortiment midi (1 nem porc, 1 samoussa, 1 tempura) 5,90 €"
+  },
+  "sections": [
+    {
+      "key": "entree", "title": "Croustillants", "column": 1, "tva": 10,
+      "dishes": [
+        { "name": "Planche Apéro Viet", "desc": "À partager à 2 : 1 rouleau de printemps, 4 nems porc, 2 nems poulet, 2 nems crevettes, 2 samoussas, 4 tempuras. Échange possible : nems et samoussas au choix", "img": "planche_apero_viet.png",
+          "variants": [{ "product": "Planche Apéro Viet", "price": 19.9 }] },
+        { "name": "Nems au choix – 3 pièces", "desc": "Porc (sans gluten), poulet, crevettes ou végé", "img": "nem.png",
+          "variants": [
+            { "label": "Porc", "id": 5, "price": 4.9 }, { "label": "Poulet", "id": 6, "price": 4.9 },
+            { "label": "Crevettes", "id": 7, "price": 4.9 }, { "label": "Végé", "id": 8, "price": 4.9 }
+          ] },
+        { "name": "Nems au choix – 4 pièces", "desc": "Porc (sans gluten), poulet, crevettes ou végé", "img": "nem.png",
+          "variants": [
+            { "label": "Porc", "product": "Nems au porc – 4 pièces", "price": 5.9 }, { "label": "Poulet", "product": "Nems au poulet – 4 pièces", "price": 5.9 },
+            { "label": "Crevettes", "product": "Nems aux crevettes – 4 pièces", "price": 5.9 }, { "label": "Végé", "product": "Nems végé – 4 pièces", "price": 5.9 }
+          ] },
+        { "name": "Samoussa au choix – 3 pièces", "desc": "Bœuf ou végé", "img": "samoussa.png",
+          "variants": [{ "label": "Bœuf", "id": 14, "price": 5.9 }, { "label": "Végé", "product": "Samoussa végé – 3 pièces", "price": 5.9 }] },
+        { "name": "Samoussa au choix – 4 pièces", "desc": "Bœuf ou végé", "img": "samoussa.png",
+          "variants": [{ "label": "Bœuf", "product": "Samoussa au bœuf – 4 pièces", "price": 7.5 }, { "label": "Végé", "product": "Samoussa végé – 4 pièces", "price": 7.5 }] },
+        { "name": "Tempura", "desc": "5 pièces", "img": "tempura.png", "variants": [{ "id": 62, "price": 7.9 }] },
+        { "name": "Mix assortiment nems", "desc": "5 pièces : 1 nem porc, 1 nem poulet, 1 nem crevette, 1 samoussa, 1 tempura", "img": "nem.png",
+          "variants": [{ "product": "Mix assortiment nems", "price": 7.9 }] }
+      ]
+    },
+    {
+      "key": "entree", "title": "Vapeur", "column": 1, "tva": 10,
+      "dishes": [
+        { "name": "Bouchée vapeur au choix – 3 pièces", "desc": "Porc, poulet, crevette · porc et crevette +1,00 €", "img": "menu_bouchee_vapeur.jpg",
+          "variants": [
+            { "label": "Porc", "id": 1, "price": 4.9 }, { "label": "Poulet", "id": 2, "price": 4.9 },
+            { "label": "Crevette", "product": "Bouchée vapeur crevette – 3 pièces", "price": 4.9 },
+            { "label": "Porc et crevette (+1€)", "id": 64, "price": 5.9, "img": "bouchee_au_porc_crevette.png" }
+          ] },
+        { "name": "Bouchée vapeur au choix – 4 pièces", "desc": "Porc, poulet, crevette · porc et crevette +1,00 €", "img": "menu_bouchee_vapeur.jpg",
+          "variants": [
+            { "label": "Porc", "product": "Bouchée vapeur porc – 4 pièces", "price": 5.9 }, { "label": "Poulet", "product": "Bouchée vapeur poulet – 4 pièces", "price": 5.9 },
+            { "label": "Crevette", "product": "Bouchée vapeur crevette – 4 pièces", "price": 5.9 },
+            { "label": "Porc et crevette (+1€)", "product": "Bouchée vapeur porc et crevette – 4 pièces", "price": 6.9, "img": "bouchee_au_porc_crevette.png" }
+          ] },
+        { "name": "Raviolis au choix – 3 pièces", "desc": "Crevette ou végé", "img": "raviolis_aux_crevettes.png",
+          "variants": [{ "label": "Crevette", "id": 9, "price": 4.9 }, { "label": "Végé", "id": 55, "price": 4.9 }] },
+        { "name": "Raviolis au choix – 4 pièces", "desc": "Crevette ou végé", "img": "raviolis_aux_crevettes.png",
+          "variants": [{ "label": "Crevette", "product": "Raviolis aux crevettes – 4 pièces", "price": 5.9 }, { "label": "Végé", "product": "Raviolis végé – 4 pièces", "price": 5.9 }] },
+        { "name": "Brioche au choix", "desc": "Porc laqué 5,50 € · végé 4,90 €", "img": "brioche.png",
+          "variants": [{ "label": "Porc laqué", "id": 3, "price": 5.5 }, { "label": "Végé", "id": 4, "price": 4.9 }] },
+        { "name": "Mix assortiment vapeur", "desc": "5 pièces au choix : porc, poulet, crevette ou porc et crevette", "img": "menu_bouchee_vapeur.jpg",
+          "variants": [{ "product": "Mix assortiment vapeur", "price": 7.9,
+            "choose": { "label": "Pièce", "count": 5, "from": ["Porc", "Poulet", "Crevette", "Porc et crevette"] } }] }
+      ]
+    },
+    {
+      "key": "entree", "title": "Fraîcheur", "column": 1, "tva": 10,
+      "dishes": [
+        { "name": "Rouleau de printemps au choix", "desc": "1 pièce : porc + crevette, poulet + crevette ou végé", "img": "rouleaux_printemps.png",
+          "variants": [
+            { "label": "Porc + crevette", "id": 11, "price": 4.5 },
+            { "label": "Poulet + crevette", "product": "Rouleau de printemps poulet-crevette", "price": 4.5 },
+            { "label": "Végé", "id": 12, "price": 4.5 }
+          ] },
+        { "name": "Salade vietnamienne", "desc": "", "img": "salade_vietnamienne.png", "variants": [{ "id": 13, "price": 6.9 }] }
+      ]
+    },
+    {
+      "key": "plat", "title": "Bo Bun", "column": 2, "tva": 10,
+      "dishes": [
+        { "name": "Bo Bun au choix", "desc": "Bœuf, porc grillé, poulet, végé · canard laqué ou crevettes 14,90 € · saumon 15,90 €", "img": "bo_bun.png",
+          "variants": [
+            { "label": "Classique (bœuf)", "id": 16, "price": 13.9 }, { "label": "Porc grillé", "id": 20, "price": 13.9, "img": "bo_bun_porc_grille.png" },
+            { "label": "Poulet", "id": 17, "price": 13.9 }, { "label": "Canard laqué", "id": 63, "price": 14.9 },
+            { "label": "Crevettes", "id": 18, "price": 14.9, "img": "bo_bun_crevette.png" }, { "label": "Saumon", "id": 66, "price": 15.9, "img": "bo_bun_saumon.png" },
+            { "label": "Végétarien", "id": 19, "price": 13.9, "img": "bo_bun_vege.png" }
+          ] },
+        { "name": "Bo Bun Duo", "desc": "2 viandes au choix", "img": "bo_bun.png",
+          "variants": [{ "product": "Bo Bun Duo", "price": 16.9,
+            "choose": { "label": "Viande", "count": 2, "distinct": true, "from": ["Bœuf", "Poulet", "Porc grillé", "Canard laqué"] } }] },
+        { "name": "Bo Bun King", "desc": "3 viandes au choix : bœuf, poulet, porc grillé ou canard laqué", "img": "bo_bun.png",
+          "variants": [{ "product": "Bo Bun King", "price": 18.9,
+            "choose": { "label": "Viande", "count": 3, "distinct": true, "from": ["Bœuf", "Poulet", "Porc grillé", "Canard laqué"] } }] }
+      ]
+    },
+    {
+      "key": "plat", "title": "Nouilles & Pad Thaï", "column": 2, "tva": 10,
+      "dishes": [
+        { "name": "Nouilles sautées au choix", "desc": "Poulet, bœuf, porc laqué, végé · canard laqué ou crevettes 14,90 € · saumon 15,90 €", "img": "nouille_saute.png",
+          "variants": [
+            { "label": "Poulet", "id": 23, "price": 13.9 }, { "label": "Bœuf", "id": 21, "price": 13.9 }, { "label": "Porc laqué", "id": 22, "price": 13.9 },
+            { "label": "Canard laqué", "product": "Nouilles au canard laqué", "price": 14.9, "img": "nouille_canard_laque.png" },
+            { "label": "Crevettes", "id": 24, "price": 14.9 },
+            { "label": "Saumon grillé", "product": "Nouilles au saumon grillé", "price": 15.9 },
+            { "label": "Végé", "id": 25, "price": 13.9, "img": "nouille_saute.png" }
+          ] },
+        { "name": "Nouilles sautées Duo", "desc": "2 viandes au choix", "img": "nouille_saute.png",
+          "variants": [{ "product": "Nouilles sautées Duo", "price": 16.9,
+            "choose": { "label": "Viande", "count": 2, "distinct": true, "from": ["Bœuf", "Poulet", "Porc laqué", "Canard laqué"] } }] },
+        { "name": "Nouilles sautées King", "desc": "3 viandes au choix", "img": "nouille_saute.png",
+          "variants": [{ "product": "Nouilles sautées King", "price": 18.9,
+            "choose": { "label": "Viande", "count": 3, "distinct": true, "from": ["Bœuf", "Poulet", "Porc laqué", "Canard laqué"] } }] },
+        { "name": "Pad Thaï au choix", "desc": "Poulet, bœuf, porc laqué · canard laqué ou crevettes 15,90 € · saumon grillé 16,90 €", "img": "pad_thai_crevette.png",
+          "variants": [
+            { "label": "Poulet", "id": 28, "price": 14.9 }, { "label": "Bœuf", "id": 26, "price": 14.9 }, { "label": "Porc laqué", "id": 27, "price": 14.9 },
+            { "label": "Canard laqué", "product": "Pad Thaï au canard laqué", "price": 15.9 },
+            { "label": "Crevettes", "id": 29, "price": 15.9, "img": "pad_thai_crevette.png" },
+            { "label": "Saumon grillé", "product": "Pad Thaï au saumon grillé", "price": 16.9 }
+          ] },
+        { "name": "Pad Thaï Duo", "desc": "2 viandes au choix", "img": "",
+          "variants": [{ "product": "Pad Thaï Duo", "price": 17.9,
+            "choose": { "label": "Viande", "count": 2, "distinct": true, "from": ["Bœuf", "Poulet", "Porc laqué", "Canard laqué"] } }] },
+        { "name": "Pad Thaï King", "desc": "3 viandes au choix", "img": "",
+          "variants": [{ "product": "Pad Thaï King", "price": 19.9,
+            "choose": { "label": "Viande", "count": 3, "distinct": true, "from": ["Bœuf", "Poulet", "Porc laqué", "Canard laqué"] } }] }
+      ]
+    },
+    {
+      "key": "plat", "title": "Riz vietnamien", "column": 2, "tva": 10,
+      "dishes": [
+        { "name": "Riz au trésor", "desc": "Riz brisé, porc grillé à la citronnelle, œuf, pickles et sauce nuoc mam", "img": "riz_tresor.png", "variants": [{ "id": 31, "price": 14.9 }] },
+        { "name": "Riz au choix", "desc": "Porc laqué, poulet, végé · bœuf 14,90 € · canard laqué ou saumon 15,90 €", "img": "riz_au_porc_laque.png",
+          "variants": [
+            { "label": "Porc laqué", "id": 32, "price": 13.9 }, { "label": "Poulet", "product": "Riz au poulet", "price": 13.9, "img": "riz_au_poulet.png" },
+            { "label": "Végé", "id": 33, "price": 13.9, "img": "riz_vege.png" }, { "label": "Bœuf", "product": "Riz au bœuf", "price": 14.9, "img": "riz_au_boeuf.png" },
+            { "label": "Canard laqué", "id": 65, "price": 15.9, "img": "riz_au_canard.png" }, { "label": "Saumon", "id": 67, "price": 15.9, "img": "riz_au_saumon.png" }
+          ] },
+        { "name": "Riz sauté aux crevettes", "desc": "Crevettes, œuf, petits légumes, oignons frits et sauce maison", "img": "riz_saute_au_crevette.png", "variants": [{ "product": "Riz sauté aux crevettes", "price": 16.9 }] }
+      ]
+    },
+    {
+      "key": "plat", "title": "Soupes & Crêpe", "column": 2, "tva": 10,
+      "dishes": [
+        { "name": "Soupe Phở", "desc": "Nouilles de riz, lamelles de bœuf, oignons, coriandre et pousses de soja", "img": "soupe_pho.png", "variants": [{ "id": 30, "price": 14.9 }] },
+        { "name": "Soupe Raviolis", "desc": "Raviolis au porc et crevettes, bouillon clair, légumes et oignons frits", "img": "menu_soupe_raviolis.jpg", "variants": [{ "product": "Soupe Raviolis", "price": 15.9 }] },
+        { "name": "Crêpe vietnamienne – Bánh xèo", "desc": "Porc, crevettes, pousses de soja, oignons, salade, herbes fraîches, sauce nước chấm", "img": "crepe_vietnamienne.png", "variants": [{ "id": 15, "price": 15.9 }] }
+      ]
+    },
+    {
+      "key": "supplement", "title": "Suppléments", "column": 2, "tva": 10,
+      "dishes": [
+        { "name": "1 nem", "desc": "Porc, crevettes, poulet ou végétarien", "img": "menu_supplement_nem.jpg",
+          "variants": [{ "product": "Supplément 1 nem", "price": 1.9, "choose": { "label": "Nem", "count": 1, "from": ["Porc", "Crevettes", "Poulet", "Végétarien"] } }] },
+        { "name": "3 nems", "desc": "Porc, crevettes, poulet ou végétarien", "img": "menu_supplement_nem.jpg",
+          "variants": [{ "product": "Supplément 3 nems", "price": 4.9, "choose": { "label": "Nems", "count": 1, "from": ["Porc", "Crevettes", "Poulet", "Végétarien"] } }] },
+        { "name": "1 œuf", "desc": "", "img": "", "variants": [{ "product": "Supplément 1 œuf", "price": 1.9 }] },
+        { "name": "Riz blanc", "desc": "", "img": "menu_supplement_riz.jpg", "variants": [{ "product": "Supplément riz blanc", "price": 4.0 }] },
+        { "name": "Portion de sauce", "desc": "", "img": "menu_supplement_sauce.jpg", "variants": [{ "product": "Supplément portion de sauce", "price": 0.9 }] },
+        { "name": "Portion de viande / crevettes", "desc": "", "img": "",
+          "variants": [{ "product": "Supplément portion viande / crevettes", "price": 4.0, "choose": { "label": "Portion", "count": 1, "from": ["Bœuf", "Porc", "Poulet", "Canard laqué", "Crevettes"] } }] }
+      ]
+    },
+    {
+      "key": "dessert", "title": "Desserts", "column": 3, "tva": 10,
+      "dishes": [
+        { "name": "Perle de coco", "desc": "Farine de riz, haricot mungo, noix de coco", "img": "perle_de_coco.png", "variants": [{ "id": 37, "price": 4.9 }] },
+        { "name": "Glace au riz gluant – Kem xôi", "desc": "Glace coco, riz gluant au pandan, cacahuètes grillées", "img": "glace_au_riz_gluant.png", "variants": [{ "id": 36, "price": 4.9 }] },
+        { "name": "Glace 2 boules", "desc": "Vanille, coco ou mixte", "img": "menu_glace_2_boules.jpg",
+          "variants": [{ "id": 35, "price": 4.9, "choose": { "label": "Parfum", "count": 1, "from": ["Vanille", "Coco", "Mixte"] } }] },
+        { "name": "Gâteau banane", "desc": "Gâteau maison, glace de coco et sauce chocolat", "img": "gateau_banane.png", "variants": [{ "id": 34, "price": 5.9 }] },
+        { "name": "Mochi glacé", "desc": "2 pcs 4,90 € · 3 pcs 5,90 € : mangue-passion, matcha, chocolat à la noix de coco", "img": "menu_mochi_glace.jpg",
+          "variants": [
+            { "label": "2 pièces", "product": "Mochi glacé – 2 pièces", "price": 4.9, "choose": { "label": "Mochi", "count": 2, "from": ["Mangue-passion", "Matcha", "Chocolat noix de coco"] } },
+            { "label": "3 pièces", "product": "Mochi glacé – 3 pièces", "price": 5.9, "choose": { "label": "Mochi", "count": 3, "from": ["Mangue-passion", "Matcha", "Chocolat noix de coco"] } }
+          ] },
+        { "name": "Trio de desserts", "desc": "Glace de coco, perle de coco, mochi au choix", "img": "menu_trio_desserts.jpg",
+          "variants": [{ "product": "Trio de desserts", "price": 5.9, "choose": { "label": "Mochi", "count": 1, "from": ["Mangue-passion", "Matcha", "Chocolat noix de coco"] } }] },
+        { "name": "Café gourmand vietnamien", "desc": "Expresso, 1 perle de coco, 1 mochi au choix", "img": "menu_cafe_gourmand.jpg",
+          "variants": [{ "product": "Café gourmand vietnamien", "price": 6.9, "choose": { "label": "Mochi", "count": 1, "from": ["Mangue-passion", "Matcha", "Chocolat noix de coco"] } }] },
+        { "name": "Thé gourmand vietnamien", "desc": "Thé jasmin, 1 perle de coco, 1 mochi au choix", "img": "menu_the_gourmand.jpg",
+          "variants": [{ "product": "Thé gourmand vietnamien", "price": 6.9, "choose": { "label": "Mochi", "count": 1, "from": ["Mangue-passion", "Matcha", "Chocolat noix de coco"] } }] }
+      ]
+    },
+    {
+      "key": "boisson", "title": "Bar à boissons", "column": 3, "tva": 10,
+      "dishes": [
+        { "name": "Bubble tea", "desc": "Sucre de canne, taro, matcha · crème brûlée ou tiramisu 7,50 €", "img": "",
+          "variants": [
+            { "label": "Sucre de canne", "product": "Bubble tea sucre de canne", "price": 6.5, "img": "menu_bubble_sucre.jpg" },
+            { "label": "Taro", "product": "Bubble tea taro", "price": 6.5, "img": "menu_bubble_taro.jpg" },
+            { "label": "Crème brûlée", "product": "Bubble tea crème brûlée", "price": 7.5, "img": "menu_bubble_creme.jpg" },
+            { "label": "Tiramisu", "product": "Bubble tea tiramisu", "price": 7.5, "img": "menu_bubble_tiramisu.jpg" },
+            { "label": "Matcha", "product": "Bubble tea matcha", "price": 6.5, "img": "menu_bubble_matcha.jpg" }
+          ] },
+        { "name": "Matcha", "desc": "Latte, fraise, mangue, pêche, litchi", "img": "",
+          "variants": [
+            { "label": "Latte", "product": "Matcha latte", "price": 6.5, "img": "menu_matcha_latte.jpg" },
+            { "label": "Fraise", "product": "Matcha fraise", "price": 6.5, "img": "menu_matcha_fraise.jpg" },
+            { "label": "Mangue", "product": "Matcha mangue", "price": 6.5, "img": "menu_matcha_mangue.jpg" },
+            { "label": "Pêche", "product": "Matcha pêche", "price": 6.5, "img": "menu_matcha_peche.jpg" },
+            { "label": "Litchi", "product": "Matcha litchi", "price": 6.5, "img": "menu_matcha_litchi.jpg" }
+          ] },
+        { "name": "Thés glacés", "desc": "Pêche, litchi, fraise, mangue", "img": "",
+          "variants": [
+            { "label": "Pêche", "product": "Thé glacé pêche", "price": 6.5, "img": "menu_the_peche.jpg" },
+            { "label": "Litchi", "product": "Thé glacé litchi", "price": 6.5, "img": "menu_the_litchi.jpg" },
+            { "label": "Fraise", "id": 45, "price": 6.5, "img": "menu_the_fraise.jpg" },
+            { "label": "Mangue", "product": "Thé glacé mangue", "price": 6.5, "img": "menu_the_mangue.jpg" },
+            { "label": "Orange pêche citronnelle", "id": 47, "price": 6.5, "print": false }
+          ] },
+        { "name": "Mojitos sans alcool", "desc": "Pêche, litchi, fraise, mangue", "img": "",
+          "variants": [
+            { "label": "Pêche", "product": "Mojito pêche (sans alcool)", "price": 6.5, "img": "menu_mojito_peche.jpg" },
+            { "label": "Litchi", "product": "Mojito litchi (sans alcool)", "price": 6.5, "img": "menu_mojito_litchi.jpg" },
+            { "label": "Fraise", "product": "Mojito fraise (sans alcool)", "price": 6.5, "img": "menu_mojito_fraise.jpg" },
+            { "label": "Mangue", "product": "Mojito mangue (sans alcool)", "price": 6.5, "img": "menu_mojito_mangue.jpg" }
+          ] },
+        { "name": "Café vietnamien", "desc": "Classique · tiramisu ou au sel 7,50 €", "img": "",
+          "variants": [
+            { "label": "Classique", "id": 42, "price": 6.5, "img": "menu_cafe_classique.jpg" },
+            { "label": "Tiramisu", "product": "Café vietnamien tiramisu", "price": 7.5, "img": "menu_cafe_tiramisu.jpg" },
+            { "label": "Au sel", "product": "Café vietnamien au sel", "price": 7.5, "img": "menu_cafe_sel.jpg" }
+          ] },
+        { "name": "Lait frais aux perles", "desc": "Sucre de canne, matcha, taro", "img": "",
+          "variants": [
+            { "label": "Sucre de canne", "product": "Lait frais aux perles sucre de canne", "price": 6.5, "img": "menu_lait_sucre.jpg" },
+            { "label": "Matcha", "product": "Lait frais aux perles matcha", "price": 6.5, "img": "menu_lait_matcha.jpg" },
+            { "label": "Taro", "product": "Lait frais aux perles taro", "price": 6.5, "img": "menu_lait_taro.jpg" }
+          ] }
+      ]
+    },
+    {
+      "key": "boisson", "title": "Bières & Vins", "column": 3, "tva": 20,
+      "dishes": [
+        { "name": "Bière Saigon Export Premium", "desc": "33cl, 4,9 % vol.", "img": "menu_biere_saigon.jpg", "variants": [{ "id": 38, "price": 5.0 }] },
+        { "name": "Vin rosé Hérault I.G.P. « Petites Balades »", "desc": "12cl 5,00 € · 25cl 8,00 € · 50cl 14,00 €", "img": "menu_vin_rose.jpg",
+          "variants": [
+            { "label": "Verre 12cl", "id": 48, "price": 5.0 },
+            { "label": "25cl", "product": "Vin rosé 25cl", "price": 8.0 },
+            { "label": "50cl", "product": "Vin rosé 50cl", "price": 14.0 }
+          ] },
+        { "name": "Vin blanc Chardonnay, Vin de France", "desc": "12cl 5,00 € · 25cl 8,00 € · 50cl 14,00 €", "img": "menu_vin_blanc.jpg",
+          "variants": [
+            { "label": "Verre 12cl", "product": "Vin blanc 12cl", "price": 5.0 },
+            { "label": "25cl", "product": "Vin blanc 25cl", "price": 8.0 },
+            { "label": "50cl", "product": "Vin blanc 50cl", "price": 14.0 }
+          ] }
+      ]
+    },
+    {
+      "key": "boisson", "title": "Boissons classiques", "column": 3, "tva": 5.5,
+      "dishes": [
+        { "name": "Eau", "desc": "Evian plate 50cl, San Pellegrino 50cl", "img": "",
+          "variants": [
+            { "label": "Evian 50cl", "id": 44, "price": 3.0, "img": "menu_eau_evian.jpg" },
+            { "label": "San Pellegrino 50cl", "id": 58, "price": 3.0, "img": "menu_eau_pellegrino.jpg" }
+          ] },
+        { "name": "Sodas", "desc": "Coca-Cola, Orangina, Coca Zéro, Ice Tea", "img": "",
+          "variants": [
+            { "label": "Coca-Cola", "id": 43, "price": 3.0, "img": "menu_soda_coca.jpg" }, { "label": "Orangina", "id": 61, "price": 3.0, "img": "menu_soda_orangina.jpg" },
+            { "label": "Coca Zéro", "id": 59, "price": 3.0, "img": "menu_soda_zero.jpg" }, { "label": "Ice Tea", "id": 60, "price": 3.0, "img": "menu_soda_icetea.jpg" }
+          ] },
+        { "name": "Boissons asiatiques", "desc": "Coco, litchi", "img": "",
+          "variants": [
+            { "label": "Coco", "id": 39, "price": 4.0, "img": "menu_boisson_coco.jpg" },
+            { "label": "Litchi", "id": 57, "price": 4.0, "img": "menu_boisson_litchi.jpg" }
+          ] },
+        { "name": "Boissons chaudes", "desc": "Thé jasmin, café expresso", "img": "",
+          "variants": [
+            { "label": "Thé jasmin", "id": 46, "price": 3.0, "img": "menu_the_jasmin.jpg" },
+            { "label": "Café expresso", "id": 41, "price": 3.0, "img": "menu_cafe_expresso.jpg" }
+          ] }
+      ]
+    }
+  ]
+}
