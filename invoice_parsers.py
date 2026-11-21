@@ -873,7 +873,9 @@ def _grand_frais_product(description):
 
 
 def is_grand_frais(text):
-    return "grandfrais.com" in text.lower()
+    # le nouveau modèle de ticket n'imprime plus « www.grandfrais.com »
+    compact = re.sub(r"\s+", "", text).lower()
+    return "grandfrais" in compact or "81358727600011" in compact
 
 
 def _grand_frais_rate(text, result):
@@ -896,7 +898,101 @@ def _grand_frais_rate(text, result):
     return 5.5
 
 
+# nouveau modèle : "A 6x *HARICOT MUNGO SACHET 1,99 € 11,94 €"
+_GF2_ITEM = re.compile(
+    r"^(?P<tva>[A-Z])\s+(?:(?P<qty>\d+)x\s+)?\*?(?P<desc>.+?)\s+"
+    r"(?P<pu>\d+,\d{2})\s*€\s+(?P<total>\d+,\d{2})\s*€$"
+)
+# article au poids sur 2 lignes : "A *CHOI SUM" puis "NET 0,600 kg x 3,99 €/kg 2,39 €"
+_GF2_WEIGHED = re.compile(r"^(?P<tva>[A-Z])\s+\*?(?P<desc>[^€]+)$")
+_GF2_NET = re.compile(
+    r"^NET\s+(?P<kg>\d+,\d{3})\s*kg\s+x\s+(?P<pu>\d+,\d{2})\s*€/kg\s+(?P<total>\d+,\d{2})\s*€$"
+)
+_GF2_NEGATIVE = re.compile(r"^(?P<label>.+?)\s+(?P<amount>-\d+,\d{2})\s*€$")
+
+
+def _parse_grand_frais_v2(text):
+    result = _empty("grand_frais", "Grand Frais")
+
+    m = re.search(r"(\d{2}/\d{2}/\d{4})\s+\d{2}:\d{2}:\d{2}\s+N\S*\s*Ticket vente\s+(\d+)", text)
+    if m:
+        result["invoice_date"] = _iso(m.group(1))
+        barcode = re.search(r"^(\d{16,24})$", text, re.M)
+        ref = barcode.group(1) if barcode else m.group(2)
+        # le n° de ticket seul peut revenir d'un jour à l'autre
+        result["invoice_number"] = f"{ref}-{result['invoice_date'].replace('-', '')}"
+
+    m = re.search(r"NET TTC\s+(\d{1,3}(?: \d{3})*,\d{2})\s*€", text)
+    if m:
+        result["total_ttc"] = _num(m.group(1))
+
+    # "A 5,5% 14,52 € 0,80 € 15,32 €" → code A = 5,5 %
+    rates = {
+        code: _num(rate)
+        for code, rate in re.findall(
+            r"^([A-Z])\s+(\d+(?:,\d+)?)%\s+\d+,\d{2}\s*€\s+\d+,\d{2}\s*€\s+\d+,\d{2}\s*€$", text, re.M
+        )
+    }
+    default_rate = next(iter(rates.values()), 5.5)
+
+    def rate_of(code):
+        if code not in rates:
+            result["warnings"].append(f"Taux de TVA « {code} » inconnu : {default_rate} % appliqué")
+        return rates.get(code, default_rate)
+
+    items = []
+    discounts = []
+    pending = None
+    in_items = False
+
+    for raw in text.split("\n"):
+        line = raw.strip()
+
+        if not in_items:
+            in_items = line.startswith("T Qt Description")
+            continue
+
+        if re.match(r"^\d+ LIGNES?\b", line):
+            break
+
+        nm = _GF2_NET.match(line)
+        if nm and pending:
+            # poids déjà net : la ligne « PT » (tare) n'est pas à retirer
+            items.append({
+                "desc": pending["desc"], "qty": _num(nm.group("kg")), "pu": _num(nm.group("pu")),
+                "total": _num(nm.group("total")), "hint": "kg", "rate": pending["rate"],
+            })
+            pending = None
+            continue
+
+        im = _GF2_ITEM.match(line)
+        if im:
+            qty = int(im.group("qty") or 1)
+            items.append({
+                "desc": im.group("desc").strip(), "qty": qty, "pu": _num(im.group("pu")),
+                "total": _num(im.group("total")), "hint": "", "rate": rate_of(im.group("tva")),
+            })
+            continue
+
+        dm = _GF2_NEGATIVE.match(line)
+        if dm:
+            # format de remise pas encore rencontré : jamais rattaché à un produit au hasard
+            amount = _num(dm.group("amount"))
+            discounts.append((dm.group("label"), amount, False))
+            result["warnings"].append(f"{dm.group('label')} ({amount:.2f} €) : non importé")
+            continue
+
+        wm = _GF2_WEIGHED.match(line)
+        if wm:
+            pending = {"desc": wm.group("desc").strip(), "rate": rate_of(wm.group("tva"))}
+
+    return _grand_frais_finish(result, items, discounts, default_rate)
+
+
 def parse_grand_frais(text):
+    if re.search(r"Ticket vente\s+\d+", text):
+        return _parse_grand_frais_v2(text)
+
     result = _empty("grand_frais", "Grand Frais")
 
     m = _GF_FOOTER.search(text)
@@ -990,6 +1086,10 @@ def parse_grand_frais(text):
 
         items.append({"desc": im.group("desc"), "qty": 1, "pu": total, "total": total, "hint": ""})
 
+    return _grand_frais_finish(result, items, discounts, rate)
+
+
+def _grand_frais_finish(result, items, discounts, rate):
     # contrôle sur le ticket complet, avant de retirer les articles non suivis
     ticket_total = result["total_ttc"]
     read_total = round(sum(i["total"] for i in items) + sum(d[1] for d in discounts), 2)
@@ -1021,7 +1121,7 @@ def parse_grand_frais(text):
             item["qty"],
             item["pu"],
             item["total"],
-            rate,
+            item.get("rate", rate),
             unit_hint=item["hint"],
         ))
 
