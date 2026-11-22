@@ -77,11 +77,11 @@
     {
       "key": "plat", "title": "Bo Bun", "column": 2, "tva": 10,
       "dishes": [
-        { "name": "Bo Bun au choix", "desc": "Bœuf, porc grillé, poulet, végé · canard laqué ou crevettes 14,90 € · saumon 15,90 €", "img": "bo_bun.png",
+        { "name": "Bo Bun au choix", "desc": "Bœuf, porc grillé, poulet, végé · canard laqué ou crevettes 14,90 € · saumon grillé 15,90 €", "img": "bo_bun.png",
           "variants": [
             { "label": "Classique (bœuf)", "id": 16, "price": 13.9 }, { "label": "Porc grillé", "id": 20, "price": 13.9, "img": "bo_bun_porc_grille.png" },
             { "label": "Poulet", "id": 17, "price": 13.9 }, { "label": "Canard laqué", "id": 63, "price": 14.9 },
-            { "label": "Crevettes", "id": 18, "price": 14.9, "img": "bo_bun_crevette.png" }, { "label": "Saumon", "id": 66, "price": 15.9, "img": "bo_bun_saumon.png" },
+            { "label": "Crevettes", "id": 18, "price": 14.9, "img": "bo_bun_crevette.png" }, { "label": "Saumon grillé", "id": 66, "price": 15.9, "img": "bo_bun_saumon.png" },
             { "label": "Végétarien", "id": 19, "price": 13.9, "img": "bo_bun_vege.png" }
           ] },
         { "name": "Bo Bun Duo", "desc": "2 viandes au choix", "img": "bo_bun.png",
@@ -95,7 +95,7 @@
     {
       "key": "plat", "title": "Nouilles & Pad Thaï", "column": 2, "tva": 10,
       "dishes": [
-        { "name": "Nouilles sautées au choix", "desc": "Poulet, bœuf, porc laqué, végé · canard laqué ou crevettes 14,90 € · saumon 15,90 €", "img": "nouille_saute.png",
+        { "name": "Nouilles sautées au choix", "desc": "Poulet, bœuf, porc laqué, végé · canard laqué ou crevettes 14,90 € · saumon grillé 15,90 €", "img": "nouille_saute.png",
           "variants": [
             { "label": "Poulet", "id": 23, "price": 13.9 }, { "label": "Bœuf", "id": 21, "price": 13.9 }, { "label": "Porc laqué", "id": 22, "price": 13.9 },
             { "label": "Canard laqué", "product": "Nouilles au canard laqué", "price": 14.9, "img": "nouille_canard_laque.png" },
@@ -128,11 +128,11 @@
       "key": "plat", "title": "Riz vietnamien", "column": 2, "tva": 10,
       "dishes": [
         { "name": "Riz au trésor", "desc": "Riz brisé, porc grillé à la citronnelle, œuf, pickles et sauce nuoc mam", "img": "riz_tresor.png", "variants": [{ "id": 31, "price": 14.9 }] },
-        { "name": "Riz au choix", "desc": "Porc laqué, poulet, végé · bœuf 14,90 € · canard laqué ou saumon 15,90 €", "img": "riz_au_porc_laque.png",
+        { "name": "Riz au choix", "desc": "Porc laqué, poulet, végé · bœuf 14,90 € · canard laqué ou saumon grillé 15,90 €", "img": "riz_au_porc_laque.png",
           "variants": [
             { "label": "Porc laqué", "id": 32, "price": 13.9 }, { "label": "Poulet", "product": "Riz au poulet", "price": 13.9, "img": "riz_au_poulet.png" },
             { "label": "Végé", "id": 33, "price": 13.9, "img": "riz_vege.png" }, { "label": "Bœuf", "product": "Riz au bœuf", "price": 14.9, "img": "riz_au_boeuf.png" },
-            { "label": "Canard laqué", "id": 65, "price": 15.9, "img": "riz_au_canard.png" }, { "label": "Saumon", "id": 67, "price": 15.9, "img": "riz_au_saumon.png" }
+            { "label": "Canard laqué", "id": 65, "price": 15.9, "img": "riz_au_canard.png" }, { "label": "Saumon grillé", "id": 67, "price": 15.9, "img": "riz_au_saumon.png" }
           ] },
         { "name": "Riz sauté aux crevettes", "desc": "Crevettes, œuf, petits légumes, oignons frits et sauce maison", "img": "riz_saute_au_crevette.png", "variants": [{ "product": "Riz sauté aux crevettes", "price": 16.9 }] }
       ]
