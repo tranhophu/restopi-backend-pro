@@ -245,7 +245,8 @@ def sync_stock():
         cur.execute("""
         ALTER TABLE stock_products
         ADD COLUMN IF NOT EXISTS stock_parent_id INTEGER REFERENCES stock_products(id) ON DELETE SET NULL,
-        ADD COLUMN IF NOT EXISTS stock_link_from DATE;
+        ADD COLUMN IF NOT EXISTS stock_link_from DATE,
+        ADD COLUMN IF NOT EXISTS stock_link_factor DOUBLE PRECISION;
         """)
 
     worksheets = spreadsheet.worksheets()
