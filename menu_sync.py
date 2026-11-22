@@ -192,6 +192,7 @@ def expected_products(source, files):
                     "category": section["key"],
                     "tva": dish.get("tva", section["tva"]),
                     "img": resolve_image(dish, v, name, files),
+                    "replace_img": dish.get("replace_img", False),
                     "print": v.get("print", True),
                 })
     return out
@@ -219,7 +220,8 @@ def build_plan(source, current, files):
             plan["price"].append((p["id"], p["name"], p["price"], e["price"]))
         current_img = p.get("img") or ""
         has_real = current_img and "default" not in current_img and not current_img.startswith("http")
-        if e["img"] and not has_real:
+        # replace_img : la photo du menu remplace volontairement celle déjà en base
+        if e["img"] and (not has_real or (e["replace_img"] and current_img != e["img"])):
             plan["image"].append((p["id"], p["name"], e["img"]))
 
     # doublons de l'onglet Végétariens : même prix que le plat de référence

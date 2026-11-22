@@ -22,14 +22,14 @@
             { "label": "Porc", "id": 5, "price": 4.9 }, { "label": "Poulet", "id": 6, "price": 4.9 },
             { "label": "Crevettes", "id": 7, "price": 4.9 }, { "label": "Végé", "id": 8, "price": 4.9 }
           ] },
-        { "name": "Nems au choix – 4 pièces", "desc": "Porc (sans gluten), poulet, crevettes ou végé", "img": "nem.png",
+        { "name": "Nems au choix – 4 pièces", "desc": "Porc (sans gluten), poulet, crevettes ou végé", "img": "menu_nems_4_pieces.jpg", "replace_img": true,
           "variants": [
             { "label": "Porc", "product": "Nems au porc – 4 pièces", "price": 5.9 }, { "label": "Poulet", "product": "Nems au poulet – 4 pièces", "price": 5.9 },
             { "label": "Crevettes", "product": "Nems aux crevettes – 4 pièces", "price": 5.9 }, { "label": "Végé", "product": "Nems végé – 4 pièces", "price": 5.9 }
           ] },
         { "name": "Samoussa au choix – 3 pièces", "hidden": true, "desc": "Bœuf ou végé", "img": "samoussa.png",
           "variants": [{ "label": "Bœuf", "id": 14, "price": 5.9 }, { "label": "Végé", "product": "Samoussa végé – 3 pièces", "price": 5.9 }] },
-        { "name": "Samoussa au choix – 4 pièces", "desc": "Bœuf ou végé", "img": "samoussa.png",
+        { "name": "Samoussa au choix – 4 pièces", "desc": "Bœuf ou végé", "img": "menu_samoussa_4_pieces.jpg", "replace_img": true,
           "variants": [{ "label": "Bœuf", "product": "Samoussa au bœuf – 4 pièces", "price": 7.5 }, { "label": "Végé", "product": "Samoussa végé – 4 pièces", "price": 7.5 }] },
         { "name": "Tempura", "desc": "5 pièces", "img": "tempura.png", "variants": [{ "id": 62, "price": 7.9 }] },
         { "name": "Mix assortiment nems", "desc": "5 pièces : 1 nem porc, 1 nem poulet, 1 nem crevette, 1 samoussa, 1 tempura", "img": "nem.png",
