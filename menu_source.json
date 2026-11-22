@@ -140,7 +140,7 @@
     {
       "key": "plat", "title": "Soupes & Crêpe", "column": 2, "tva": 10,
       "dishes": [
-        { "name": "Soupe Phở", "desc": "Nouilles de riz, lamelles de bœuf, oignons, coriandre et pousses de soja", "img": "soupe_pho.png", "variants": [{ "id": 30, "price": 14.9 }] },
+        { "name": "Soupe Phở", "desc": "Pâtes de riz, lamelles de bœuf, oignons, coriandre et pousses de soja", "img": "soupe_pho.png", "variants": [{ "id": 30, "price": 14.9 }] },
         { "name": "Soupe Raviolis", "desc": "Raviolis au porc et crevettes, bouillon clair, légumes et oignons frits", "img": "menu_soupe_raviolis.jpg", "variants": [{ "product": "Soupe Raviolis", "price": 15.9 }] },
         { "name": "Crêpe vietnamienne – Bánh xèo", "desc": "Porc, crevettes, pousses de soja, oignons, salade, herbes fraîches, sauce nước chấm", "img": "crepe_vietnamienne.png", "variants": [{ "id": 15, "price": 15.9 }] }
       ]
