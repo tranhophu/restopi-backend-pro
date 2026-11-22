@@ -241,6 +241,13 @@ def sync_stock():
         ADD COLUMN IF NOT EXISTS skipped_control_date DATE;
         """)
 
+        # 🔗 forme d'achat liée : son stock est compté sur le produit parent (voir /admin/stock/link)
+        cur.execute("""
+        ALTER TABLE stock_products
+        ADD COLUMN IF NOT EXISTS stock_parent_id INTEGER REFERENCES stock_products(id) ON DELETE SET NULL,
+        ADD COLUMN IF NOT EXISTS stock_link_from DATE;
+        """)
+
     worksheets = spreadsheet.worksheets()
 
     synced = 0
@@ -329,7 +336,7 @@ def sync_stock():
             with conn.cursor() as cur:
 
                 cur.execute("""
-                SELECT id, stock_quantity, stock_date, skipped_control_date
+                SELECT id, stock_quantity, stock_date, skipped_control_date, stock_parent_id
                 FROM stock_products
                 WHERE LOWER(name)=%s
                 AND LOWER(supplier)=%s
@@ -360,6 +367,10 @@ def sync_stock():
                     # ⏭ passé lors de l'inventaire de cette date : D2 (date du contrôle) ne le concerne pas.
                     # Sinon la synchro le « confirme » à cette date → snapshot → semaine sans consommation.
                     if should_update_stock and existing[3] and stock_date == existing[3]:
+                        should_update_stock = False
+
+                    # 🔗 forme d'achat liée : pas de stock propre, même si « Stock Réel » est saisi dans le Sheet
+                    if existing[4] is not None:
                         should_update_stock = False
 
                     if should_update_stock:

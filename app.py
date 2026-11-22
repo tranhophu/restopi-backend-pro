@@ -461,6 +461,14 @@ def init_stock():
             ALTER TABLE stock_products
             ADD COLUMN IF NOT EXISTS skipped_control_date DATE;
             """)
+
+            # 🔗 « forme d'achat » (carton) d'un produit compté ailleurs (pce) : un seul stock, sur le parent.
+            # stock_link_from : seuls les achats APRÈS cette date alimentent le parent.
+            cur.execute("""
+            ALTER TABLE stock_products
+            ADD COLUMN IF NOT EXISTS stock_parent_id INTEGER REFERENCES stock_products(id) ON DELETE SET NULL,
+            ADD COLUMN IF NOT EXISTS stock_link_from DATE;
+            """)
             # historique achat réel
 
             cur.execute("""
@@ -1921,7 +1929,10 @@ def stock_products():
                  FROM stock_movements m
                  WHERE m.movement_type = 'ACHAT'
                  AND LOWER(TRIM(m.product_name)) = LOWER(TRIM(stock_products.name))
-                 AND LOWER(TRIM(m.supplier)) = LOWER(TRIM(stock_products.supplier)))
+                 AND LOWER(TRIM(m.supplier)) = LOWER(TRIM(stock_products.supplier))),
+
+                stock_parent_id,
+                stock_link_from
             FROM stock_products
             ORDER BY name ASC
             """)
@@ -1931,10 +1942,19 @@ def stock_products():
             # achats reçus depuis le dernier contrôle (stock théorique de l'inventaire)
             since_control = _purchases_since_control(cur)
 
+    # un achat en carton garde le produit parent « actif » (pas dormant)
+    last_purchase = {r[0]: r[14] for r in rows}
+    for r in rows:
+        if r[15] in last_purchase and r[14] and (not last_purchase[r[15]] or r[14] > last_purchase[r[15]]):
+            last_purchase[r[15]] = r[14]
+
     result = []
 
     for r in rows:
         result.append({
+
+            "stock_parent_id": r[15],
+            "stock_link_from": str(r[16]) if r[16] else "",
 
             "purchases_since_control": [
                 {"date": d.isoformat(), "quantity": q, "unit": u}
@@ -1961,7 +1981,7 @@ def stock_products():
             "min_stock": r[12],
 
             "order_tracking": r[13],
-            "last_purchase_date": str(r[14]) if r[14] else ""
+            "last_purchase_date": str(last_purchase[r[0]]) if last_purchase[r[0]] else ""
 
         })
 
@@ -2255,22 +2275,51 @@ def rename_stock_product():
     return jsonify({"success": True, "new_name": new_name, "supplier": supplier})
 
 
+def _merge_unit_plan(old_purchase, old_stock, old_conv, new_purchase, new_stock, new_conv):
+    """
+    Conversion des achats du produit absorbé vers l'unité d'achat du produit gardé
+    (ex. carton de 15 pce absorbé par un produit en pce : 2 carton → 30 pce).
+    → {"unit", "code_ratio", "groups": [(unités_en_minuscules, ratio)]}
+    None si les unités stock diffèrent (aucune équivalence connue : rien n'est converti).
+    L'unité d'achat de l'ancien produit vient en premier : une fois réétiquetée, elle ne doit
+    pas être reconvertie par le groupe « unité stock ».
+    """
+    o_stock = (old_stock or "").strip() or (old_purchase or "").strip() or "unité"
+    o_purchase = (old_purchase or "").strip() or o_stock
+    n_stock = (new_stock or "").strip() or (new_purchase or "").strip() or "unité"
+    n_purchase = (new_purchase or "").strip() or n_stock
+
+    if o_stock.lower() != n_stock.lower():
+        return None
+
+    o_factor = 1.0 if o_purchase.lower() == o_stock.lower() else (float(old_conv or 1) or 1.0)
+    n_factor = 1.0 if n_purchase.lower() == n_stock.lower() else (float(new_conv or 1) or 1.0)
+
+    groups = []
+    if o_purchase.lower() != o_stock.lower():
+        groups.append(([o_purchase.lower()], o_factor / n_factor))
+    groups.append((["", o_stock.lower()], 1.0 / n_factor))
+
+    return {"unit": n_purchase, "code_ratio": o_factor / n_factor, "groups": groups}
+
+
 def _merge_stock_product(cur, supplier, old_name, new_name):
     """
     Fusionne « old_name » dans « new_name » (même fournisseur, transaction de l'appelant) :
     historique d'achats, prix de référence, codes facture, recettes, alias d'inventaire
     passent sur le produit gardé ; l'ancien produit est supprimé (base + ligne Google Sheet).
+    Achats et codes facture sont convertis vers l'unité d'achat du produit gardé (même unité stock).
     Le stock du produit gardé ne change pas (l'ancien stock est renvoyé pour information).
     Lève une exception en cas d'échec → l'appelant fait rollback.
     """
     cur.execute("""
-    SELECT id, stock_quantity, stock_unit, purchase_unit FROM stock_products
+    SELECT id, stock_quantity, stock_unit, purchase_unit, conversion_factor FROM stock_products
     WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s)) AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
     """, (old_name, supplier))
     old = cur.fetchone()
 
     cur.execute("""
-    SELECT id FROM stock_products
+    SELECT id, stock_unit, purchase_unit, conversion_factor FROM stock_products
     WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s)) AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
     """, (new_name, supplier))
     new = cur.fetchone()
@@ -2278,10 +2327,38 @@ def _merge_stock_product(cur, supplier, old_name, new_name):
     if not old or not new or old[0] == new[0]:
         raise ValueError("Produits à fusionner introuvables")
 
+    cur.execute("""
+    SELECT 1 FROM stock_products
+    WHERE (id = ANY(%s) AND stock_parent_id IS NOT NULL) OR stock_parent_id = ANY(%s)
+    LIMIT 1
+    """, ([old[0], new[0]], [old[0], new[0]]))
+    if cur.fetchone():
+        raise ValueError("Produit lié (🔗) : retirez d'abord la liaison avant de fusionner")
+
     match = """
     WHERE LOWER(TRIM(product_name)) = LOWER(TRIM(%s))
     AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
     """
+
+    plan = _merge_unit_plan(old[3], old[2], old[4], new[2], new[1], new[3])
+    if plan:
+        for units, ratio in plan["groups"]:
+            cur.execute(f"""
+            UPDATE stock_movements
+            SET quantity = ROUND((quantity * %s)::numeric, 6)::double precision,
+                purchase_quantity = ROUND((purchase_quantity * %s)::numeric, 6)::double precision,
+                unit_price = unit_price / %s,
+                purchase_unit = %s
+            {match}
+            AND movement_type IN ('ACHAT', 'RETOUR')
+            AND LOWER(TRIM(COALESCE(purchase_unit, ''))) = ANY(%s)
+            """, (ratio, ratio, ratio, plan["unit"], old_name, supplier, units))
+
+        # code facture : quantité facture × facteur = quantité en unité d'achat du produit gardé
+        cur.execute(f"""
+        UPDATE stock_supplier_codes SET factor = COALESCE(factor, 1) * %s
+        {match}
+        """, (plan["code_ratio"], old_name, supplier))
 
     moved = {}
     for table in (
@@ -2431,7 +2508,8 @@ def _save_stock_products(updates):
                 min_stock = float(p.get("min_stock") or 0)
 
                 cur.execute("""
-                SELECT name, supplier, stock_quantity, min_stock
+                SELECT name, supplier, stock_quantity, min_stock, stock_unit, stock_parent_id,
+                       EXISTS (SELECT 1 FROM stock_products c WHERE c.stock_parent_id = stock_products.id)
                 FROM stock_products
                 WHERE id = %s
                 """, (product_id,))
@@ -2440,6 +2518,14 @@ def _save_stock_products(updates):
 
                 if not old:
                     continue
+
+                # 🔗 forme d'achat : pas de stock propre ; unité stock figée des deux côtés de la liaison
+                stock_unit = p.get("stock_unit")
+                if old[5] is not None:
+                    stock_quantity = float(old[2] or 0)
+                    min_stock = float(old[3] or 0)
+                if old[5] is not None or old[6]:
+                    stock_unit = old[4]
 
                 cur.execute("""
                 UPDATE stock_products
@@ -2451,7 +2537,7 @@ def _save_stock_products(updates):
                 WHERE id=%s
                 """, (
                     stock_quantity,
-                    p.get("stock_unit"),
+                    stock_unit,
                     float(p.get("conversion_factor") or 1),
                     min_stock,
                     product_id
@@ -2533,7 +2619,8 @@ def stock_inventory():
                    stock_unit, conversion_factor
             FROM stock_products
             WHERE LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
-            """, (supplier_in,))
+            AND stock_parent_id IS NULL
+            """, (supplier_in,))  # 🔗 formes d'achat : comptées sur leur produit parent
             products = cur.fetchall()
 
             if not products:
@@ -3178,6 +3265,59 @@ def _purchases_between(cur, supplier, start, end, name=None):
     out = {}
     for key, d, q, u in cur.fetchall():
         out.setdefault(key, []).append((d, float(q or 0), u))
+    # 🔗 achats des formes liées (carton) : comptés sur le produit parent, en unité stock
+    for _, key, d, q, u in _linked_purchase_rows(cur, supplier=supplier, start=start, end=end, parent_name=name):
+        out.setdefault(key, []).append((d, q, u))
+    return out
+
+
+def _linked_purchase_rows(cur, supplier=None, start=None, end=None, parent_name=None,
+                          parent_ids=None, after_control=False):
+    """
+    Achats des formes d'achat liées, rattachés au produit parent et convertis en unité stock
+    (2 carton de 15 → 30 pce). Seuls les achats APRÈS la date de liaison comptent : les précédents
+    sont déjà dans le stock compté à la liaison. Unité inconnue : gardée telle quelle (signalée « ? »).
+    → [(parent_id, parent_nom_minuscule, date, quantité, unité)]
+    """
+    sql = """
+    SELECT par.id, LOWER(TRIM(par.name)), m.purchase_date, m.quantity, m.purchase_unit,
+           c.purchase_unit, c.stock_unit, c.conversion_factor, par.stock_unit, par.purchase_unit
+    FROM stock_products c
+    JOIN stock_products par ON par.id = c.stock_parent_id
+    JOIN stock_movements m
+      ON LOWER(TRIM(m.product_name)) = LOWER(TRIM(c.name))
+     AND LOWER(TRIM(m.supplier)) = LOWER(TRIM(c.supplier))
+    WHERE m.movement_type IN ('ACHAT', 'RETOUR')
+    AND m.purchase_date > c.stock_link_from
+    """
+    params = []
+    if supplier is not None:
+        sql += " AND LOWER(TRIM(c.supplier)) = LOWER(TRIM(%s))"
+        params.append(supplier)
+    if start is not None:
+        sql += " AND m.purchase_date > %s"
+        params.append(start)
+    if end is not None:
+        sql += " AND m.purchase_date <= %s"
+        params.append(end)
+    if parent_name is not None:
+        sql += " AND LOWER(TRIM(par.name)) = LOWER(TRIM(%s))"
+        params.append(parent_name)
+    if parent_ids is not None:
+        sql += " AND par.id = ANY(%s)"
+        params.append(list(parent_ids))
+    if after_control:
+        sql += " AND par.stock_date IS NOT NULL AND m.purchase_date > par.stock_date"
+    cur.execute(sql, params)
+
+    out = []
+    for pid, key, d, q, u, c_purchase, c_stock, c_conv, p_stock, p_purchase in cur.fetchall():
+        q = float(q or 0)
+        f = _purchase_to_stock_factor(u, c_purchase, c_stock, c_conv)
+        if f is None:
+            out.append((pid, key, d, q, u))
+        else:
+            out.append((pid, key, d, q * f, (p_stock or "").strip() or (p_purchase or "").strip()))
     return out
 
 
@@ -3212,6 +3352,7 @@ def _purchases_since_control(cur, product_ids=None):
      AND LOWER(TRIM(m.supplier)) = LOWER(TRIM(sp.supplier))
     WHERE m.movement_type IN ('ACHAT', 'RETOUR')
     AND sp.stock_date IS NOT NULL
+    AND sp.stock_parent_id IS NULL
     AND m.purchase_date > sp.stock_date
     """
     params = []
@@ -3225,6 +3366,12 @@ def _purchases_since_control(cur, product_ids=None):
     out = {}
     for pid, d, q, u in cur.fetchall():
         out.setdefault(pid, []).append((d, float(q or 0), u))
+
+    # 🔗 achats en carton des formes liées, déjà convertis en unité stock du parent
+    for pid, _, d, q, u in _linked_purchase_rows(cur, parent_ids=product_ids, after_control=True):
+        out.setdefault(pid, []).append((d, q, u))
+    for items in out.values():
+        items.sort(key=lambda x: x[0])
     return out
 
 
@@ -3383,6 +3530,176 @@ def stock_snapshots_product():
         prev = d
     points.reverse()  # plus récent d'abord
     return jsonify({"name": name, "supplier": supplier, "points": points})
+
+
+# =========================
+# 🔗 FORMES D'ACHAT LIÉES
+# TOFOU (CTN) acheté en carton, TOFOU 500G acheté à la pièce, un seul stock physique :
+# la ligne carton reste pour les achats / prix, le stock est compté sur le produit parent.
+# =========================
+
+def _effective_stock_unit(stock_unit, purchase_unit):
+    return ((stock_unit or "").strip() or (purchase_unit or "").strip() or "unité").lower()
+
+
+@app.route("/admin/stock/link", methods=["POST"])
+def stock_link_product():
+    """
+    Body : {child_id, parent_id, counted}   counted = stock réel total, en unité stock.
+    Le comptage du jour sert de point de départ : parent = counted, forme d'achat = 0.
+    """
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.get_json(silent=True) or {}
+    try:
+        child_id = int(data.get("child_id"))
+        parent_id = int(data.get("parent_id"))
+        counted = float(str(data.get("counted")).replace(",", "."))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Produits ou stock réel invalides"}), 400
+
+    if counted < 0:
+        return jsonify({"error": "Quantité négative interdite"}), 400
+    if child_id == parent_id:
+        return jsonify({"error": "Choisissez deux produits différents"}), 400
+
+    today = datetime.now(paris_tz).date()
+    today_fr = today.strftime("%d/%m/%Y")
+
+    conn = get_conn()
+    conn.autocommit = False  # tout est enregistré (base + Google Sheet), ou rien
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT id, name, supplier, purchase_unit, stock_unit, stock_date, stock_parent_id
+            FROM stock_products WHERE id = ANY(%s) ORDER BY id FOR UPDATE
+            """, ([child_id, parent_id],))
+            rows = {r[0]: r for r in cur.fetchall()}
+            child, parent = rows.get(child_id), rows.get(parent_id)
+
+            if not child or not parent:
+                return jsonify({"error": "Produit introuvable"}), 404
+            if child[2].strip().lower() != parent[2].strip().lower():
+                return jsonify({"error": "Les deux produits doivent être chez le même fournisseur"}), 400
+            if child[6] is not None:
+                return jsonify({"error": f"« {child[1]} » est déjà lié"}), 400
+            if parent[6] is not None:
+                return jsonify({"error": f"« {parent[1]} » est lui-même une forme d'achat liée"}), 400
+            if _effective_stock_unit(child[4], child[3]) != _effective_stock_unit(parent[4], parent[3]):
+                return jsonify({"error": "Les deux produits doivent avoir la même unité stock"}), 400
+            if parent[5] and parent[5] > today:
+                return jsonify({"error": f"« {parent[1]} » a un contrôle daté du futur"}), 400
+
+            cur.execute("SELECT 1 FROM stock_products WHERE stock_parent_id = %s LIMIT 1", (child_id,))
+            if cur.fetchone():
+                return jsonify({"error": f"« {child[1]} » a déjà des formes d'achat liées"}), 400
+
+            supplier = parent[2]
+            sheet = spreadsheet.worksheet(supplier)
+            ensure_control_date_column(sheet, cur)
+
+            child_fields = {"Stock Réel": 0, CONTROL_DATE_HEADER: today_fr}
+            parent_fields = {"Stock Réel": counted, CONTROL_DATE_HEADER: today_fr}
+            for row, fields in ((child, child_fields), (parent, parent_fields)):
+                error = _unit_change_sheet_check(supplier, row[1], fields, row[5])
+                if error:
+                    return jsonify({"error": f"« {row[1]} » : {error}"}), 409
+
+            cur.execute("""
+            UPDATE stock_products
+            SET stock_quantity = 0, stock_date = %s, stock_parent_id = %s, stock_link_from = %s, updated_at = NOW()
+            WHERE id = %s
+            """, (today, parent_id, today, child_id))
+
+            cur.execute("""
+            UPDATE stock_products SET stock_quantity = %s, stock_date = %s, updated_at = NOW() WHERE id = %s
+            """, (counted, today, parent_id))
+
+            cur.execute("""
+            INSERT INTO stock_snapshots (snapshot_date, product_name, supplier, stock_quantity, purchase_unit)
+            VALUES (%s,%s,%s,%s,%s)
+            ON CONFLICT (snapshot_date, LOWER(product_name), LOWER(supplier))
+            DO UPDATE SET stock_quantity = EXCLUDED.stock_quantity,
+                          purchase_unit = EXCLUDED.purchase_unit,
+                          created_at = NOW()
+            """, (today, parent[1], supplier, counted, parent[3]))
+
+            # Google Sheet en dernier : si ça échoue, rien n'est gardé en base
+            sheet_errors = _push_stock_to_sheet([
+                (supplier, child[1], child_fields),
+                (supplier, parent[1], parent_fields),
+            ])
+            if sheet_errors:
+                conn.rollback()
+                return jsonify({"error": "Google Sheet non mis à jour : " + " · ".join(sheet_errors)}), 502
+
+        conn.commit()
+        return jsonify({"success": True, "date": today.isoformat()})
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": f"Liaison impossible : {e}"}), 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/admin/stock/unlink", methods=["POST"])
+def stock_unlink_product():
+    """Body : {child_id}. La ligne redevient indépendante, à 0 ; le stock reste sur le parent."""
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.get_json(silent=True) or {}
+    try:
+        child_id = int(data.get("child_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Produit invalide"}), 400
+
+    today = datetime.now(paris_tz).date()
+
+    conn = get_conn()
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT name, supplier, stock_date, stock_parent_id
+            FROM stock_products WHERE id = %s FOR UPDATE
+            """, (child_id,))
+            child = cur.fetchone()
+            if not child:
+                return jsonify({"error": "Produit introuvable"}), 404
+            if child[3] is None:
+                return jsonify({"error": f"« {child[0]} » n'est pas lié"}), 400
+
+            fields = {"Stock Réel": 0, CONTROL_DATE_HEADER: today.strftime("%d/%m/%Y")}
+            error = _unit_change_sheet_check(child[1], child[0], fields, child[2])
+            if error:
+                return jsonify({"error": error}), 409
+
+            # date du jour : les achats précédents ne reviennent pas dans son stock théorique
+            cur.execute("""
+            UPDATE stock_products
+            SET stock_parent_id = NULL, stock_link_from = NULL, stock_quantity = 0,
+                stock_date = %s, updated_at = NOW()
+            WHERE id = %s
+            """, (today, child_id))
+
+            sheet_errors = _push_stock_to_sheet([(child[1], child[0], fields)])
+            if sheet_errors:
+                conn.rollback()
+                return jsonify({"error": "Google Sheet non mis à jour : " + " · ".join(sheet_errors)}), 502
+
+        conn.commit()
+        return jsonify({"success": True})
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": f"Suppression de la liaison impossible : {e}"}), 500
+
+    finally:
+        conn.close()
 
 
 @app.route("/admin/stock/update", methods=["POST"])
@@ -3736,6 +4053,13 @@ def stock_change_unit():
             if not row:
                 return jsonify({"error": "Produit introuvable"}), 404
 
+            cur.execute("""
+            SELECT 1 FROM stock_products
+            WHERE (id = %s AND stock_parent_id IS NOT NULL) OR stock_parent_id = %s LIMIT 1
+            """, (product_id, product_id))
+            if cur.fetchone():
+                return jsonify({"error": "Produit lié (🔗) : retirez d'abord la liaison pour changer son unité"}), 400
+
             name, supplier, stock, min_stock, purchase_unit, stock_unit, conv, stock_date = row
             stock = float(stock or 0)
             min_stock = float(min_stock or 0)
@@ -4080,6 +4404,7 @@ def stock_dashboard():
             SELECT COUNT(*)
             FROM stock_products
             WHERE stock_quantity <= min_stock
+            AND stock_parent_id IS NULL
             """)
 
             low_stock = cur.fetchone()[0]
@@ -4735,7 +5060,8 @@ def _remaining_by_lot(lots, stock_quantity, stock_date, stock_unit, conversion_f
     counted = []
 
     for lot in lots:
-        factor = _lot_conversion_factor(lot["purchase_unit"], stock_unit, conversion_factor)
+        # lot d'une forme liée (carton) : facteur de sa propre ligne
+        factor = lot.get("factor") or _lot_conversion_factor(lot["purchase_unit"], stock_unit, conversion_factor)
         qty_stock_unit = float(lot["purchase_quantity"] or 0) * factor
 
         if stock_date is None or (lot["purchase_date"] and lot["purchase_date"] > stock_date):
@@ -4783,9 +5109,25 @@ def _active_lots(cur, limit_date=None):
 
     candidates = cur.fetchall()
 
+    # 🔗 formes liées : leurs lots partagent le stock du parent (FIFO sur l'ensemble)
+    cur.execute("""
+    SELECT LOWER(TRIM(c.name)), LOWER(TRIM(c.supplier)), LOWER(TRIM(par.name)), c.stock_unit, c.conversion_factor
+    FROM stock_products c
+    JOIN stock_products par ON par.id = c.stock_parent_id
+    """)
+    links = {(r[0], r[1]): r for r in cur.fetchall()}
+    members = {}
+    for child_key, supplier_key, parent_key, _, _ in links.values():
+        members.setdefault((parent_key, supplier_key), []).append(child_key)
+
+    roots = sorted({
+        (links[(n, s)][2], s) if (n, s) in links else (n, s)
+        for n, s in candidates
+    })
+
     result = []
 
-    for name_key, supplier_key in candidates:
+    for name_key, supplier_key in roots:
 
         cur.execute("""
         SELECT stock_quantity,
@@ -4811,12 +5153,14 @@ def _active_lots(cur, limit_date=None):
         FROM stock_movements
         WHERE movement_type = 'ACHAT'
         AND COALESCE(lot_status, 'ACTIF') = 'ACTIF'
-        AND LOWER(TRIM(product_name)) = %s
+        AND LOWER(TRIM(product_name)) = ANY(%s)
         AND LOWER(TRIM(supplier)) = %s
-        """, (name_key, supplier_key))
+        """, ([name_key, *members.get((name_key, supplier_key), [])], supplier_key))
 
-        lots = [
-            {
+        lots = []
+        for r in cur.fetchall():
+            link = links.get((r[1].strip().lower(), supplier_key))
+            lots.append({
                 "id": r[0],
                 "product_name": r[1],
                 "supplier": r[2],
@@ -4825,9 +5169,8 @@ def _active_lots(cur, limit_date=None):
                 "purchase_unit": r[5],
                 "expiry_date": r[6],
                 "unit_price": r[7],
-            }
-            for r in cur.fetchall()
-        ]
+                "factor": _lot_conversion_factor(r[5], link[3], link[4]) if link else None,
+            })
 
         if product:
             remaining = _remaining_by_lot(
