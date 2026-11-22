@@ -235,8 +235,12 @@ def public_products():
             "featured": row[7]
         })
 
+    source = _menu_source()
+    hidden = menu_sync.hidden_ids(source, result)
+    result = [p for p in result if p["id"] not in hidden]
+
     # plat à choix obligatoire (Duo/King, parfums) : à commander depuis « Notre carte »
-    rules = menu_sync.choice_rules(_menu_source(), result)
+    rules = menu_sync.choice_rules(source, result)
     for product in result:
         product["needs_choice"] = product["id"] in rules
 
@@ -1039,7 +1043,9 @@ def create_checkout_session():
     # 🔥 CALCUL TOTAL
     # =========================
     total_eur = 0
-    choice_rules = menu_sync.choice_rules(_menu_source(), list(products.values()))
+    menu_source = _menu_source()
+    choice_rules = menu_sync.choice_rules(menu_source, list(products.values()))
+    hidden_products = menu_sync.hidden_ids(menu_source, list(products.values()))
 
     for item in items:
         # quantité négative = total réduit : la commande entière est refusée
@@ -1055,6 +1061,12 @@ def create_checkout_session():
         product = products.get(str(product_id))
         if not product:
             continue
+
+        # ancien panier (localStorage) : refusé avant le paiement, jamais retiré en silence
+        if product_id in hidden_products:
+            return jsonify({
+                "error": f"« {product['name']} » n'est plus disponible. Retirez-le du panier et choisissez la version 4 pièces."
+            }), 400
 
         # choix obligatoires (viandes Duo/King…) vérifiés avant le paiement
         try:

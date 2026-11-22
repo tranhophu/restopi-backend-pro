@@ -1,5 +1,5 @@
 {
-  "_aide": "Menu de référence = Menu_Au_Ptit_Vietnam_A4.pdf. variante : id = plat existant ; product = nouveau plat. choose = choix obligatoire du client (imprimé sur le ticket cuisine). print:false = vendu en ligne mais absent du menu papier.",
+  "_aide": "Menu de référence = Menu_Au_Ptit_Vietnam_A4.pdf. variante : id = plat existant ; product = nouveau plat. choose = choix obligatoire du client (imprimé sur le ticket cuisine). print:false = vendu en ligne mais absent du menu papier. hidden:true (plat) = plus proposé ni commandable, mais gardé pour les commandes déjà payées ; retirer ce champ pour le remettre en vente.",
   "aliases": { "49": 12, "50": 4, "51": 8, "52": 33, "53": 25 },
   "retired": [40],
   "midi": {
@@ -17,7 +17,7 @@
       "dishes": [
         { "name": "Planche Apéro Viet", "desc": "À partager à 2 : 1 rouleau de printemps, 4 nems porc, 2 nems poulet, 2 nems crevettes, 2 samoussas, 4 tempuras. Échange possible : nems et samoussas au choix", "img": "planche_apero_viet.png",
           "variants": [{ "product": "Planche Apéro Viet", "price": 19.9 }] },
-        { "name": "Nems au choix – 3 pièces", "desc": "Porc (sans gluten), poulet, crevettes ou végé", "img": "nem.png",
+        { "name": "Nems au choix – 3 pièces", "hidden": true, "desc": "Porc (sans gluten), poulet, crevettes ou végé", "img": "nem.png",
           "variants": [
             { "label": "Porc", "id": 5, "price": 4.9 }, { "label": "Poulet", "id": 6, "price": 4.9 },
             { "label": "Crevettes", "id": 7, "price": 4.9 }, { "label": "Végé", "id": 8, "price": 4.9 }
@@ -27,7 +27,7 @@
             { "label": "Porc", "product": "Nems au porc – 4 pièces", "price": 5.9 }, { "label": "Poulet", "product": "Nems au poulet – 4 pièces", "price": 5.9 },
             { "label": "Crevettes", "product": "Nems aux crevettes – 4 pièces", "price": 5.9 }, { "label": "Végé", "product": "Nems végé – 4 pièces", "price": 5.9 }
           ] },
-        { "name": "Samoussa au choix – 3 pièces", "desc": "Bœuf ou végé", "img": "samoussa.png",
+        { "name": "Samoussa au choix – 3 pièces", "hidden": true, "desc": "Bœuf ou végé", "img": "samoussa.png",
           "variants": [{ "label": "Bœuf", "id": 14, "price": 5.9 }, { "label": "Végé", "product": "Samoussa végé – 3 pièces", "price": 5.9 }] },
         { "name": "Samoussa au choix – 4 pièces", "desc": "Bœuf ou végé", "img": "samoussa.png",
           "variants": [{ "label": "Bœuf", "product": "Samoussa au bœuf – 4 pièces", "price": 7.5 }, { "label": "Végé", "product": "Samoussa végé – 4 pièces", "price": 7.5 }] },
@@ -39,7 +39,7 @@
     {
       "key": "entree", "title": "Vapeur", "column": 1, "tva": 10,
       "dishes": [
-        { "name": "Bouchée vapeur au choix – 3 pièces", "desc": "Porc, poulet, crevette · porc et crevette +1,00 €", "img": "menu_bouchee_vapeur.jpg",
+        { "name": "Bouchée vapeur au choix – 3 pièces", "hidden": true, "desc": "Porc, poulet, crevette · porc et crevette +1,00 €", "img": "menu_bouchee_vapeur.jpg",
           "variants": [
             { "label": "Porc", "id": 1, "price": 4.9 }, { "label": "Poulet", "id": 2, "price": 4.9 },
             { "label": "Crevette", "product": "Bouchée vapeur crevette – 3 pièces", "price": 4.9 },
@@ -51,7 +51,7 @@
             { "label": "Crevette", "product": "Bouchée vapeur crevette – 4 pièces", "price": 5.9 },
             { "label": "Porc et crevette (+1€)", "product": "Bouchée vapeur porc et crevette – 4 pièces", "price": 6.9, "img": "bouchee_au_porc_crevette.png" }
           ] },
-        { "name": "Raviolis au choix – 3 pièces", "desc": "Crevette ou végé", "img": "raviolis_aux_crevettes.png",
+        { "name": "Raviolis au choix – 3 pièces", "hidden": true, "desc": "Crevette ou végé", "img": "raviolis_aux_crevettes.png",
           "variants": [{ "label": "Crevette", "id": 9, "price": 4.9 }, { "label": "Végé", "id": 55, "price": 4.9 }] },
         { "name": "Raviolis au choix – 4 pièces", "desc": "Crevette ou végé", "img": "raviolis_aux_crevettes.png",
           "variants": [{ "label": "Crevette", "product": "Raviolis aux crevettes – 4 pièces", "price": 5.9 }, { "label": "Végé", "product": "Raviolis végé – 4 pièces", "price": 5.9 }] },

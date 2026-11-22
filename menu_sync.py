@@ -64,16 +64,38 @@ def image_fits(image, name, label=""):
     return all(word in wanted for word in PROTEINS if word in slug(image))
 
 
+def hidden_ids(source, products):
+    """Ids des plats « hidden » et de leurs doublons (aliases) : plus proposés ni commandables."""
+    by_name = {p["name"].strip().lower(): p["id"] for p in products}
+    ids = set()
+    for section in source["sections"]:
+        for dish in section["dishes"]:
+            if not dish.get("hidden"):
+                continue
+            for v in dish["variants"]:
+                pid = v.get("id") or by_name.get(v["product"].strip().lower())
+                if pid:
+                    ids.add(pid)
+    ids |= {int(alias) for alias, target in source.get("aliases", {}).items() if target in ids}
+    return ids
+
+
 def build_public_menu(source, products):
     """Menu du site : prix et disponibilité viennent de la base, l'organisation de menu_source.json."""
     by_id = {p["id"]: p for p in products}
     by_name = {p["name"].strip().lower(): p for p in products}
-    used = {int(a) for a in source.get("aliases", {})} | set(source.get("retired", []))
+    used = (
+        {int(a) for a in source.get("aliases", {})}
+        | set(source.get("retired", []))
+        | hidden_ids(source, products)
+    )
     sections = []
 
     for section in source["sections"]:
         dishes = []
         for dish in section["dishes"]:
+            if dish.get("hidden"):
+                continue
             variants = []
             for v in dish["variants"]:
                 p = by_id.get(v["id"]) if v.get("id") else by_name.get(v["product"].strip().lower())
@@ -156,6 +178,9 @@ def expected_products(source, files):
     out = []
     for section in source["sections"]:
         for dish in section["dishes"]:
+            # plat masqué : absent de /products, ne doit être ni signalé ni recréé
+            if dish.get("hidden"):
+                continue
             for v in dish["variants"]:
                 name = v.get("product") or dish["name"]
                 out.append({
