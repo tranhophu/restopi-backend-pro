@@ -150,8 +150,10 @@
       "dishes": [
         { "name": "1 nem", "desc": "Porc, crevettes, poulet ou végétarien", "img": "menu_supplement_nem.jpg",
           "variants": [{ "product": "Supplément 1 nem", "price": 1.9, "choose": { "label": "Nem", "count": 1, "from": ["Porc", "Crevettes", "Poulet", "Végétarien"] } }] },
-        { "name": "3 nems", "desc": "Porc, crevettes, poulet ou végétarien", "img": "menu_supplement_nem.jpg",
+        { "name": "3 nems", "hidden": true, "desc": "Porc, crevettes, poulet ou végétarien", "img": "menu_supplement_nem.jpg",
           "variants": [{ "product": "Supplément 3 nems", "price": 4.9, "choose": { "label": "Nems", "count": 1, "from": ["Porc", "Crevettes", "Poulet", "Végétarien"] } }] },
+        { "name": "4 nems pour Bo bun", "desc": "Porc, crevettes, poulet ou végétarien", "img": "menu_supplement_nem.jpg",
+          "variants": [{ "product": "Supplément 4 nems pour Bo bun", "price": 5.9, "choose": { "label": "Nems", "count": 1, "from": ["Porc", "Crevettes", "Poulet", "Végétarien"] } }] },
         { "name": "1 œuf", "desc": "", "img": "", "variants": [{ "product": "Supplément 1 œuf", "price": 1.9 }] },
         { "name": "Riz blanc", "desc": "", "img": "menu_supplement_riz.jpg", "variants": [{ "product": "Supplément riz blanc", "price": 4.0 }] },
         { "name": "Portion de sauce", "desc": "", "img": "menu_supplement_sauce.jpg", "variants": [{ "product": "Supplément portion de sauce", "price": 0.9 }] },
