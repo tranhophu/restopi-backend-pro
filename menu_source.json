@@ -1,5 +1,5 @@
 {
-  "_aide": "Menu de référence = Menu_Au_Ptit_Vietnam_A4.pdf. variante : id = plat existant ; product = nouveau plat. choose = choix obligatoire du client (imprimé sur le ticket cuisine). print:false = vendu en ligne mais absent du menu papier. hidden:true (plat) = plus proposé ni commandable, mais gardé pour les commandes déjà payées ; retirer ce champ pour le remettre en vente.",
+  "_aide": "Menu de référence = Menu_Au_Ptit_Vietnam_A4.pdf. variante : id = plat existant ; product = nouveau plat. choose = choix obligatoire du client (imprimé sur le ticket cuisine). print:false = vendu en ligne mais absent du menu papier. hidden:true (plat) = plus proposé ni commandable, mais gardé pour les commandes déjà payées ; retirer ce champ pour le remettre en vente. print_note (section) = ligne commune sur les menus papier ; print_desc (plat) = description courte sur les menus papier, desc reste sur Notre carte.",
   "aliases": { "49": 12, "50": 4, "51": 8, "52": 33, "53": 25 },
   "retired": [40],
   "midi": {
@@ -163,13 +163,14 @@
     },
     {
       "key": "dessert", "title": "Desserts", "column": 3, "tva": 10,
+      "print_note": "Mochi au choix : mangue-passion, matcha ou chocolat-coco",
       "dishes": [
         { "name": "Perle de coco", "desc": "Farine de riz, haricot mungo, noix de coco", "img": "perle_de_coco.png", "variants": [{ "id": 37, "price": 4.9 }] },
         { "name": "Glace au riz gluant – Kem xôi", "desc": "Glace coco, riz gluant au pandan, cacahuètes grillées", "img": "glace_au_riz_gluant.png", "variants": [{ "id": 36, "price": 4.9 }] },
         { "name": "Glace 2 boules", "desc": "Vanille, coco ou mixte", "img": "menu_glace_2_boules.jpg",
           "variants": [{ "id": 35, "price": 4.9, "choose": { "label": "Parfum", "count": 1, "from": ["Vanille", "Coco", "Mixte"] } }] },
         { "name": "Gâteau banane", "desc": "Gâteau maison, glace de coco et sauce chocolat", "img": "gateau_banane.png", "variants": [{ "id": 34, "price": 5.9 }] },
-        { "name": "Mochi glacé au choix", "desc": "2 pcs 4,90 € · 3 pcs 5,90 € : mangue-passion, matcha, chocolat à la noix de coco", "img": "menu_mochi_glace.jpg",
+        { "name": "Mochi glacé au choix", "desc": "2 pcs 4,90 € · 3 pcs 5,90 € : mangue-passion, matcha, chocolat à la noix de coco", "print_desc": "2 pcs 4,90 € · 3 pcs 5,90 €", "img": "menu_mochi_glace.jpg",
           "variants": [
             { "label": "2 pièces", "product": "Mochi glacé – 2 pièces", "price": 4.9, "choose": { "label": "Mochi", "count": 2, "from": ["Mangue-passion", "Matcha", "Chocolat noix de coco"] } },
             { "label": "3 pièces", "product": "Mochi glacé – 3 pièces", "price": 5.9, "choose": { "label": "Mochi", "count": 3, "from": ["Mangue-passion", "Matcha", "Chocolat noix de coco"] } }

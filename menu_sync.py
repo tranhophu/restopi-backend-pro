@@ -118,6 +118,7 @@ def build_public_menu(source, products):
                 dishes.append({
                     "name": dish["name"],
                     "desc": dish.get("desc", ""),
+                    "print_desc": dish.get("print_desc", ""),
                     "img": f"images/{dish['img']}" if dish.get("img") else "",
                     "price": min(printable),
                     "price_from": len(set(printable)) > 1,
@@ -128,6 +129,7 @@ def build_public_menu(source, products):
             sections.append({
                 "key": section["key"], "title": section["title"],
                 "column": section["column"], "dishes": dishes,
+                "print_note": section.get("print_note", ""),
             })
 
     others = [p for p in products if p["id"] not in used]
