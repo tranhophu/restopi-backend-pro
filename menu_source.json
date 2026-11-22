@@ -77,7 +77,7 @@
     {
       "key": "plat", "title": "Bo Bun", "column": 2, "tva": 10,
       "dishes": [
-        { "name": "Bo Bun au choix", "desc": "Bœuf, porc grillé, poulet, végé · canard laqué ou crevettes 14,90 € · saumon grillé 15,90 €", "img": "bo_bun.png",
+        { "name": "Bo Bun au choix", "desc": "Bœuf, porc grillé, poulet, végétarien · canard laqué ou crevettes 14,90 € · saumon grillé 15,90 €", "img": "bo_bun.png",
           "variants": [
             { "label": "Classique (bœuf)", "id": 16, "price": 13.9 }, { "label": "Porc grillé", "id": 20, "price": 13.9, "img": "bo_bun_porc_grille.png" },
             { "label": "Poulet", "id": 17, "price": 13.9 }, { "label": "Canard laqué", "id": 63, "price": 14.9 },
@@ -95,13 +95,13 @@
     {
       "key": "plat", "title": "Nouilles & Pad Thaï", "column": 2, "tva": 10,
       "dishes": [
-        { "name": "Nouilles sautées au choix", "desc": "Poulet, bœuf, porc laqué, végé · canard laqué ou crevettes 14,90 € · saumon grillé 15,90 €", "img": "nouille_saute.png",
+        { "name": "Nouilles sautées au choix", "desc": "Poulet, bœuf, porc laqué, végétarien · canard laqué ou crevettes 14,90 € · saumon grillé 15,90 €", "img": "nouille_saute.png",
           "variants": [
             { "label": "Poulet", "id": 23, "price": 13.9 }, { "label": "Bœuf", "id": 21, "price": 13.9 }, { "label": "Porc laqué", "id": 22, "price": 13.9 },
             { "label": "Canard laqué", "product": "Nouilles au canard laqué", "price": 14.9, "img": "nouille_canard_laque.png" },
             { "label": "Crevettes", "id": 24, "price": 14.9 },
             { "label": "Saumon grillé", "product": "Nouilles au saumon grillé", "price": 15.9 },
-            { "label": "Végé", "id": 25, "price": 13.9, "img": "nouille_saute.png" }
+            { "label": "Végétarien", "id": 25, "price": 13.9, "img": "nouille_saute.png" }
           ] },
         { "name": "Nouilles sautées Duo", "desc": "2 viandes au choix", "img": "nouille_saute.png",
           "variants": [{ "product": "Nouilles sautées Duo", "price": 16.9,
@@ -128,10 +128,10 @@
       "key": "plat", "title": "Riz vietnamien", "column": 2, "tva": 10,
       "dishes": [
         { "name": "Riz au trésor", "desc": "Riz brisé, porc grillé à la citronnelle, œuf, pickles et sauce nuoc mam", "img": "riz_tresor.png", "variants": [{ "id": 31, "price": 14.9 }] },
-        { "name": "Riz au choix", "desc": "Porc laqué, poulet, végé · bœuf 14,90 € · canard laqué ou saumon grillé 15,90 €", "img": "riz_au_porc_laque.png",
+        { "name": "Riz au choix", "desc": "Porc laqué, poulet, végétarien · bœuf 14,90 € · canard laqué ou saumon grillé 15,90 €", "img": "riz_au_porc_laque.png",
           "variants": [
             { "label": "Porc laqué", "id": 32, "price": 13.9 }, { "label": "Poulet", "product": "Riz au poulet", "price": 13.9, "img": "riz_au_poulet.png" },
-            { "label": "Végé", "id": 33, "price": 13.9, "img": "riz_vege.png" }, { "label": "Bœuf", "product": "Riz au bœuf", "price": 14.9, "img": "riz_au_boeuf.png" },
+            { "label": "Végétarien", "id": 33, "price": 13.9, "img": "riz_vege.png" }, { "label": "Bœuf", "product": "Riz au bœuf", "price": 14.9, "img": "riz_au_boeuf.png" },
             { "label": "Canard laqué", "id": 65, "price": 15.9, "img": "riz_au_canard.png" }, { "label": "Saumon grillé", "id": 67, "price": 15.9, "img": "riz_au_saumon.png" }
           ] },
         { "name": "Riz sauté aux crevettes", "desc": "Crevettes, œuf, petits légumes, oignons frits et sauce maison", "img": "riz_saute_au_crevette.png", "variants": [{ "product": "Riz sauté aux crevettes", "price": 16.9 }] }
@@ -142,7 +142,7 @@
       "dishes": [
         { "name": "Soupe Phở", "desc": "Pâtes de riz, lamelles de bœuf, oignons, coriandre et pousses de soja", "img": "soupe_pho.png", "variants": [{ "id": 30, "price": 14.9 }] },
         { "name": "Soupe Raviolis", "desc": "Raviolis au porc et crevettes, bouillon clair, légumes et oignons frits", "img": "menu_soupe_raviolis.jpg", "variants": [{ "product": "Soupe Raviolis", "price": 15.9 }] },
-        { "name": "Crêpe vietnamienne – Bánh xèo", "desc": "Porc, crevettes, pousses de soja, oignons, salade, herbes fraîches, sauce nước chấm", "img": "crepe_vietnamienne.png", "variants": [{ "id": 15, "price": 15.9 }] }
+        { "name": "Crêpe vietnamienne – Bánh xèo", "desc": "Porc, crevettes, pousses de soja, oignons, salade, sauce nuoc mam", "img": "crepe_vietnamienne.png", "variants": [{ "id": 15, "price": 15.9 }] }
       ]
     },
     {
@@ -152,7 +152,7 @@
           "variants": [{ "product": "Supplément 1 nem", "price": 1.9, "choose": { "label": "Nem", "count": 1, "from": ["Porc", "Crevettes", "Poulet", "Végétarien"] } }] },
         { "name": "3 nems", "hidden": true, "desc": "Porc, crevettes, poulet ou végétarien", "img": "menu_supplement_nem.jpg",
           "variants": [{ "product": "Supplément 3 nems", "price": 4.9, "choose": { "label": "Nems", "count": 1, "from": ["Porc", "Crevettes", "Poulet", "Végétarien"] } }] },
-        { "name": "4 nems pour Bo bun", "desc": "Porc, crevettes, poulet ou végétarien", "img": "menu_supplement_nem.jpg",
+        { "name": "4 nems pour Bo bun", "hidden": true, "desc": "Porc, crevettes, poulet ou végétarien", "img": "menu_supplement_nem.jpg",
           "variants": [{ "product": "Supplément 4 nems pour Bo bun", "price": 5.9, "choose": { "label": "Nems", "count": 1, "from": ["Porc", "Crevettes", "Poulet", "Végétarien"] } }] },
         { "name": "1 œuf", "desc": "", "img": "", "variants": [{ "product": "Supplément 1 œuf", "price": 1.9 }] },
         { "name": "Riz blanc", "desc": "", "img": "menu_supplement_riz.jpg", "variants": [{ "product": "Supplément riz blanc", "price": 4.0 }] },
@@ -169,7 +169,7 @@
         { "name": "Glace 2 boules", "desc": "Vanille, coco ou mixte", "img": "menu_glace_2_boules.jpg",
           "variants": [{ "id": 35, "price": 4.9, "choose": { "label": "Parfum", "count": 1, "from": ["Vanille", "Coco", "Mixte"] } }] },
         { "name": "Gâteau banane", "desc": "Gâteau maison, glace de coco et sauce chocolat", "img": "gateau_banane.png", "variants": [{ "id": 34, "price": 5.9 }] },
-        { "name": "Mochi glacé", "desc": "2 pcs 4,90 € · 3 pcs 5,90 € : mangue-passion, matcha, chocolat à la noix de coco", "img": "menu_mochi_glace.jpg",
+        { "name": "Mochi glacé au choix", "desc": "2 pcs 4,90 € · 3 pcs 5,90 € : mangue-passion, matcha, chocolat à la noix de coco", "img": "menu_mochi_glace.jpg",
           "variants": [
             { "label": "2 pièces", "product": "Mochi glacé – 2 pièces", "price": 4.9, "choose": { "label": "Mochi", "count": 2, "from": ["Mangue-passion", "Matcha", "Chocolat noix de coco"] } },
             { "label": "3 pièces", "product": "Mochi glacé – 3 pièces", "price": 5.9, "choose": { "label": "Mochi", "count": 3, "from": ["Mangue-passion", "Matcha", "Chocolat noix de coco"] } }
@@ -211,10 +211,10 @@
           ] },
         { "name": "Mojitos sans alcool", "desc": "Pêche, litchi, fraise, mangue", "img": "",
           "variants": [
-            { "label": "Pêche", "product": "Mojito pêche (sans alcool)", "price": 6.5, "img": "menu_mojito_peche.jpg" },
-            { "label": "Litchi", "product": "Mojito litchi (sans alcool)", "price": 6.5, "img": "menu_mojito_litchi.jpg" },
-            { "label": "Fraise", "product": "Mojito fraise (sans alcool)", "price": 6.5, "img": "menu_mojito_fraise.jpg" },
-            { "label": "Mangue", "product": "Mojito mangue (sans alcool)", "price": 6.5, "img": "menu_mojito_mangue.jpg" }
+            { "label": "Pêche", "product": "Mojito pêche (sans alcool)", "price": 6.9, "img": "menu_mojito_peche.jpg" },
+            { "label": "Litchi", "product": "Mojito litchi (sans alcool)", "price": 6.9, "img": "menu_mojito_litchi.jpg" },
+            { "label": "Fraise", "product": "Mojito fraise (sans alcool)", "price": 6.9, "img": "menu_mojito_fraise.jpg" },
+            { "label": "Mangue", "product": "Mojito mangue (sans alcool)", "price": 6.9, "img": "menu_mojito_mangue.jpg" }
           ] },
         { "name": "Café vietnamien", "desc": "Classique · tiramisu ou au sel 7,50 €", "img": "",
           "variants": [

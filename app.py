@@ -1065,7 +1065,7 @@ def create_checkout_session():
         # ancien panier (localStorage) : refusé avant le paiement, jamais retiré en silence
         if product_id in hidden_products:
             return jsonify({
-                "error": f"« {product['name']} » n'est plus disponible. Retirez-le du panier et choisissez la version 4 pièces."
+                "error": f"« {product['name']} » n'est plus disponible. Retirez-le du panier pour continuer."
             }), 400
 
         # choix obligatoires (viandes Duo/King…) vérifiés avant le paiement
