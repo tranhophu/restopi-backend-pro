@@ -3633,154 +3633,192 @@ def _set_control_movement(cur, name, supplier, control_date, at, unit, qty=None,
               at or datetime.combine(control_date, datetime.min.time())))
 
 
+class _ControlCorrectionError(Exception):
+    def __init__(self, message, status):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+
+def _apply_control_correction(cur, product_id, control_date, counted):
+    """
+    Corrige un contrôle dans la transaction en cours :
+    - contrôle : snapshot, ligne d'inventaire et écart de ce contrôle
+    - contrôle suivant : théorique et écart recalculés à partir de la nouvelle valeur
+    - stock actuel : seulement si c'est le dernier contrôle du produit
+    """
+    new_stock = None
+    cur.execute("""
+    SELECT name, supplier, purchase_unit, stock_date, stock_parent_id
+    FROM stock_products WHERE id = %s FOR UPDATE
+    """, (product_id,))
+    prod = cur.fetchone()
+    if not prod:
+        raise _ControlCorrectionError("Produit introuvable", 404)
+    name, supplier, purchase_unit, stock_date, parent_id = prod
+    if parent_id is not None:
+        raise _ControlCorrectionError("Produit lié (🔗) : corrigez le contrôle sur son produit parent", 400)
+
+    who = (name, supplier)
+    match = "LOWER(TRIM(product_name)) = LOWER(TRIM(%s)) AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))"
+    cur.execute(f"""
+    SELECT id, snapshot_date, stock_quantity FROM stock_snapshots
+    WHERE {match} ORDER BY snapshot_date FOR UPDATE
+    """, who)
+    snaps = cur.fetchall()
+    idx = next((i for i, s in enumerate(snaps) if s[1] == control_date), None)
+    if idx is None:
+        raise _ControlCorrectionError("Contrôle introuvable pour ce produit", 404)
+
+    snap_id, _, old_qty = snaps[idx]
+    old_qty = float(old_qty or 0)
+    if abs(counted - old_qty) < 1e-9:
+        return {"unchanged": True, "name": name, "supplier": supplier, "new_stock": None}
+    prev_snap = snaps[idx - 1] if idx > 0 else None
+    next_snap = snaps[idx + 1] if idx + 1 < len(snaps) else None
+    dates = [control_date] + ([next_snap[1]] if next_snap else [])
+
+    # copie avant correction
+    before = {}
+    cur.execute("SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM stock_snapshots t "
+                f"WHERE snapshot_date = ANY(%s) AND {match}", (dates, *who))
+    before["snapshots"] = cur.fetchone()[0]
+    cur.execute("SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM stock_inventory_lines t "
+                f"WHERE inventory_date = ANY(%s) AND {match}", (dates, *who))
+    before["inventory_lines"] = cur.fetchone()[0]
+    cur.execute("SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM stock_movements t "
+                "WHERE movement_type IN ('CONSUMPTION', 'INVENTORY_ADJUSTMENT') "
+                f"AND purchase_date = ANY(%s) AND {match}", (dates, *who))
+    before["movements"] = cur.fetchone()[0]
+    cur.execute("SELECT to_jsonb(t) FROM stock_products t WHERE id = %s", (product_id,))
+    before["product"] = cur.fetchone()[0]
+
+    def control_lines(day):
+        cur.execute(f"""
+        SELECT id, created_at, theoretical, counted, prev_control_date, purchases_since
+        FROM stock_inventory_lines
+        WHERE inventory_date = %s AND (product_id = %s OR ({match}))
+        ORDER BY created_at
+        FOR UPDATE
+        """, (day, product_id, *who))
+        return cur.fetchall()
+
+    # 1) ce contrôle
+    cur.execute("UPDATE stock_snapshots SET stock_quantity = %s, created_at = NOW() WHERE id = %s",
+                (counted, snap_id))
+
+    lines = control_lines(control_date)
+    cur.execute(f"""
+    SELECT MAX(created_at) FROM stock_movements
+    WHERE note = %s AND purchase_date = %s AND {match}
+    """, (SHEET_CONTROL_NOTE, control_date, *who))
+    sheet_at = cur.fetchone()[0]
+
+    if lines and (sheet_at is None or sheet_at <= lines[-1][1]):
+        line_id, at, theoretical, *_ = lines[-1]
+        cur.execute("""
+        UPDATE stock_inventory_lines
+        SET counted = %s, counted_original = COALESCE(counted_original, counted), corrected_at = NOW()
+        WHERE id = %s
+        """, (counted, line_id))
+        _set_control_movement(cur, name, supplier, control_date, at, purchase_unit,
+                              qty=counted - float(theoretical or 0))
+    elif prev_snap:
+        _set_control_movement(cur, name, supplier, control_date, None, purchase_unit,
+                              qty=counted - float(prev_snap[2] or 0))
+    else:
+        _set_control_movement(cur, name, supplier, control_date, None, purchase_unit,
+                              add=counted - old_qty)
+
+    # 2) contrôle suivant : son point de départ a changé
+    if next_snap:
+        next_lines = control_lines(next_snap[1])
+        if next_lines:
+            line_id, at, _, next_counted, prev_control, bought = next_lines[0]
+            if prev_control is None or prev_control == control_date:
+                theoretical = round(counted + float(bought or 0), 6)
+                cur.execute("""
+                UPDATE stock_inventory_lines
+                SET theoretical = %s,
+                    prev_stock = CASE WHEN prev_stock IS NULL THEN NULL ELSE %s END
+                WHERE id = %s
+                """, (theoretical, counted, line_id))
+                _set_control_movement(cur, name, supplier, next_snap[1], at, purchase_unit,
+                                      qty=float(next_counted or 0) - theoretical)
+        else:
+            _set_control_movement(cur, name, supplier, next_snap[1], None, purchase_unit,
+                                  qty=float(next_snap[2] or 0) - counted)
+
+    # 3) stock actuel : seulement pour le dernier contrôle
+    elif stock_date is None or stock_date <= control_date:
+        new_stock = counted
+        cur.execute("UPDATE stock_products SET stock_quantity = %s, updated_at = NOW() WHERE id = %s",
+                    (counted, product_id))
+
+    cur.execute("""
+    INSERT INTO stock_control_corrections
+    (product_id, product_name, supplier, control_date, old_quantity, new_quantity, before_data)
+    VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb)
+    """, (product_id, name, supplier, control_date, old_qty, counted,
+          json.dumps(before, ensure_ascii=False, default=str)))
+
+    return {
+        "unchanged": False, "name": name, "supplier": supplier, "new_stock": new_stock,
+        "date": control_date.isoformat(), "old_quantity": old_qty, "counted": counted,
+    }
+
+
 @app.route("/admin/stock/snapshots/correct", methods=["POST"])
 def stock_snapshot_correct():
     """
-    Corrige le stock compté d'un contrôle passé, même recompté depuis ou venu de Google Sheet.
-    Body : {product_id, date: "YYYY-MM-DD", counted (unité stock)}
-    - contrôle : snapshot, ligne d'inventaire et écart de ce contrôle
-    - contrôle suivant : théorique et écart recalculés à partir de la nouvelle valeur
-    - stock actuel + Google Sheet : seulement si c'est le dernier contrôle du produit
+    Corrige le stock compté d'un ou plusieurs contrôles passés, même recomptés depuis ou venus de Google Sheet.
+    Body : {product_id, corrections: [{date: "YYYY-MM-DD", counted (unité stock)}]}
+    (ou {product_id, date, counted} pour un seul jour). Tout est enregistré, ou rien.
     """
     if not check_admin(request):
         return jsonify({"error": "unauthorized"}), 403
 
     data = request.get_json(silent=True) or {}
+    items = data.get("corrections")
+    if items is None:
+        items = [{"date": data.get("date"), "counted": data.get("counted")}]
+    if not isinstance(items, list) or not items or len(items) > 200:
+        return jsonify({"error": "Liste de corrections invalide"}), 400
+
+    corrections = {}
     try:
         product_id = int(data.get("product_id"))
-        control_date = datetime.strptime(data.get("date") or "", "%Y-%m-%d").date()
-        counted = round(float(data.get("counted")), 6)
-    except (TypeError, ValueError):
+        for item in items:
+            day = datetime.strptime(item.get("date") or "", "%Y-%m-%d").date()
+            counted = round(float(item.get("counted")), 6)
+            if not math.isfinite(counted) or counted < 0:
+                return jsonify({"error": "Quantité invalide"}), 400
+            if day in corrections:
+                return jsonify({"error": f"Date en double : {day.strftime('%d/%m/%Y')}"}), 400
+            corrections[day] = counted
+    except (AttributeError, TypeError, ValueError):
         return jsonify({"error": "Données invalides"}), 400
-    if not math.isfinite(counted) or counted < 0:
-        return jsonify({"error": "Quantité invalide"}), 400
 
-    new_stock = None
+    results = []
     conn = get_conn()
     conn.autocommit = False
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("""
-            SELECT name, supplier, purchase_unit, stock_date, stock_parent_id
-            FROM stock_products WHERE id = %s FOR UPDATE
-            """, (product_id,))
-            prod = cur.fetchone()
-            if not prod:
-                return jsonify({"error": "Produit introuvable"}), 404
-            name, supplier, purchase_unit, stock_date, parent_id = prod
-            if parent_id is not None:
-                return jsonify({"error": "Produit lié (🔗) : corrigez le contrôle sur son produit parent"}), 400
-
-            who = (name, supplier)
-            match = "LOWER(TRIM(product_name)) = LOWER(TRIM(%s)) AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))"
-            cur.execute(f"""
-            SELECT id, snapshot_date, stock_quantity FROM stock_snapshots
-            WHERE {match} ORDER BY snapshot_date FOR UPDATE
-            """, who)
-            snaps = cur.fetchall()
-            idx = next((i for i, s in enumerate(snaps) if s[1] == control_date), None)
-            if idx is None:
-                return jsonify({"error": "Contrôle introuvable pour ce produit"}), 404
-
-            snap_id, _, old_qty = snaps[idx]
-            old_qty = float(old_qty or 0)
-            if abs(counted - old_qty) < 1e-9:
-                return jsonify({"success": True, "unchanged": True})
-            prev_snap = snaps[idx - 1] if idx > 0 else None
-            next_snap = snaps[idx + 1] if idx + 1 < len(snaps) else None
-            dates = [control_date] + ([next_snap[1]] if next_snap else [])
-
-            # copie avant correction
-            before = {}
-            cur.execute("SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM stock_snapshots t "
-                        f"WHERE snapshot_date = ANY(%s) AND {match}", (dates, *who))
-            before["snapshots"] = cur.fetchone()[0]
-            cur.execute("SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM stock_inventory_lines t "
-                        f"WHERE inventory_date = ANY(%s) AND {match}", (dates, *who))
-            before["inventory_lines"] = cur.fetchone()[0]
-            cur.execute("SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM stock_movements t "
-                        "WHERE movement_type IN ('CONSUMPTION', 'INVENTORY_ADJUSTMENT') "
-                        f"AND purchase_date = ANY(%s) AND {match}", (dates, *who))
-            before["movements"] = cur.fetchone()[0]
-            cur.execute("SELECT to_jsonb(t) FROM stock_products t WHERE id = %s", (product_id,))
-            before["product"] = cur.fetchone()[0]
-
-            def control_lines(day):
-                cur.execute(f"""
-                SELECT id, created_at, theoretical, counted, prev_control_date, purchases_since
-                FROM stock_inventory_lines
-                WHERE inventory_date = %s AND (product_id = %s OR ({match}))
-                ORDER BY created_at
-                FOR UPDATE
-                """, (day, product_id, *who))
-                return cur.fetchall()
-
-            # 1) ce contrôle
-            cur.execute("UPDATE stock_snapshots SET stock_quantity = %s, created_at = NOW() WHERE id = %s",
-                        (counted, snap_id))
-
-            lines = control_lines(control_date)
-            cur.execute(f"""
-            SELECT MAX(created_at) FROM stock_movements
-            WHERE note = %s AND purchase_date = %s AND {match}
-            """, (SHEET_CONTROL_NOTE, control_date, *who))
-            sheet_at = cur.fetchone()[0]
-
-            if lines and (sheet_at is None or sheet_at <= lines[-1][1]):
-                line_id, at, theoretical, *_ = lines[-1]
-                cur.execute("""
-                UPDATE stock_inventory_lines
-                SET counted = %s, counted_original = COALESCE(counted_original, counted), corrected_at = NOW()
-                WHERE id = %s
-                """, (counted, line_id))
-                _set_control_movement(cur, name, supplier, control_date, at, purchase_unit,
-                                      qty=counted - float(theoretical or 0))
-            elif prev_snap:
-                _set_control_movement(cur, name, supplier, control_date, None, purchase_unit,
-                                      qty=counted - float(prev_snap[2] or 0))
-            else:
-                _set_control_movement(cur, name, supplier, control_date, None, purchase_unit,
-                                      add=counted - old_qty)
-
-            # 2) contrôle suivant : son point de départ a changé
-            if next_snap:
-                next_lines = control_lines(next_snap[1])
-                if next_lines:
-                    line_id, at, _, next_counted, prev_control, bought = next_lines[0]
-                    if prev_control is None or prev_control == control_date:
-                        theoretical = round(counted + float(bought or 0), 6)
-                        cur.execute("""
-                        UPDATE stock_inventory_lines
-                        SET theoretical = %s,
-                            prev_stock = CASE WHEN prev_stock IS NULL THEN NULL ELSE %s END
-                        WHERE id = %s
-                        """, (theoretical, counted, line_id))
-                        _set_control_movement(cur, name, supplier, next_snap[1], at, purchase_unit,
-                                              qty=float(next_counted or 0) - theoretical)
-                else:
-                    _set_control_movement(cur, name, supplier, next_snap[1], None, purchase_unit,
-                                          qty=float(next_snap[2] or 0) - counted)
-
-            # 3) stock actuel : seulement pour le dernier contrôle
-            elif stock_date is None or stock_date <= control_date:
-                new_stock = counted
-                cur.execute("UPDATE stock_products SET stock_quantity = %s, updated_at = NOW() WHERE id = %s",
-                            (counted, product_id))
-
-            cur.execute("""
-            INSERT INTO stock_control_corrections
-            (product_id, product_name, supplier, control_date, old_quantity, new_quantity, before_data)
-            VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb)
-            """, (product_id, name, supplier, control_date, old_qty, counted,
-                  json.dumps(before, ensure_ascii=False, default=str)))
+            for day in sorted(corrections):
+                results.append(_apply_control_correction(cur, product_id, day, corrections[day]))
+    except _ControlCorrectionError as e:
+        return jsonify({"error": e.message}), e.status
     finally:
         conn.close()
 
+    saved = [r for r in results if not r["unchanged"]]
+    new_stock = next((r["new_stock"] for r in reversed(saved) if r["new_stock"] is not None), None)
     sheet_errors = []
     if new_stock is not None:
-        sheet_errors = _push_stock_to_sheet([(supplier, name, {"Stock Réel": new_stock})])
+        sheet_errors = _push_stock_to_sheet([(saved[-1]["supplier"], saved[-1]["name"], {"Stock Réel": new_stock})])
     return jsonify({
-        "success": True, "old_quantity": old_qty, "counted": counted,
+        "success": True, "saved": len(saved), "unchanged": not saved,
+        "corrections": [{k: r[k] for k in ("date", "old_quantity", "counted")} for r in saved],
         "stock_quantity": new_stock, "sheet_errors": sheet_errors,
     })
 
