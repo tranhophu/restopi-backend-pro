@@ -1551,6 +1551,12 @@ TABLE_WINDOW_MS = 30 * 60 * 1000
 TABLE_MAX_ORDERS = 6
 
 
+def _test_service(catalog, key):
+    """Mode test (admin) : service choisi, quelle que soit l'heure."""
+    windows = catalog["service"]["windows"]
+    return next((w for w in windows if w["key"] == key), windows[0])
+
+
 @app.route("/table/menu", methods=["GET"])
 def table_menu():
     catalog = table_orders.load_catalog()
@@ -1558,8 +1564,15 @@ def table_menu():
     if not table:
         return jsonify({"error": "QR code invalide"}), 403
 
-    service = table_orders.current_service(catalog, datetime.now(paris_tz))
-    payload = {"table": table, "open": bool(service), "service": service["label"] if service else None}
+    test = request.args.get("test") == "1"
+    if test and not check_admin(request):
+        return jsonify({"error": "test_login"}), 403
+
+    service = (
+        _test_service(catalog, request.args.get("service")) if test
+        else table_orders.current_service(catalog, datetime.now(paris_tz))
+    )
+    payload = {"table": table, "test": test, "open": bool(service), "service": service["label"] if service else None}
     if service:
         payload.update(table_orders.public_menu(catalog, service["key"]))
     return jsonify(payload)
@@ -1573,8 +1586,12 @@ def table_order():
     if not table:
         return jsonify({"error": "QR code invalide"}), 403
 
+    test = data.get("test") is True
+    if test and not check_admin(request):
+        return jsonify({"error": "test_login"}), 403
+
     now = datetime.now(paris_tz)
-    service = table_orders.current_service(catalog, now)
+    service = _test_service(catalog, data.get("service")) if test else table_orders.current_service(catalog, now)
     if not service:
         return jsonify({"error": "Les commandes sont ouvertes de 11h30 à 14h30 et de 18h30 à 22h, du lundi au samedi."}), 409
 
@@ -1582,6 +1599,13 @@ def table_order():
         items, total = table_orders.build_items(catalog, service["key"], data.get("lines"))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+
+    note = table_orders.clean_note(data.get("note"))
+    if test:
+        # visible sur le ticket avec l'imprimante actuelle : la cuisine ne prépare pas
+        note = f"TEST - NE PAS PREPARER. {note}".strip()
+        for item in items:
+            item["name"] = f"[TEST] {item['name']}"
 
     now_ms = int(now.timestamp() * 1000)
     order_id = now_ms + random.randint(0, 999)
@@ -1599,22 +1623,23 @@ def table_order():
                     (table, now_ms - TABLE_WINDOW_MS),
                 )
                 count, last_id = cur.fetchone()
-                if last_id >= now_ms - TABLE_COOLDOWN_MS:
+                if not test and last_id >= now_ms - TABLE_COOLDOWN_MS:
                     return jsonify({"error": "Commande déjà reçue. Patientez quelques secondes avant d'en envoyer une autre."}), 429
-                if count >= TABLE_MAX_ORDERS:
+                if not test and count >= TABLE_MAX_ORDERS:
                     return jsonify({"error": "Trop de commandes pour cette table. Merci d'appeler un serveur."}), 429
                 cur.execute(
                     """
                     INSERT INTO orders (
                         id, date, nom, prenom, tel, adresse, pickup_time,
                         note, items, total, printed, source, table_number
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,FALSE,'table',%s)
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,FALSE,%s,%s)
                     """,
                     (
-                        order_id, now.strftime("%d/%m/%Y %H:%M:%S"), f"Table {table}", "", "",
+                        order_id, now.strftime("%d/%m/%Y %H:%M:%S"), f"{'TEST ' if test else ''}Table {table}", "", "",
                         "Sur place - 1er étage", "À payer en caisse",
-                        table_orders.clean_note(data.get("note")),
-                        json.dumps(items, ensure_ascii=False), total, table,
+                        note,
+                        json.dumps(items, ensure_ascii=False), total,
+                        "table_test" if test else "table", table,
                     ),
                 )
     finally:
@@ -1774,7 +1799,7 @@ def get_stats():
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM orders WHERE COALESCE(source, 'online') <> 'table'")
+            cur.execute("SELECT * FROM orders WHERE COALESCE(source, 'online') NOT IN ('table', 'table_test')")
             rows = cur.fetchall()
 
     total_today = 0
