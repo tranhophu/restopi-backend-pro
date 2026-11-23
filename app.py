@@ -4372,7 +4372,7 @@ def stock_update_movement_date():
                 for name, supplier in {(r[1], r[2]) for r in to_change}:
                     _refresh_product_prices(cur, name, supplier)
 
-                control_checks = _flag_control_checks(cur, [r[0] for r in to_change if r[3] == "ACHAT"])
+                control_checks = _flag_control_checks(cur, changed_ids)
     finally:
         conn.close()
 
@@ -5165,9 +5165,10 @@ def check_purchase_duplicates():
 
 
 # =========================
-# LIVRAISON ET COMPTAGE : la livraison est-elle déjà dans le stock compté ?
+# LIVRAISON / RETOUR ET COMPTAGE : le mouvement est-il déjà pris en compte dans le stock compté ?
 # stock_movements.control_check : NULL = pas de question, 'pending' = à confirmer,
-# 'included' = déjà comptée, 'added' = ajoutée au comptage (control_check_date = contrôle concerné).
+# 'included' = déjà pris en compte, 'added' = quantité appliquée au comptage, négative pour un retour
+# (control_check_date = contrôle concerné).
 # La question est posée par l'étape saisie en dernier : achat après inventaire, ou inventaire après achat.
 # =========================
 
@@ -5191,7 +5192,7 @@ def _control_check_rows(cur, where, params, lock=False):
       ON LOWER(TRIM(c.name)) = LOWER(TRIM(m.product_name))
      AND LOWER(TRIM(c.supplier)) = LOWER(TRIM(m.supplier))
     LEFT JOIN stock_products par ON par.id = c.stock_parent_id
-    WHERE m.movement_type = 'ACHAT' {where}
+    WHERE m.movement_type IN ('ACHAT', 'RETOUR') {where}
     ORDER BY m.supplier, m.invoice_ref NULLS LAST, LOWER(m.product_name), m.id
     {"FOR UPDATE OF m" if lock else ""}
     """, params)
@@ -5209,7 +5210,7 @@ def _control_check_rows(cur, where, params, lock=False):
             "movement_id": mid, "product_name": name, "supplier": supplier, "invoice_ref": ref or "",
             "purchase_date": purchase_date.isoformat() if purchase_date else None,
             "control_date": control_date.isoformat() if control_date else None,
-            "quantity": qty, "unit": unit or "", "status": status,
+            "quantity": qty, "unit": unit or "", "status": status, "is_return": qty < 0,
             "root_id": root_id, "root_name": root_name, "root_supplier": root_supplier,
             "stock_quantity": stock_qty,
             "stock_unit": (root_stock or "").strip() or (root_purchase or "").strip(),
@@ -5341,7 +5342,12 @@ def stock_control_checks_resolve():
                 snap = cur.fetchone()
                 if not snap:
                     raise _ControlCorrectionError(f"Contrôle du {day.strftime('%d/%m/%Y')} introuvable pour « {root_name} »", 404)
-                result = _apply_control_correction(cur, root_id, day, round(float(snap[0] or 0) + qty, 6))
+                new_count = round(float(snap[0] or 0) + qty, 6)
+                if new_count < 0:
+                    raise _ControlCorrectionError(
+                        f"« {root_name} » : le retour dépasse le stock compté le {day.strftime('%d/%m/%Y')}. "
+                        "Corrigez d'abord ce comptage ou la quantité du retour.", 400)
+                result = _apply_control_correction(cur, root_id, day, new_count)
                 if result["new_stock"] is not None:
                     pushes.append((result["supplier"], result["name"], {"Stock Réel": result["new_stock"]}))
     except _ControlCorrectionError as e:
@@ -5548,9 +5554,7 @@ Variation prix:
 """
                 ))
 
-                movement_id = cur.fetchone()[0]
-                if movement_type == "ACHAT":
-                    saved_ids.append(movement_id)
+                saved_ids.append(cur.fetchone()[0])
 
                 saved += 1
 
@@ -5649,23 +5653,28 @@ def _lot_conversion_factor(lot_unit, stock_unit, conversion_factor):
     return float(conversion_factor or 1) or 1
 
 
-def _remaining_by_lot(lots, stock_quantity, stock_date, stock_unit, conversion_factor):
+def _remaining_by_lot(lots, stock_quantity, stock_date, stock_unit, conversion_factor, returns=None):
     """
     Estime la quantité restante de chaque lot (FIFO) à partir du dernier inventaire.
 
     - Lots achetés APRÈS le dernier inventaire : pas encore comptés → entiers.
     - Lots achetés AVANT/LE JOUR de l'inventaire : le stock compté est attribué
       aux lots les plus récents d'abord, les plus anciens sont considérés consommés.
+    - Retours APRÈS le dernier inventaire (returns) : retirés du lot reçu le plus récemment
+      avant le retour, puis des précédents. Avant l'inventaire, le comptage en tient déjà compte.
 
     lots : liste de dict {id, purchase_date, purchase_quantity, purchase_unit}
+    returns : liste de dict {purchase_date, purchase_quantity (négative), purchase_unit, factor}
     Retourne {lot_id: quantité restante en unité d'achat}
     """
     remaining = {}
     counted = []
+    lot_factors = {}
 
     for lot in lots:
         # lot d'une forme liée (carton) : facteur de sa propre ligne
         factor = lot.get("factor") or _lot_conversion_factor(lot["purchase_unit"], stock_unit, conversion_factor)
+        lot_factors[lot["id"]] = factor
         qty_stock_unit = float(lot["purchase_quantity"] or 0) * factor
 
         if stock_date is None or (lot["purchase_date"] and lot["purchase_date"] > stock_date):
@@ -5682,6 +5691,24 @@ def _remaining_by_lot(lots, stock_quantity, stock_date, stock_unit, conversion_f
         allocated = min(left, qty_stock_unit)
         left -= allocated
         remaining[lot["id"]] = allocated / factor
+
+    oldest = datetime.min.date()
+    for ret in sorted(returns or [], key=lambda r: r["purchase_date"] or oldest):
+        factor = ret.get("factor") or _lot_conversion_factor(ret["purchase_unit"], stock_unit, conversion_factor)
+        to_remove = abs(float(ret["purchase_quantity"] or 0)) * factor
+        eligible = [
+            lot for lot in lots
+            if not ret["purchase_date"] or not lot["purchase_date"] or lot["purchase_date"] <= ret["purchase_date"]
+        ]
+        eligible.sort(key=lambda l: (l["purchase_date"] or oldest, l["id"]), reverse=True)
+        for lot in eligible:
+            if to_remove <= 1e-9:
+                break
+            lot_factor = lot_factors[lot["id"]]
+            available = remaining.get(lot["id"], 0) * lot_factor
+            taken = min(available, to_remove)
+            remaining[lot["id"]] = (available - taken) / lot_factor
+            to_remove -= taken
 
     return remaining
 
@@ -5777,13 +5804,37 @@ def _active_lots(cur, limit_date=None):
                 "factor": _lot_conversion_factor(r[5], link[3], link[4]) * float(link[5] or 1) if link else None,
             })
 
+        returns = []
+        if product:
+            # retours sortis après le dernier inventaire : encore dans les lots
+            cur.execute("""
+            SELECT product_name,
+                   COALESCE(purchase_date, created_at::date),
+                   COALESCE(purchase_quantity, quantity),
+                   purchase_unit
+            FROM stock_movements
+            WHERE movement_type = 'RETOUR'
+            AND LOWER(TRIM(product_name)) = ANY(%s)
+            AND LOWER(TRIM(supplier)) = %s
+            AND (%s::date IS NULL OR COALESCE(purchase_date, created_at::date) > %s::date)
+            """, ([name_key, *members.get((name_key, supplier_key), [])], supplier_key, product[1], product[1]))
+            for r in cur.fetchall():
+                link = links.get((r[0].strip().lower(), supplier_key))
+                returns.append({
+                    "purchase_date": r[1],
+                    "purchase_quantity": r[2],
+                    "purchase_unit": r[3],
+                    "factor": _lot_conversion_factor(r[3], link[3], link[4]) * float(link[5] or 1) if link else None,
+                })
+
         if product:
             remaining = _remaining_by_lot(
                 lots,
                 product[0],
                 product[1],
                 product[2],
-                product[3]
+                product[3],
+                returns
             )
             stock_date = product[1]
         else:
@@ -6706,11 +6757,10 @@ def stock_invoices_import():
                         f"{qty_invoice:g} × {float(line['unit_price']):.2f} €"
                     ))
 
-                    movement_id = cur.fetchone()[0]
+                    saved_ids.append(cur.fetchone()[0])
                     line_count += 1
 
                     if movement_type == "ACHAT":
-                        saved_ids.append(movement_id)
                         touched.add((product[0], product[1]))
 
                         if line.get("tva") is not None and 0 <= float(line["tva"]) <= 30:
