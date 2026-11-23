@@ -5,6 +5,7 @@ import os
 import resend
 import json
 import io
+import base64
 import math
 import re
 from datetime import datetime, timedelta
@@ -625,6 +626,42 @@ def init_stock():
             cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_stock_control_corrections_product
             ON stock_control_corrections (product_id, control_date);
+            """)
+
+            # DLC relevées pendant l'inventaire (quantités en unité stock du produit compté)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_count_dlc (
+                id SERIAL PRIMARY KEY,
+                product_id INTEGER NOT NULL,
+                control_date DATE NOT NULL,
+                quantity FLOAT NOT NULL,
+                expiry_date DATE NOT NULL,
+                lot_status TEXT NOT NULL DEFAULT 'ACTIF',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+            """)
+            cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_count_dlc_product
+            ON stock_count_dlc (product_id, control_date);
+            """)
+
+            # photos de DLC prises à la réception (image réduite côté navigateur)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_dlc_photos (
+                id SERIAL PRIMARY KEY,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                product_id INTEGER NOT NULL,
+                received_date DATE NOT NULL,
+                expiry_date DATE NOT NULL,
+                photo BYTEA NOT NULL,
+                content_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                movement_id INTEGER
+            );
+            """)
+            cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_dlc_photos_pending
+            ON stock_dlc_photos (product_id, received_date) WHERE status = 'pending';
             """)
 
             # prix référence
@@ -2434,6 +2471,8 @@ def _merge_stock_product(cur, supplier, old_name, new_name):
 
     # listes de comptage collées : « vinaigre alcool » reconnu comme le produit gardé
     cur.execute("UPDATE stock_inventory_aliases SET product_id = %s WHERE product_id = %s", (new[0], old[0]))
+    cur.execute("UPDATE stock_count_dlc SET product_id = %s WHERE product_id = %s", (new[0], old[0]))
+    cur.execute("UPDATE stock_dlc_photos SET product_id = %s WHERE product_id = %s", (new[0], old[0]))
 
     cur.execute("DELETE FROM stock_products WHERE id = %s", (old[0],))
 
@@ -2655,6 +2694,22 @@ def stock_inventory():
     except (TypeError, ValueError):
         return jsonify({"error": "Liste « passés » invalide"}), 400
 
+    # DLC facultatives : {product_id: [{quantity, expiry_date}]} ; sans date, rien n'est enregistré
+    count_dlc = {}
+    try:
+        for pid, entries in (data.get("dlc") or {}).items():
+            clean = []
+            for entry in entries or []:
+                expiry = _iso_date_or_none(entry.get("expiry_date"))
+                qty = float(entry.get("quantity"))
+                if not expiry or not math.isfinite(qty) or qty < 0:
+                    return jsonify({"error": "DLC invalide"}), 400
+                if qty > 0:
+                    clean.append((expiry, qty))
+            count_dlc[int(pid)] = clean
+    except (AttributeError, TypeError, ValueError):
+        return jsonify({"error": "DLC invalide"}), 400
+
     sheet_changes = []
     summary = {"counted": 0, "unchanged": 0, "adjusted": 0, "skipped": 0}
 
@@ -2736,6 +2791,19 @@ def stock_inventory():
                 WHERE id = %s
                 """, (new_qty, inv_date, inv_date, pid))
 
+                # DLC de ce comptage : remplace celles du même jour (les plus proches d'abord si trop de quantité)
+                cur.execute("DELETE FROM stock_count_dlc WHERE product_id = %s AND control_date = %s", (pid, inv_date))
+                left_for_dlc = new_qty
+                for expiry, qty in sorted(count_dlc.get(pid, [])):
+                    kept = min(qty, left_for_dlc)
+                    if kept <= 1e-9:
+                        break
+                    left_for_dlc -= kept
+                    cur.execute("""
+                    INSERT INTO stock_count_dlc (product_id, control_date, quantity, expiry_date)
+                    VALUES (%s,%s,%s,%s)
+                    """, (pid, inv_date, kept, expiry))
+
                 # Google Sheet : date de contrôle de CETTE ligne (+ stock si écart)
                 sheet_fields = {CONTROL_DATE_HEADER: inv_date.strftime("%d/%m/%Y")}
 
@@ -2783,6 +2851,7 @@ INVENTORY_DRAFT_PREFIXES = (
     "stock_inventory_draft__",   # comptages par fournisseur
     "stock_inventory_skip__",    # produits ⏭ passés par fournisseur
     "stock_inventory_import_draft",  # liste de comptage collée + corrections
+    "stock_inventory_dlc_draft",     # DLC écrites dans la liste, en attente de validation
 )
 
 
@@ -5359,6 +5428,196 @@ def stock_control_checks_resolve():
     return jsonify({"success": True, "answered": answered, "corrected": len(additions), "sheet_errors": sheet_errors})
 
 
+# =========================
+# 📷 PHOTOS DLC : photo prise à la réception, date saisie par l'employé en regardant la photo.
+# La facture arrive souvent après : la DLC est reportée sur l'achat du même produit (± 3 jours).
+# =========================
+
+DLC_PHOTO_MAX_BYTES = 3 * 1024 * 1024
+DLC_MATCH_DAYS = 3
+
+
+def _dlc_family_ids(cur, product_id):
+    """Le produit, son parent et ses formes d'achat liées (carton + pièce = même marchandise)."""
+    cur.execute("SELECT COALESCE(stock_parent_id, id) FROM stock_products WHERE id = %s", (product_id,))
+    row = cur.fetchone()
+    if not row:
+        return [product_id]
+    cur.execute("SELECT id FROM stock_products WHERE id = %s OR stock_parent_id = %s", (row[0], row[0]))
+    return [r[0] for r in cur.fetchall()]
+
+
+def _match_dlc_photos(cur, movement_ids):
+    """Achats qui viennent d'être enregistrés, sans DLC : reprend la DLC de la photo en attente la plus proche."""
+    if not movement_ids:
+        return []
+    cur.execute("""
+    SELECT m.id, m.product_name, m.purchase_date, p.id
+    FROM stock_movements m
+    JOIN stock_products p
+      ON LOWER(TRIM(p.name)) = LOWER(TRIM(m.product_name))
+     AND LOWER(TRIM(p.supplier)) = LOWER(TRIM(m.supplier))
+    WHERE m.id = ANY(%s) AND m.movement_type = 'ACHAT'
+    AND m.expiry_date IS NULL AND m.purchase_date IS NOT NULL
+    ORDER BY m.id
+    """, (list(movement_ids),))
+    matched = []
+    for movement_id, name, day, product_id in cur.fetchall():
+        cur.execute("""
+        SELECT id, expiry_date FROM stock_dlc_photos
+        WHERE status = 'pending' AND product_id = ANY(%s)
+        AND received_date BETWEEN %s::date - %s AND %s::date + %s
+        AND expiry_date >= %s
+        ORDER BY ABS(received_date - %s::date), id
+        LIMIT 1
+        FOR UPDATE
+        """, (_dlc_family_ids(cur, product_id), day, DLC_MATCH_DAYS, day, DLC_MATCH_DAYS, day, day))
+        photo = cur.fetchone()
+        if not photo:
+            continue
+        cur.execute("UPDATE stock_movements SET expiry_date = %s WHERE id = %s", (photo[1], movement_id))
+        cur.execute("UPDATE stock_dlc_photos SET status = 'matched', movement_id = %s WHERE id = %s",
+                    (movement_id, photo[0]))
+        matched.append({"movement_id": movement_id, "product_name": name, "expiry_date": photo[1].isoformat()})
+    return matched
+
+
+@app.route("/admin/stock/dlc-photos", methods=["GET"])
+def stock_dlc_photos_list():
+    """Photos DLC (sans l'image) : les plus récentes d'abord."""
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+        SELECT d.id, d.created_at, d.received_date, d.expiry_date, d.status, d.movement_id,
+               p.id, p.name, p.supplier, OCTET_LENGTH(d.photo)
+        FROM stock_dlc_photos d
+        LEFT JOIN stock_products p ON p.id = d.product_id
+        ORDER BY d.id DESC
+        LIMIT 200
+        """)
+        rows = cur.fetchall()
+    return jsonify([
+        {
+            "id": r[0], "created_at": r[1].isoformat() if r[1] else None,
+            "received_date": r[2].isoformat(), "expiry_date": r[3].isoformat(),
+            "status": r[4], "movement_id": r[5], "product_id": r[6],
+            "product_name": r[7] or "(produit supprimé)", "supplier": r[8] or "", "size": r[9],
+        }
+        for r in rows
+    ])
+
+
+@app.route("/admin/stock/dlc-photos", methods=["POST"])
+def stock_dlc_photos_add():
+    """Body : {product_id, received_date, expiry_date, image: data URL ou base64 (JPEG, PNG, WebP)}"""
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.get_json(silent=True) or {}
+    received = _iso_date_or_none(data.get("received_date"))
+    expiry = _iso_date_or_none(data.get("expiry_date"))
+    try:
+        product_id = int(data.get("product_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Produit obligatoire"}), 400
+    if not received or not expiry:
+        return jsonify({"error": "Date de réception et DLC obligatoires"}), 400
+    if received > datetime.now(paris_tz).date():
+        return jsonify({"error": "La date de réception ne peut pas être dans le futur"}), 400
+
+    encoded = str(data.get("image") or "")
+    if encoded.startswith("data:"):
+        encoded = encoded.split(",", 1)[-1]
+    if not encoded or len(encoded) > DLC_PHOTO_MAX_BYTES * 4 // 3 + 8:
+        return jsonify({"error": "Photo manquante ou trop lourde (3 Mo maximum)"}), 400
+    try:
+        photo = base64.b64decode(encoded, validate=True)
+    except ValueError:
+        return jsonify({"error": "Photo illisible"}), 400
+    if photo.startswith(b"\xff\xd8\xff"):
+        content_type = "image/jpeg"
+    elif photo.startswith(b"\x89PNG\r\n\x1a\n"):
+        content_type = "image/png"
+    elif photo[:4] == b"RIFF" and photo[8:12] == b"WEBP":
+        content_type = "image/webp"
+    else:
+        return jsonify({"error": "Format de photo non accepté (JPEG, PNG ou WebP)"}), 400
+    if len(photo) > DLC_PHOTO_MAX_BYTES:
+        return jsonify({"error": "Photo trop lourde (3 Mo maximum)"}), 400
+
+    conn = get_conn()
+    conn.autocommit = False
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT name FROM stock_products WHERE id = %s", (product_id,))
+            if not cur.fetchone():
+                return jsonify({"error": "Produit introuvable"}), 404
+
+            # achat déjà enregistré, encore sans DLC ?
+            cur.execute("""
+            SELECT m.id, m.product_name
+            FROM stock_movements m
+            JOIN stock_products p
+              ON LOWER(TRIM(p.name)) = LOWER(TRIM(m.product_name))
+             AND LOWER(TRIM(p.supplier)) = LOWER(TRIM(m.supplier))
+            WHERE p.id = ANY(%s)
+            AND m.movement_type = 'ACHAT'
+            AND m.expiry_date IS NULL
+            AND COALESCE(m.lot_status, 'ACTIF') = 'ACTIF'
+            AND m.purchase_date BETWEEN %s::date - %s AND %s::date + %s
+            AND m.purchase_date <= %s
+            ORDER BY ABS(m.purchase_date - %s::date), m.id
+            LIMIT 1
+            FOR UPDATE OF m
+            """, (_dlc_family_ids(cur, product_id), received, DLC_MATCH_DAYS, received, DLC_MATCH_DAYS, expiry, received))
+            movement = cur.fetchone()
+            if movement:
+                cur.execute("UPDATE stock_movements SET expiry_date = %s WHERE id = %s", (expiry, movement[0]))
+
+            cur.execute("""
+            INSERT INTO stock_dlc_photos (product_id, received_date, expiry_date, photo, content_type, status, movement_id)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id
+            """, (product_id, received, expiry, psycopg2.Binary(photo), content_type,
+                  "matched" if movement else "pending", movement[0] if movement else None))
+            photo_id = cur.fetchone()[0]
+    finally:
+        conn.close()
+
+    return jsonify({
+        "success": True, "id": photo_id, "status": "matched" if movement else "pending",
+        "matched_product": movement[1] if movement else None,
+    })
+
+
+@app.route("/admin/stock/dlc-photos/<int:photo_id>/image", methods=["GET"])
+def stock_dlc_photo_image(photo_id):
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT photo, content_type FROM stock_dlc_photos WHERE id = %s", (photo_id,))
+        row = cur.fetchone()
+    if not row:
+        return jsonify({"error": "Photo introuvable"}), 404
+    response = app.response_class(bytes(row[0]), mimetype=row[1])
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+@app.route("/admin/stock/dlc-photos/<int:photo_id>/delete", methods=["POST"])
+def stock_dlc_photo_delete(photo_id):
+    """Photo prise par erreur : seulement tant qu'elle n'est pas liée à un achat."""
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM stock_dlc_photos WHERE id = %s AND status = 'pending' RETURNING id", (photo_id,))
+        if not cur.fetchone():
+            return jsonify({"error": "Photo introuvable ou déjà liée à un achat"}), 409
+    return jsonify({"success": True})
+
+
 @app.route("/admin/stock/add-deliveries", methods=["POST"])
 def add_deliveries():
 
@@ -5372,6 +5631,7 @@ def add_deliveries():
     saved = 0
     saved_ids = []
     control_checks = []
+    dlc_matched = []
     skipped = []
     skipped_invoices = []
 
@@ -5632,9 +5892,11 @@ Variation prix:
                 ))
 
             control_checks = _flag_control_checks(cur, saved_ids)
+            dlc_matched = _match_dlc_photos(cur, saved_ids)
 
     return jsonify({
         "success": True,
+        "dlc_matched": dlc_matched,
         "saved": saved,
         "skipped": skipped,
         "skipped_invoices": sorted(set(skipped_invoices)),
@@ -5651,6 +5913,13 @@ def _lot_conversion_factor(lot_unit, stock_unit, conversion_factor):
     if (lot_unit or "").strip().lower() == (stock_unit or "").strip().lower():
         return 1
     return float(conversion_factor or 1) or 1
+
+
+def _lot_priority(lot):
+    """Ordre « le plus récent d'abord » ; au même jour, les DLC relevées au comptage passent avant les achats."""
+    is_count = bool(lot.get("is_count"))
+    expiry = lot["expiry_date"].toordinal() if is_count and lot.get("expiry_date") else 0
+    return (lot["purchase_date"] or datetime.min.date(), is_count, expiry, lot["id"])
 
 
 def _remaining_by_lot(lots, stock_quantity, stock_date, stock_unit, conversion_factor, returns=None):
@@ -5685,7 +5954,7 @@ def _remaining_by_lot(lots, stock_quantity, stock_date, stock_unit, conversion_f
     left = max(float(stock_quantity or 0), 0)
 
     # plus récent d'abord
-    counted.sort(key=lambda x: (x[0]["purchase_date"] or datetime.min.date(), x[0]["id"]), reverse=True)
+    counted.sort(key=lambda x: _lot_priority(x[0]), reverse=True)
 
     for lot, qty_stock_unit, factor in counted:
         allocated = min(left, qty_stock_unit)
@@ -5700,7 +5969,7 @@ def _remaining_by_lot(lots, stock_quantity, stock_date, stock_unit, conversion_f
             lot for lot in lots
             if not ret["purchase_date"] or not lot["purchase_date"] or lot["purchase_date"] <= ret["purchase_date"]
         ]
-        eligible.sort(key=lambda l: (l["purchase_date"] or oldest, l["id"]), reverse=True)
+        eligible.sort(key=_lot_priority, reverse=True)
         for lot in eligible:
             if to_remove <= 1e-9:
                 break
@@ -5740,6 +6009,16 @@ def _active_lots(cur, limit_date=None):
 
     candidates = cur.fetchall()
 
+    # produits avec une DLC relevée à l'inventaire
+    cur.execute("""
+    SELECT DISTINCT LOWER(TRIM(p.name)), LOWER(TRIM(p.supplier))
+    FROM stock_count_dlc d
+    JOIN stock_products p ON p.id = d.product_id
+    WHERE d.lot_status = 'ACTIF'
+    AND (%s::date IS NULL OR d.expiry_date <= %s::date)
+    """, (limit_date, limit_date))
+    candidates = list(candidates) + cur.fetchall()
+
     # 🔗 formes liées : leurs lots partagent le stock du parent (FIFO sur l'ensemble)
     cur.execute("""
     SELECT LOWER(TRIM(c.name)), LOWER(TRIM(c.supplier)), LOWER(TRIM(par.name)), c.stock_unit, c.conversion_factor,
@@ -5765,7 +6044,12 @@ def _active_lots(cur, limit_date=None):
         SELECT stock_quantity,
                stock_date,
                stock_unit,
-               conversion_factor
+               conversion_factor,
+               id,
+               average_price,
+               purchase_unit,
+               name,
+               supplier
         FROM stock_products
         WHERE LOWER(TRIM(name)) = %s
         AND LOWER(TRIM(supplier)) = %s
@@ -5803,6 +6087,29 @@ def _active_lots(cur, limit_date=None):
                 "unit_price": r[7],
                 "factor": _lot_conversion_factor(r[5], link[3], link[4]) * float(link[5] or 1) if link else None,
             })
+
+        if product:
+            # DLC du dernier comptage qui en a relevé : lots réels, prioritaires sur l'estimation par achat
+            cur.execute("""
+            SELECT id, control_date, quantity, expiry_date
+            FROM stock_count_dlc
+            WHERE product_id = %s
+            AND lot_status = 'ACTIF'
+            AND control_date = (SELECT MAX(control_date) FROM stock_count_dlc WHERE product_id = %s)
+            """, (product[4], product[4]))
+            for count_id, control_date, qty, expiry in cur.fetchall():
+                lots.append({
+                    "id": -count_id,  # id négatif = lot relevé à l'inventaire
+                    "product_name": product[7],
+                    "supplier": product[8],
+                    "purchase_date": control_date,
+                    "purchase_quantity": qty,
+                    "purchase_unit": (product[2] or "").strip() or product[6],
+                    "expiry_date": expiry,
+                    "unit_price": product[5],
+                    "factor": 1.0,
+                    "is_count": True,
+                })
 
         returns = []
         if product:
@@ -5866,6 +6173,7 @@ def _active_lots(cur, limit_date=None):
                 "expiry_date": lot["expiry_date"].isoformat(),
                 "days_left": (lot["expiry_date"] - today).days,
                 "stock_date": stock_date.isoformat() if stock_date else None,
+                "source": "inventaire" if lot.get("is_count") else "achat",
             })
 
     result.sort(key=lambda x: x["expiry_date"])
@@ -6026,6 +6334,10 @@ def stock_lot_status():
 
     with get_conn() as conn:
         with conn.cursor() as cur:
+            if lot_id < 0:  # lot relevé à l'inventaire
+                cur.execute("UPDATE stock_count_dlc SET lot_status = %s WHERE id = %s", (status, -lot_id))
+                return jsonify({"success": True})
+
             cur.execute("""
             UPDATE stock_movements
             SET lot_status = %s
@@ -6655,6 +6967,7 @@ def stock_invoices_import():
     touched = set()
     saved_ids = []
     control_checks = []
+    dlc_matched = []
 
     try:
         with conn.cursor() as cur:
@@ -6776,6 +7089,7 @@ def stock_invoices_import():
                 _refresh_product_prices(cur, name, supplier)
 
             control_checks = _flag_control_checks(cur, saved_ids)
+            dlc_matched = _match_dlc_photos(cur, saved_ids)
 
         conn.commit()
 
@@ -6792,7 +7106,8 @@ def stock_invoices_import():
         "skipped": skipped,
         "lines": line_count,
         "created_products": [a["product_name"] for a in created],
-        "control_checks": control_checks
+        "control_checks": control_checks,
+        "dlc_matched": dlc_matched
     })
 
 
