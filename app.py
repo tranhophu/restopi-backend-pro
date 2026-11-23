@@ -489,6 +489,14 @@ def init_stock():
             ADD COLUMN IF NOT EXISTS expiry_date DATE,
             ADD COLUMN IF NOT EXISTS lot_status TEXT DEFAULT 'ACTIF';
             """)
+            # purchase_date = date de RÉCEPTION (stock / consommation) ; invoice_date = date de la facture
+            # control_check : livraison déjà dans le comptage ? (voir _flag_control_checks)
+            cur.execute("""
+            ALTER TABLE stock_movements
+            ADD COLUMN IF NOT EXISTS invoice_date DATE,
+            ADD COLUMN IF NOT EXISTS control_check TEXT,
+            ADD COLUMN IF NOT EXISTS control_check_date DATE;
+            """)
             # snapshots hebdomadaires
             cur.execute("""
             CREATE TABLE IF NOT EXISTS stock_snapshots (
@@ -4151,7 +4159,8 @@ def stock_history():
                 created_at,
                 expiry_date,
                 COALESCE(lot_status, 'ACTIF'),
-                id
+                id,
+                invoice_date
             FROM stock_movements
             ORDER BY created_at DESC
             """)
@@ -4183,7 +4192,8 @@ def stock_history():
             "created_at": str(r[9]) if r[9] else None,
             "expiry_date": r[10].isoformat() if r[10] else None,
             "lot_status": r[11],
-            "id": r[12]
+            "id": r[12],
+            "invoice_date": r[13].isoformat() if r[13] else None
         })
 
     return jsonify(result)
@@ -4283,6 +4293,93 @@ def stock_update_movement_unit():
                 _refresh_product_prices(cur, product_name, supplier)
 
     return jsonify({"success": True, "updated": len(rows)})
+
+
+@app.route("/admin/stock/update-movement-date", methods=["POST"])
+def stock_update_movement_date():
+    """
+    Corrige la date de réception (colonne « Date ») de lignes ACHAT / RETOUR. Tout est enregistré, ou rien.
+    Body : {"ids": [12, 13, ...], "purchase_date": "YYYY-MM-DD"}
+    - facture sans date propre : l'ancienne date est gardée comme date de facture
+    - question « livraison déjà comptée ? » reposée pour la nouvelle date
+    - ligne déjà ajoutée à un comptage : refusée (le comptage contient sa quantité)
+    """
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.get_json(silent=True) or {}
+    new_date = _iso_date_or_none(data.get("purchase_date"))
+    try:
+        ids = sorted({int(i) for i in (data.get("ids") or [])})
+    except (TypeError, ValueError):
+        return jsonify({"error": "Lignes invalides"}), 400
+    if not ids or len(ids) > 1000:
+        return jsonify({"error": "Aucune ligne sélectionnée"}), 400
+    if not new_date:
+        return jsonify({"error": "Date invalide"}), 400
+    if new_date > datetime.now(paris_tz).date():
+        return jsonify({"error": "La date de réception ne peut pas être dans le futur"}), 400
+
+    conn = get_conn()
+    conn.autocommit = False
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+            SELECT id, product_name, supplier, movement_type, purchase_date, expiry_date,
+                   control_check, control_check_date
+            FROM stock_movements
+            WHERE id = ANY(%s) AND movement_type IN ('ACHAT', 'RETOUR')
+            FOR UPDATE
+            """, (ids,))
+            rows = cur.fetchall()
+            if not rows:
+                return jsonify({"error": "Aucune ligne ACHAT/RETOUR trouvée"}), 404
+
+            to_change = [r for r in rows if r[4] != new_date]
+
+            blocked = [
+                f"{r[1]} : déjà ajouté au comptage du {r[7].strftime('%d/%m/%Y') if r[7] else '?'}"
+                for r in to_change if r[6] == "added"
+            ]
+            if blocked:
+                return jsonify({
+                    "error": "Date non modifiée. Retirez d'abord la quantité de ce comptage avec ✏️ Corriger, "
+                             "puis supprimez et ressaisissez l'achat :\n" + "\n".join(blocked)
+                }), 409
+
+            expired = [
+                f"{r[1]} : DLC {r[5].strftime('%d/%m/%Y')}"
+                for r in to_change if r[5] and r[5] < new_date
+            ]
+            if expired:
+                return jsonify({"error": "La DLC serait antérieure à la date de réception :\n" + "\n".join(expired)}), 400
+
+            changed_ids = [r[0] for r in to_change]
+            control_checks = []
+            if changed_ids:
+                cur.execute("""
+                UPDATE stock_movements
+                SET invoice_date = COALESCE(
+                        invoice_date,
+                        CASE WHEN COALESCE(TRIM(invoice_ref), '') <> '' THEN purchase_date END
+                    ),
+                    purchase_date = %s,
+                    control_check = NULL,
+                    control_check_date = NULL
+                WHERE id = ANY(%s)
+                """, (new_date, changed_ids))
+
+                for name, supplier in {(r[1], r[2]) for r in to_change}:
+                    _refresh_product_prices(cur, name, supplier)
+
+                control_checks = _flag_control_checks(cur, [r[0] for r in to_change if r[3] == "ACHAT"])
+    finally:
+        conn.close()
+
+    return jsonify({
+        "success": True, "updated": len(changed_ids), "unchanged": len(rows) - len(changed_ids),
+        "control_checks": control_checks,
+    })
 
 
 def _unit_change_sheet_check(supplier, name, fields, stock_date):
@@ -5067,6 +5164,195 @@ def check_purchase_duplicates():
     return jsonify({"duplicates": duplicates})
 
 
+# =========================
+# LIVRAISON ET COMPTAGE : la livraison est-elle déjà dans le stock compté ?
+# stock_movements.control_check : NULL = pas de question, 'pending' = à confirmer,
+# 'included' = déjà comptée, 'added' = ajoutée au comptage (control_check_date = contrôle concerné).
+# La question est posée par l'étape saisie en dernier : achat après inventaire, ou inventaire après achat.
+# =========================
+
+def _iso_date_or_none(value):
+    try:
+        return datetime.strptime(str(value or "").strip()[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _control_check_rows(cur, where, params, lock=False):
+    """Achats avec leur produit de comptage (parent si forme liée) et leur quantité en unité stock de ce produit."""
+    cur.execute(f"""
+    SELECT m.id, m.product_name, m.supplier, m.invoice_ref, m.purchase_date, m.control_check_date,
+           m.quantity, m.purchase_unit, m.control_check,
+           c.purchase_unit, c.stock_unit, c.conversion_factor, c.stock_parent_id, c.stock_link_factor,
+           COALESCE(par.id, c.id), COALESCE(par.name, c.name), COALESCE(par.supplier, c.supplier),
+           COALESCE(par.stock_unit, c.stock_unit), COALESCE(par.purchase_unit, c.purchase_unit)
+    FROM stock_movements m
+    JOIN stock_products c
+      ON LOWER(TRIM(c.name)) = LOWER(TRIM(m.product_name))
+     AND LOWER(TRIM(c.supplier)) = LOWER(TRIM(m.supplier))
+    LEFT JOIN stock_products par ON par.id = c.stock_parent_id
+    WHERE m.movement_type = 'ACHAT' {where}
+    ORDER BY m.supplier, m.invoice_ref NULLS LAST, LOWER(m.product_name), m.id
+    {"FOR UPDATE OF m" if lock else ""}
+    """, params)
+
+    out = []
+    for (mid, name, supplier, ref, purchase_date, control_date, qty, unit, status,
+         c_purchase, c_stock, c_conv, parent_id, link_factor,
+         root_id, root_name, root_supplier, root_stock, root_purchase) in cur.fetchall():
+        qty = float(qty or 0)
+        factor = _purchase_to_stock_factor(unit, c_purchase, c_stock, c_conv)
+        stock_qty = None
+        if factor is not None:
+            stock_qty = round(qty * factor * (float(link_factor or 1) if parent_id is not None else 1), 6)
+        out.append({
+            "movement_id": mid, "product_name": name, "supplier": supplier, "invoice_ref": ref or "",
+            "purchase_date": purchase_date.isoformat() if purchase_date else None,
+            "control_date": control_date.isoformat() if control_date else None,
+            "quantity": qty, "unit": unit or "", "status": status,
+            "root_id": root_id, "root_name": root_name, "root_supplier": root_supplier,
+            "stock_quantity": stock_qty,
+            "stock_unit": (root_stock or "").strip() or (root_purchase or "").strip(),
+            "same_day": bool(purchase_date and control_date and purchase_date == control_date),
+        })
+    return out
+
+
+def _flag_control_checks(cur, movement_ids):
+    """
+    Achats qui viennent d'être enregistrés : à confirmer si leur premier contrôle à partir de la date
+    de réception est le DERNIER contrôle du produit (les vieilles factures ne posent pas de question).
+    """
+    if not movement_ids:
+        return []
+    flagged = []
+    controls = {}
+    for row in _control_check_rows(cur, "AND m.id = ANY(%s)", (list(movement_ids),)):
+        if not row["purchase_date"]:
+            continue
+        if row["root_id"] not in controls:
+            cur.execute("""
+            SELECT snapshot_date FROM stock_snapshots
+            WHERE LOWER(TRIM(product_name)) = LOWER(TRIM(%s)) AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+            ORDER BY snapshot_date
+            """, (row["root_name"], row["root_supplier"]))
+            controls[row["root_id"]] = [r[0].isoformat() for r in cur.fetchall()]
+        dates = controls[row["root_id"]]
+        control = next((d for d in dates if d >= row["purchase_date"]), None)
+        if control is None or control != dates[-1]:
+            continue
+        cur.execute("UPDATE stock_movements SET control_check = 'pending', control_check_date = %s WHERE id = %s",
+                    (control, row["movement_id"]))
+        row.update(control_date=control, status="pending", same_day=control == row["purchase_date"])
+        flagged.append(row)
+    return flagged
+
+
+@app.route("/admin/stock/control-checks", methods=["GET"])
+def stock_control_checks_pending():
+    """Livraisons laissées « à vérifier plus tard »."""
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+    with get_conn() as conn, conn.cursor() as cur:
+        return jsonify({"rows": _control_check_rows(cur, "AND m.control_check = 'pending'", ())})
+
+
+@app.route("/admin/stock/control-checks/for-inventory", methods=["POST"])
+def stock_control_checks_for_inventory():
+    """Avant de valider un inventaire : achats reçus le jour même, sans réponse. Body : {date, product_ids}"""
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+    data = request.get_json(silent=True) or {}
+    day = _iso_date_or_none(data.get("date"))
+    try:
+        product_ids = [int(i) for i in (data.get("product_ids") or [])]
+    except (TypeError, ValueError):
+        return jsonify({"error": "Produits invalides"}), 400
+    if not day:
+        return jsonify({"error": "Date invalide"}), 400
+    if not product_ids:
+        return jsonify({"rows": []})
+    with get_conn() as conn, conn.cursor() as cur:
+        rows = _control_check_rows(cur, """
+        AND m.purchase_date = %s
+        AND (m.control_check IS NULL OR m.control_check = 'pending')
+        AND COALESCE(par.id, c.id) = ANY(%s)
+        """, (day, product_ids))
+    for row in rows:
+        row.update(control_date=day.isoformat(), same_day=True)
+    return jsonify({"rows": rows})
+
+
+@app.route("/admin/stock/control-checks/resolve", methods=["POST"])
+def stock_control_checks_resolve():
+    """
+    Body : {decisions: [{movement_id, decision: included|added}], apply_to_count, control_date}
+    apply_to_count (défaut true) : « added » corrige le contrôle déjà enregistré.
+    false : l'inventaire en cours de validation contient déjà la quantité. Tout est enregistré, ou rien.
+    """
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    data = request.get_json(silent=True) or {}
+    apply_to_count = data.get("apply_to_count", True) is not False
+    default_day = _iso_date_or_none(data.get("control_date"))
+    decisions = {}
+    try:
+        for d in data.get("decisions") or []:
+            if d.get("decision") not in ("included", "added"):
+                return jsonify({"error": "Décision invalide"}), 400
+            decisions[int(d.get("movement_id"))] = d["decision"]
+    except (AttributeError, TypeError, ValueError):
+        return jsonify({"error": "Données invalides"}), 400
+    if not decisions or len(decisions) > 1000:
+        return jsonify({"error": "Aucune décision"}), 400
+
+    additions = {}
+    pushes = []
+    answered = 0
+    conn = get_conn()
+    conn.autocommit = False
+    try:
+        with conn, conn.cursor() as cur:
+            rows = _control_check_rows(cur, "AND m.id = ANY(%s)", (list(decisions),), lock=True)
+            for row in rows:
+                if row["status"] not in (None, "pending"):
+                    continue  # déjà répondu (double clic, autre appareil)
+                decision = decisions[row["movement_id"]]
+                day = _iso_date_or_none(row["control_date"]) or default_day
+                if not day:
+                    raise _ControlCorrectionError(f"Contrôle inconnu pour « {row['product_name']} »", 400)
+                if decision == "added" and apply_to_count:
+                    if row["stock_quantity"] is None:
+                        raise _ControlCorrectionError(
+                            f"Unité « {row['unit']} » inconnue pour « {row['product_name']} » : corrigez d'abord l'achat", 400)
+                    key = (row["root_id"], row["root_name"], row["root_supplier"], day)
+                    additions[key] = additions.get(key, 0) + row["stock_quantity"]
+                cur.execute("UPDATE stock_movements SET control_check = %s, control_check_date = %s WHERE id = %s",
+                            (decision, day, row["movement_id"]))
+                answered += 1
+
+            for (root_id, root_name, root_supplier, day), qty in sorted(additions.items(), key=lambda x: x[0][3]):
+                cur.execute("""
+                SELECT stock_quantity FROM stock_snapshots
+                WHERE snapshot_date = %s
+                AND LOWER(TRIM(product_name)) = LOWER(TRIM(%s)) AND LOWER(TRIM(supplier)) = LOWER(TRIM(%s))
+                """, (day, root_name, root_supplier))
+                snap = cur.fetchone()
+                if not snap:
+                    raise _ControlCorrectionError(f"Contrôle du {day.strftime('%d/%m/%Y')} introuvable pour « {root_name} »", 404)
+                result = _apply_control_correction(cur, root_id, day, round(float(snap[0] or 0) + qty, 6))
+                if result["new_stock"] is not None:
+                    pushes.append((result["supplier"], result["name"], {"Stock Réel": result["new_stock"]}))
+    except _ControlCorrectionError as e:
+        return jsonify({"error": e.message}), e.status
+    finally:
+        conn.close()
+
+    sheet_errors = _push_stock_to_sheet(pushes) if pushes else []
+    return jsonify({"success": True, "answered": answered, "corrected": len(additions), "sheet_errors": sheet_errors})
+
+
 @app.route("/admin/stock/add-deliveries", methods=["POST"])
 def add_deliveries():
 
@@ -5078,6 +5364,8 @@ def add_deliveries():
     deliveries = data.get("deliveries", [])
 
     saved = 0
+    saved_ids = []
+    control_checks = []
     skipped = []
     skipped_invoices = []
 
@@ -5222,9 +5510,11 @@ def add_deliveries():
                     purchase_date,
                     expiry_date,
                     invoice_ref,
+                    invoice_date,
                     note
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING id
                 """, (
 
                     product_name,
@@ -5243,6 +5533,7 @@ def add_deliveries():
                     purchase_date,
                     expiry_date,
                     invoice_ref or None,
+                    _iso_date_or_none(d.get("invoice_date")),
 
                     f"""{"Facture " + invoice_ref + " (achats fournisseurs)" if invoice_ref else "Livraison ERP"}
 
@@ -5256,6 +5547,10 @@ Variation prix:
 {round(price_variation, 2)}%
 """
                 ))
+
+                movement_id = cur.fetchone()[0]
+                if movement_type == "ACHAT":
+                    saved_ids.append(movement_id)
 
                 saved += 1
 
@@ -5332,12 +5627,15 @@ Variation prix:
                     supplier
                 ))
 
+            control_checks = _flag_control_checks(cur, saved_ids)
+
     return jsonify({
         "success": True,
         "saved": saved,
         "skipped": skipped,
         "skipped_invoices": sorted(set(skipped_invoices)),
-        "created_products": created_products
+        "created_products": created_products,
+        "control_checks": control_checks
     })
 
 # =========================
@@ -6304,6 +6602,8 @@ def stock_invoices_import():
     skipped = []
     line_count = 0
     touched = set()
+    saved_ids = []
+    control_checks = []
 
     try:
         with conn.cursor() as cur:
@@ -6384,9 +6684,11 @@ def stock_invoices_import():
                         unit_price,
                         purchase_date,
                         invoice_ref,
+                        invoice_date,
                         note
                     )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    RETURNING id
                     """, (
                         product[0],
                         product[1],
@@ -6398,14 +6700,17 @@ def stock_invoices_import():
                         round(unit_price, 4),
                         inv["purchase_date"],
                         number,
+                        _iso_date_or_none(inv.get("invoice_date")),
                         f"Facture {number} (import PDF)\n"
                         f"{line['code']} {line['description']}\n"
                         f"{qty_invoice:g} × {float(line['unit_price']):.2f} €"
                     ))
 
+                    movement_id = cur.fetchone()[0]
                     line_count += 1
 
                     if movement_type == "ACHAT":
+                        saved_ids.append(movement_id)
                         touched.add((product[0], product[1]))
 
                         if line.get("tva") is not None and 0 <= float(line["tva"]) <= 30:
@@ -6419,6 +6724,8 @@ def stock_invoices_import():
 
             for name, supplier in touched:
                 _refresh_product_prices(cur, name, supplier)
+
+            control_checks = _flag_control_checks(cur, saved_ids)
 
         conn.commit()
 
@@ -6434,7 +6741,8 @@ def stock_invoices_import():
         "imported": imported,
         "skipped": skipped,
         "lines": line_count,
-        "created_products": [a["product_name"] for a in created]
+        "created_products": [a["product_name"] for a in created],
+        "control_checks": control_checks
     })
 
 
