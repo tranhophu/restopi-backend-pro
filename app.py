@@ -1551,6 +1551,10 @@ TABLE_WINDOW_MS = 30 * 60 * 1000
 TABLE_MAX_ORDERS = 6
 
 
+def _table_carte():
+    return menu_sync.build_public_menu(_menu_source(), list(load_products().values()))
+
+
 def _test_service(catalog, key):
     """Mode test (admin) : service choisi, quelle que soit l'heure."""
     windows = catalog["service"]["windows"]
@@ -1575,6 +1579,7 @@ def table_menu():
     payload = {"table": table, "test": test, "open": bool(service), "service": service["label"] if service else None}
     if service:
         payload.update(table_orders.public_menu(catalog, service["key"]))
+        payload["carte"] = table_orders.carte_tabs(_table_carte())
     return jsonify(payload)
 
 
@@ -1596,7 +1601,7 @@ def table_order():
         return jsonify({"error": "Les commandes sont ouvertes de 11h30 à 14h30 et de 18h30 à 22h, du lundi au samedi."}), 409
 
     try:
-        items, total = table_orders.build_items(catalog, service["key"], data.get("lines"))
+        items, total = table_orders.build_items(catalog, service["key"], data.get("lines"), _table_carte)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
@@ -1949,7 +1954,7 @@ def top_products():
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM orders")
+            cur.execute("SELECT * FROM orders WHERE COALESCE(source, 'online') NOT IN ('table_test')")
             rows = cur.fetchall()
 
     product_count = {}
