@@ -1,0 +1,98 @@
+{
+  "_aide": "Commande à table (QR). Source : Menu_Au_Ptit_Vietnam_A4_impression.pdf, pages 2 et 3. extra = supplément en euros, sur un plat ou sur un choix.",
+  "tables": [1, 2, 3, 4, 5, 6],
+  "service": {
+    "days": [0, 1, 2, 3, 4, 5],
+    "windows": [
+      { "key": "midi", "label": "Midi", "start": "11:30", "end": "14:30" },
+      { "key": "soir", "label": "Soir", "start": "18:30", "end": "22:00" }
+    ]
+  },
+  "groups": {
+    "entree_midi": [
+      { "id": "nems", "name": "Nems 3 pièces", "choices": ["Porc", "Poulet", "Crevette", "Végé"] },
+      { "id": "samoussas", "name": "Samoussas 3 pièces", "choices": ["Bœuf", "Végé"] },
+      { "id": "raviolis", "name": "Raviolis 3 pièces", "choices": ["Crevette", "Végé"] },
+      { "id": "bouchees", "name": "Bouchées vapeur 3 pièces", "choices": ["Porc", "Poulet"] },
+      { "id": "brioche", "name": "Brioche végé 2 pièces" },
+      { "id": "mix", "name": "Mix assortiment", "desc": "1 nem porc, 1 samoussa, 1 tempura" }
+    ],
+    "entree_soir": [
+      { "id": "nems", "name": "Nems 3 pièces", "choices": ["Porc", "Poulet", "Crevette", "Végé"] },
+      { "id": "samoussas", "name": "Samoussas 3 pièces", "choices": ["Bœuf", "Végé"] },
+      { "id": "raviolis", "name": "Raviolis 3 pièces", "choices": ["Crevette", "Végé"] },
+      { "id": "bouchees", "name": "Bouchées vapeur 3 pièces", "choices": ["Porc", "Poulet"] },
+      { "id": "rouleau", "name": "Rouleau de printemps", "choices": ["Porc + crevette", "Poulet + crevette", "Végé"] },
+      { "id": "brioche", "name": "Brioche", "choices": ["Porc laqué", "Végé"] }
+    ],
+    "plat_midi": [
+      { "id": "bobun", "name": "Bo bun", "choices": ["Bœuf", "Porc grillé", "Poulet", "Crevette", "Végé"] },
+      { "id": "nouilles", "name": "Nouilles sautées", "choices": ["Bœuf", "Porc laqué", "Poulet", "Crevette", "Végé"] },
+      { "id": "riz", "name": "Riz", "choices": ["Porc laqué", "Végé"] }
+    ],
+    "plat_formule": [
+      { "id": "bobun", "name": "Bo bun", "choices": ["Bœuf", "Porc grillé", "Poulet", "Végé", { "label": "Canard laqué", "extra": 1 }, { "label": "Crevettes", "extra": 1 }, { "label": "Saumon grillé", "extra": 2 }] },
+      { "id": "nouilles", "name": "Nouilles sautées", "choices": ["Bœuf", "Porc laqué", "Poulet", "Végé", { "label": "Canard laqué", "extra": 1 }, { "label": "Crevettes", "extra": 1 }, { "label": "Saumon grillé", "extra": 2 }] },
+      { "id": "riz", "name": "Riz", "choices": ["Bœuf", "Porc laqué", "Poulet", "Végé", { "label": "Canard laqué", "extra": 1 }, { "label": "Saumon grillé", "extra": 2 }] },
+      { "id": "riz_tresor", "name": "Riz au trésor", "extra": 1 }
+    ],
+    "dessert_midi": [
+      { "id": "perle", "name": "Perle de coco" },
+      { "id": "kem_xoi", "name": "Glace au riz gluant (Kem xôi)" },
+      { "id": "glace", "name": "Glace 2 boules", "choices": ["Coco", "Vanille", "Mixte"] },
+      { "id": "mochi", "name": "Mochi glacé 2 pièces", "choices": ["Mangue-passion", "Chocolat noix de coco", "Matcha", "Mixte"] }
+    ],
+    "dessert_soir": [
+      { "id": "perle", "name": "Perle de coco" },
+      { "id": "kem_xoi", "name": "Glace au riz gluant (Kem xôi)" },
+      { "id": "glace", "name": "Glace 2 boules", "choices": ["Coco", "Vanille", "Mixte"] },
+      { "id": "mochi", "name": "Mochi glacé 2 pièces", "choices": ["Mangue-passion", "Chocolat noix de coco", "Matcha", "Mixte"] },
+      { "id": "gateau", "name": "Gâteau banane", "extra": 1 },
+      { "id": "trio", "name": "Trio de desserts", "extra": 1, "choices": ["Mangue-passion", "Matcha", "Chocolat noix de coco"] }
+    ],
+    "boisson": [
+      { "id": "the", "name": "Thé glacé", "choices": ["Pêche", "Litchi", "Fraise", "Mangue"] },
+      { "id": "bubble", "name": "Bubble tea", "choices": ["Sucre de canne", "Taro", "Matcha"] },
+      { "id": "matcha", "name": "Matcha", "choices": ["Latte", "Fraise", "Mangue", "Pêche", "Litchi"] },
+      { "id": "mojito", "name": "Mojito sans alcool", "choices": ["Pêche", "Litchi", "Fraise", "Mangue"] }
+    ]
+  },
+  "formules": [
+    {
+      "id": "bonne_affaire", "name": "Bonne Affaire", "price": 17.0, "services": ["midi"],
+      "paths": [
+        { "label": "Entrée + Plat", "steps": [{ "label": "Entrée", "group": "entree_midi" }, { "label": "Plat", "group": "plat_midi" }] },
+        { "label": "Plat + Dessert", "steps": [{ "label": "Plat", "group": "plat_midi" }, { "label": "Dessert", "group": "dessert_midi" }] }
+      ]
+    },
+    {
+      "id": "excellente_affaire", "name": "Excellente Affaire", "price": 21.0, "services": ["midi"],
+      "paths": [
+        { "label": "Entrée + Plat + Dessert", "steps": [{ "label": "Entrée", "group": "entree_midi" }, { "label": "Plat", "group": "plat_midi" }, { "label": "Dessert", "group": "dessert_midi" }] }
+      ]
+    },
+    {
+      "id": "plat_boisson", "name": "Plat + Boisson maison", "price": 18.9, "services": ["midi", "soir"],
+      "paths": [
+        { "label": "Plat + Boisson", "steps": [{ "label": "Plat", "group": "plat_formule" }, { "label": "Boisson", "group": "boisson" }] }
+      ]
+    },
+    {
+      "id": "menu_soir", "name": "Menu Soir", "price": 22.9, "services": ["soir"],
+      "paths": [
+        { "label": "Entrée + Plat + Dessert", "steps": [{ "label": "Entrée", "group": "entree_soir" }, { "label": "Plat", "group": "plat_formule" }, { "label": "Dessert", "group": "dessert_soir" }] }
+      ]
+    },
+    {
+      "id": "menu_duo", "name": "Menu Duo", "desc": "Pour 2 personnes", "price": 54.9, "services": ["soir"],
+      "fixed": ["Planche Apéro Viet"],
+      "paths": [
+        { "label": "Planche + 2 plats + 2 boissons", "steps": [{ "label": "Plat 1", "group": "plat_formule" }, { "label": "Plat 2", "group": "plat_formule" }, { "label": "Boisson 1", "group": "boisson" }, { "label": "Boisson 2", "group": "boisson" }] }
+      ],
+      "addon": {
+        "label": "2 desserts au choix", "price": 7.9,
+        "steps": [{ "label": "Dessert 1", "group": "dessert_soir" }, { "label": "Dessert 2", "group": "dessert_soir" }]
+      }
+    }
+  ]
+}

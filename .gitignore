@@ -1,0 +1,15 @@
+# ENV
+.env
+
+# Google credentials
+restopi-stock-sync.json
+
+# Python
+__pycache__/
+*.pyc
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db

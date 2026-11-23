@@ -26,6 +26,10 @@ import sheet_duplicates
 import threading
 import difflib
 import unicodedata
+import hmac
+from functools import wraps
+import segno
+import table_orders
 
 paris_tz = pytz.timezone("Europe/Paris")
 
@@ -38,7 +42,7 @@ else:
     # chạy local → dùng public   ggggg
     DATABASE_URL = os.environ.get("DATABASE_PUBLIC_URL")
 
-print("Using DB:", DATABASE_URL)
+print("Base de données configurée:", bool(DATABASE_URL))
 
 def get_conn():
 
@@ -130,6 +134,9 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")
+PRINTER_TOKEN = os.environ.get("PRINTER_TOKEN")
+TABLE_SECRET = os.environ.get("TABLE_SECRET")
+TABLE_PAGE_URL = "https://aupetitvietnam.com/commande-table.html"
 
 if not ADMIN_PASSWORD or not ADMIN_TOKEN:
     raise Exception("Missing ADMIN credentials in ENV")
@@ -192,6 +199,24 @@ def check_admin(req):
         return False
 
     return True
+
+
+def check_kitchen(req):
+    """Cuisine : jeton de l'imprimante ou jeton admin (écran print.html)."""
+    token = (req.headers.get("Authorization") or "").encode()
+    return any(
+        allowed and hmac.compare_digest(token, allowed.encode())
+        for allowed in (PRINTER_TOKEN, ADMIN_TOKEN)
+    )
+
+
+def kitchen_required(view):
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        if not check_kitchen(request):
+            return jsonify({"error": "unauthorized"}), 403
+        return view(*args, **kwargs)
+    return wrapper
 
 # =========================
 # PRODUCTS DATABASE
@@ -297,6 +322,12 @@ def init_db():
                 total FLOAT,
                 printed BOOLEAN DEFAULT FALSE
             );
+            """)
+            # source = 'table' : à payer en caisse, hors chiffre d'affaires en ligne
+            cur.execute("""
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'online',
+            ADD COLUMN IF NOT EXISTS table_number INTEGER;
             """)
 
 init_db()
@@ -839,68 +870,87 @@ def init_stock():
 
 init_stock()
 
-@app.route("/customer/set-pin", methods=["POST"])
-def customer_set_pin():
-    data = request.get_json()
-    email = (data.get("email") or "").strip().lower()
-    phone = (data.get("phone") or "").strip()
-    pin = (data.get("pin") or "").strip()
+PIN_MAX_ATTEMPTS = 5
+PIN_LOCK_MINUTES = 15
+PIN_LOCK_MAX_MINUTES = 24 * 60
+# même message partout : la réponse ne dit jamais si un email a un compte
+PIN_ERROR = "Email ou code PIN incorrect, ou trop d'essais. Réessayez plus tard ou cliquez sur « Code oublié ? »."
+PIN_EMAIL_MAX_PER_HOUR = 3
+PIN_EMAIL_MESSAGE = "Si cet email a un compte fidélité, un lien vient d'être envoyé."
+# même temps de réponse, que l'email existe ou non
+_DUMMY_PIN_HASH = generate_password_hash("0000")
 
-    if not email:
-        return jsonify({"error": "Email manquant"}), 400
 
-    if not pin or len(pin) != 4 or not pin.isdigit():
-        return jsonify({"error": "Le PIN doit contenir exactement 4 chiffres"}), 400
+def verify_customer_pin(email, pin):
+    """(points, None) si le PIN est bon, sinon (None, (message, code HTTP)).
 
-    pin_hash = generate_password_hash(pin)
+    Chaque 5e erreur bloque le compte : 15 min, puis le double, jusqu'à 24 h.
+    Le lien « Code oublié » débloque le compte.
+    """
+    if not email or not re.fullmatch(r"\d{4}", pin or ""):
+        return None, (PIN_ERROR, 401)
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, pin_hash FROM customers WHERE email = %s", (email,))
-            row = cur.fetchone()
-
-            if row:
+    conn = get_conn()
+    try:
+        conn.autocommit = False
+        with conn:
+            with conn.cursor() as cur:
+                # FOR UPDATE : des essais simultanés ne contournent pas le compteur
                 cur.execute("""
-                    UPDATE customers
-                    SET phone = COALESCE(NULLIF(%s, ''), phone),
-                        pin_hash = %s
+                    SELECT pin_hash, points, pin_failed_attempts,
+                           COALESCE(pin_locked_until > NOW(), FALSE)
+                    FROM customers
                     WHERE email = %s
-                """, (phone, pin_hash, email))
-            else:
-                cur.execute("""
-                    INSERT INTO customers (email, phone, pin_hash, points)
-                    VALUES (%s, %s, %s, 0)
-                """, (email, phone, pin_hash))
+                    FOR UPDATE
+                """, (email,))
+                row = cur.fetchone()
 
-    return jsonify({
-        "success": True,
-        "message": "PIN enregistré avec succès"
-    })
+                if not row or not row[0]:
+                    check_password_hash(_DUMMY_PIN_HASH, pin)
+                    return None, (PIN_ERROR, 401)
+
+                pin_hash, points, failed, locked = row
+                if locked:
+                    return None, (PIN_ERROR, 401)
+
+                if check_password_hash(pin_hash, pin):
+                    if failed:
+                        cur.execute("""
+                            UPDATE customers
+                            SET pin_failed_attempts = 0, pin_locked_until = NULL
+                            WHERE email = %s
+                        """, (email,))
+                    return points, None
+
+                failed += 1
+                if failed % PIN_MAX_ATTEMPTS == 0:
+                    minutes = min(
+                        PIN_LOCK_MINUTES * 2 ** (failed // PIN_MAX_ATTEMPTS - 1),
+                        PIN_LOCK_MAX_MINUTES,
+                    )
+                    cur.execute("""
+                        UPDATE customers
+                        SET pin_failed_attempts = %s,
+                            pin_locked_until = NOW() + (%s * INTERVAL '1 minute')
+                        WHERE email = %s
+                    """, (failed, minutes, email))
+                    return None, (PIN_ERROR, 401)
+
+                cur.execute("UPDATE customers SET pin_failed_attempts = %s WHERE email = %s", (failed, email))
+                return None, (PIN_ERROR, 401)
+    finally:
+        conn.close()
+
 
 @app.route("/customer/verify-pin", methods=["POST"])
 def customer_verify_pin():
-    data = request.get_json()
-    email = (data.get("email") or "").strip().lower()
-    pin = (data.get("pin") or "").strip()
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email") or "").strip().lower()
+    pin = str(data.get("pin") or "").strip()
 
-    if not email or not pin:
-        return jsonify({"error": "Email ou PIN manquant"}), 400
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT pin_hash, points FROM customers WHERE email = %s", (email,))
-            row = cur.fetchone()
-
-    if not row:
-        return jsonify({"error": "Client introuvable"}), 404
-
-    pin_hash, points = row
-
-    if not pin_hash:
-        return jsonify({"error": "Aucun PIN défini pour ce client"}), 400
-
-    if not check_password_hash(pin_hash, pin):
-        return jsonify({"error": "PIN incorrect"}), 401
+    points, error = verify_customer_pin(email, pin)
+    if error:
+        return jsonify({"error": error[0]}), error[1]
 
     return jsonify({
         "success": True,
@@ -909,57 +959,70 @@ def customer_verify_pin():
 
 @app.route("/customer/redeem-points", methods=["POST"])
 def customer_redeem_points():
-    data = request.get_json()
-    email = (data.get("email") or "").strip().lower()
-    pin = (data.get("pin") or "").strip()
-    points_to_use = int(data.get("points_to_use", 0))
-
-    if not email or not pin:
-        return jsonify({"error": "Email ou PIN manquant"}), 400
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email") or "").strip().lower()
+    pin = str(data.get("pin") or "").strip()
+    try:
+        points_to_use = int(data.get("points_to_use", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Nombre de points invalide"}), 400
 
     if points_to_use <= 0:
         return jsonify({"error": "Nombre de points invalide"}), 400
 
+    _, error = verify_customer_pin(email, pin)
+    if error:
+        return jsonify({"error": error[0]}), error[1]
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT id, pin_hash, points
-                FROM customers
-                WHERE email = %s
-            """, (email,))
+                UPDATE customers
+                SET points = points - %s
+                WHERE email = %s AND points >= %s
+                RETURNING points
+            """, (points_to_use, email, points_to_use))
             row = cur.fetchone()
 
-            if not row:
-                return jsonify({"error": "Client introuvable"}), 404
-
-            customer_id, pin_hash, current_points = row
-
-            if not pin_hash or not check_password_hash(pin_hash, pin):
-                return jsonify({"error": "PIN incorrect"}), 401
-
-            if current_points < points_to_use:
-                return jsonify({"error": "Points insuffisants"}), 400
-
-            new_points = current_points - points_to_use
-
-            cur.execute("""
-                UPDATE customers
-                SET points = %s
-                WHERE id = %s
-            """, (new_points, customer_id))
+    if not row:
+        return jsonify({"error": "Points insuffisants"}), 400
 
     discount_eur = points_to_use / 10
 
     return jsonify({
         "success": True,
-        "points_restants": new_points,
+        "points_restants": row[0],
         "discount_eur": discount_eur
     })
 
+def _send_pin_email(email, token):
+    reset_link = f"https://aupetitvietnam.com/reset-pin.html?token={token}"
+    try:
+        resend.api_key = RESEND_API_KEY
+        resend.Emails.send({
+            "from": "Au P'tit Vietnam <contact@pierregroupe.com>",
+            "to": [email],
+            "subject": "Votre code PIN fidélité",
+            "html": f"""
+                <p>Bonjour,</p>
+                <p>Vous avez demandé à créer ou réinitialiser votre code PIN fidélité.</p>
+                <p>
+                <a href="{reset_link}" style="display:inline-block;padding:10px 18px;background:#00cdbd;color:#fff;text-decoration:none;border-radius:8px;">
+                    Choisir mon code PIN
+                </a>
+                </p>
+                <p>Ce lien expire dans 30 minutes.</p>
+                <p>Si vous n'êtes pas à l'origine de cette demande, ignorez cet email.</p>
+            """
+        })
+    except Exception as e:
+        print("Erreur email PIN:", e)
+
+
 @app.route("/customer/request-pin-reset", methods=["POST"])
 def request_pin_reset():
-    data = request.get_json()
-    email = (data.get("email") or "").strip().lower()
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email") or "").strip().lower()
 
     if not email:
         return jsonify({"error": "Email manquant"}), 400
@@ -969,45 +1032,32 @@ def request_pin_reset():
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM customers WHERE email = %s", (email,))
-            row = cur.fetchone()
+            # 3 emails par heure et par compte ; au-delà, le dernier lien reste valable
+            cur.execute("""
+                UPDATE customers
+                SET reset_token = %s,
+                    reset_token_expiry = %s,
+                    pin_email_count = CASE
+                        WHEN pin_email_window IS NULL OR pin_email_window <= NOW() - INTERVAL '1 hour' THEN 1
+                        ELSE pin_email_count + 1
+                    END,
+                    pin_email_window = CASE
+                        WHEN pin_email_window IS NULL OR pin_email_window <= NOW() - INTERVAL '1 hour' THEN NOW()
+                        ELSE pin_email_window
+                    END
+                WHERE email = %s
+                  AND (pin_email_window IS NULL
+                       OR pin_email_window <= NOW() - INTERVAL '1 hour'
+                       OR pin_email_count < %s)
+                RETURNING id
+            """, (token, expiry, email, PIN_EMAIL_MAX_PER_HOUR))
+            allowed = cur.fetchone()
 
-            if row:
-                cur.execute("""
-                    UPDATE customers
-                    SET reset_token = %s,
-                        reset_token_expiry = %s
-                    WHERE email = %s
-                """, (token, expiry, email))
+    # en arrière-plan : le temps de réponse ne révèle pas si le compte existe
+    if allowed:
+        threading.Thread(target=_send_pin_email, args=(email, token), daemon=True).start()
 
-                reset_link = f"https://aupetitvietnam.com/reset-pin.html?token={token}"
-
-                try:
-                    resend.api_key = RESEND_API_KEY
-                    resend.Emails.send({
-                        "from": "Au P'tit Vietnam <contact@pierregroupe.com>",
-                        "to": [email],
-                        "subject": "Réinitialisation de votre PIN fidélité",
-                        "html": f"""
-                            <p>Bonjour,</p>
-                            <p>Vous avez demandé la réinitialisation de votre PIN fidélité.</p>
-                            <p>
-                            <a href="{reset_link}" style="display:inline-block;padding:10px 18px;background:#00cdbd;color:#fff;text-decoration:none;border-radius:8px;">
-                                Réinitialiser mon PIN
-                            </a>
-                            </p>
-                            <p>Ce lien expire dans 30 minutes.</p>
-                            <p>Si vous n'êtes pas à l'origine de cette demande, ignorez cet email.</p>
-                        """
-                    })
-                except Exception as e:
-                    print("Erreur email reset PIN:", e)
-                    return jsonify({"error": "Impossible d'envoyer l'email"}), 500
-
-    return jsonify({
-        "success": True,
-        "message": "Si cet email existe, un lien de réinitialisation a été envoyé."
-    })
+    return jsonify({"success": True, "message": PIN_EMAIL_MESSAGE})
 
 @app.route("/customer/check-reset-token", methods=["POST"])
 def check_reset_token():
@@ -1081,7 +1131,9 @@ def reset_pin():
                 UPDATE customers
                 SET pin_hash = %s,
                     reset_token = NULL,
-                    reset_token_expiry = NULL
+                    reset_token_expiry = NULL,
+                    pin_failed_attempts = 0,
+                    pin_locked_until = NULL
                 WHERE id = %s
             """, (new_pin_hash, customer_id))
 
@@ -1153,34 +1205,15 @@ def create_checkout_session():
     email = (client.get("email") or "").strip().lower()
     pin = (data.get("pin") or "").strip()
 
-    real_points = 0
-    pin_hash = None
+    # le solde n'est lu qu'après un PIN correct : rien à déduire de la réponse
+    requested_points = (max(points_used, 0) // 100) * 100
+    valid_points = 0
 
-    if email:
-        with get_conn() as conn:
-   
-            with conn.cursor() as cur:
-                cur.execute("SELECT pin_hash, points FROM customers WHERE email = %s", (email,))
-                row = cur.fetchone()
-                if row:
-                    pin_hash, real_points = row
-
-    # không cho dùng quá số point thật
-    points_used = min(points_used, real_points)
-
-    # round chuẩn
-    valid_points = (points_used // 100) * 100
-
-    # ✅ nếu có dùng điểm thì bắt buộc check PIN
-    if valid_points > 0:
-        if not pin_hash:
-            return jsonify({"error": "Aucun PIN défini pour ce client"}), 400
-
-        if not pin:
-            return jsonify({"error": "PIN manquant"}), 400
-
-        if not check_password_hash(pin_hash, pin):
-            return jsonify({"error": "PIN incorrect"}), 401
+    if requested_points > 0:
+        real_points, error = verify_customer_pin(email, pin)
+        if error:
+            return jsonify({"error": error[0]}), error[1]
+        valid_points = (min(requested_points, real_points) // 100) * 100
 
     discount_eur = (valid_points / 100) * 10
 
@@ -1440,59 +1473,14 @@ COMMANDE:
 
         print(f"🎁 Points ajoutés: {points_earned}")
 
-@app.route("/next-order", methods=["GET"])
-def next_order():
-    with get_conn() as conn:
-   
-        with conn.cursor() as cur:
-            cur.execute("""
-            SELECT * FROM orders
-            WHERE printed = FALSE
-            ORDER BY id ASC
-            LIMIT 1
-            """)
-            row = cur.fetchone()
+ORDER_COLUMNS = "id, date, nom, prenom, tel, adresse, pickup_time, note, items, total, printed, source, table_number"
 
-            if not row:
-                return jsonify({"message": "no order"})
 
-            items = row[8]
-            if isinstance(items, str):
-                items = json.loads(items)
-
-            return jsonify({
-                "id": row[0],
-                "date": row[1],
-                "nom": row[2],
-                "prenom": row[3],
-                "tel": row[4],
-                "adresse": row[5],
-                "pickup_time": row[6],
-                "note": row[7],
-                "items": items,
-                "total": row[9],
-                "printed": row[10]
-            })
-
-@app.route("/last-order", methods=["GET"])
-def last_order():
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-            SELECT * FROM orders
-            ORDER BY id DESC
-            LIMIT 1
-            """)
-            row = cur.fetchone()
-
-    if not row:
-        return jsonify({"message": "no order"})
-
+def _order_json(row):
     items = row[8]
     if isinstance(items, str):
         items = json.loads(items)
-
-    return jsonify({
+    return {
         "id": row[0],
         "date": row[1],
         "nom": row[2],
@@ -1503,54 +1491,150 @@ def last_order():
         "note": row[7],
         "items": items,
         "total": row[9],
-        "printed": row[10]
-    })
+        "printed": row[10],
+        "source": row[11] or "online",
+        "table": row[12],
+    }
+
+
+@app.route("/next-order", methods=["GET"])
+@kitchen_required
+def next_order():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {ORDER_COLUMNS} FROM orders WHERE printed = FALSE ORDER BY id ASC LIMIT 1")
+            row = cur.fetchone()
+    return jsonify(_order_json(row) if row else {"message": "no order"})
+
+
+@app.route("/last-order", methods=["GET"])
+@kitchen_required
+def last_order():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {ORDER_COLUMNS} FROM orders ORDER BY id DESC LIMIT 1")
+            row = cur.fetchone()
+    return jsonify(_order_json(row) if row else {"message": "no order"})
+
 
 @app.route("/orders-history", methods=["GET"])
+@kitchen_required
 def orders_history():
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-            SELECT * FROM orders
-            ORDER BY id DESC
-            LIMIT 20
-            """)
+            cur.execute(f"SELECT {ORDER_COLUMNS} FROM orders ORDER BY id DESC LIMIT 20")
             rows = cur.fetchall()
+    return jsonify([_order_json(row) for row in rows])
 
-    result = []
-    for row in rows:
-        items = row[8]
-        if isinstance(items, str):
-            items = json.loads(items)
-
-        result.append({
-            "id": row[0],
-            "date": row[1],
-            "nom": row[2],
-            "prenom": row[3],
-            "tel": row[4],
-            "adresse": row[5],
-            "pickup_time": row[6],
-            "note": row[7],
-            "items": items,
-            "total": row[9],
-            "printed": row[10]
-        })
-
-    return jsonify(result)
 
 @app.route("/mark-printed", methods=["POST"])
+@kitchen_required
 def mark_printed():
-    data = request.json
-    order_id = data.get("id")
+    data = request.get_json(silent=True) or {}
+    try:
+        order_id = int(data.get("id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "id invalide"}), 400
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-            UPDATE orders SET printed = TRUE WHERE id = %s
-            """, (order_id,))
+            cur.execute("UPDATE orders SET printed = TRUE WHERE id = %s", (order_id,))
 
     return jsonify({"status": "ok"})
+
+
+# =========================
+# COMMANDE À TABLE (QR)
+# =========================
+TABLE_COOLDOWN_MS = 15 * 1000
+TABLE_WINDOW_MS = 30 * 60 * 1000
+TABLE_MAX_ORDERS = 6
+
+
+@app.route("/table/menu", methods=["GET"])
+def table_menu():
+    catalog = table_orders.load_catalog()
+    table = table_orders.verify_table(catalog, TABLE_SECRET, request.args.get("t"), request.args.get("k"))
+    if not table:
+        return jsonify({"error": "QR code invalide"}), 403
+
+    service = table_orders.current_service(catalog, datetime.now(paris_tz))
+    payload = {"table": table, "open": bool(service), "service": service["label"] if service else None}
+    if service:
+        payload.update(table_orders.public_menu(catalog, service["key"]))
+    return jsonify(payload)
+
+
+@app.route("/table/order", methods=["POST"])
+def table_order():
+    data = request.get_json(silent=True) or {}
+    catalog = table_orders.load_catalog()
+    table = table_orders.verify_table(catalog, TABLE_SECRET, data.get("t"), data.get("k"))
+    if not table:
+        return jsonify({"error": "QR code invalide"}), 403
+
+    now = datetime.now(paris_tz)
+    service = table_orders.current_service(catalog, now)
+    if not service:
+        return jsonify({"error": "Les commandes sont ouvertes de 11h30 à 14h30 et de 18h30 à 22h, du lundi au samedi."}), 409
+
+    try:
+        items, total = table_orders.build_items(catalog, service["key"], data.get("lines"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    now_ms = int(now.timestamp() * 1000)
+    order_id = now_ms + random.randint(0, 999)
+
+    conn = get_conn()
+    try:
+        conn.autocommit = False
+        with conn:
+            with conn.cursor() as cur:
+                # une table à la fois : un double appui ne sort jamais deux tickets
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (770000 + table,))
+                cur.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM orders "
+                    "WHERE source = 'table' AND table_number = %s AND id >= %s",
+                    (table, now_ms - TABLE_WINDOW_MS),
+                )
+                count, last_id = cur.fetchone()
+                if last_id >= now_ms - TABLE_COOLDOWN_MS:
+                    return jsonify({"error": "Commande déjà reçue. Patientez quelques secondes avant d'en envoyer une autre."}), 429
+                if count >= TABLE_MAX_ORDERS:
+                    return jsonify({"error": "Trop de commandes pour cette table. Merci d'appeler un serveur."}), 429
+                cur.execute(
+                    """
+                    INSERT INTO orders (
+                        id, date, nom, prenom, tel, adresse, pickup_time,
+                        note, items, total, printed, source, table_number
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,FALSE,'table',%s)
+                    """,
+                    (
+                        order_id, now.strftime("%d/%m/%Y %H:%M:%S"), f"Table {table}", "", "",
+                        "Sur place - 1er étage", "À payer en caisse",
+                        table_orders.clean_note(data.get("note")),
+                        json.dumps(items, ensure_ascii=False), total, table,
+                    ),
+                )
+    finally:
+        conn.close()
+
+    return jsonify({"success": True, "id": order_id, "total": total})
+
+
+@app.route("/admin/table-links", methods=["GET"])
+def admin_table_links():
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+    if not TABLE_SECRET:
+        return jsonify({"error": "TABLE_SECRET manquant sur le serveur"}), 503
+
+    links = []
+    for table in table_orders.load_catalog()["tables"]:
+        url = f"{TABLE_PAGE_URL}?t={table}&k={table_orders.table_key(TABLE_SECRET, table)}"
+        links.append({"table": table, "url": url, "svg": segno.make(url, error="m").svg_inline(omitsize=True, border=4)})
+    return jsonify(links)
 
 @app.route("/contact", methods=["POST"])
 def contact():
@@ -1676,33 +1760,10 @@ def get_orders():
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-            SELECT * FROM orders
-            ORDER BY id DESC
-            """)
+            cur.execute(f"SELECT {ORDER_COLUMNS} FROM orders ORDER BY id DESC")
             rows = cur.fetchall()
 
-    result = []
-    for row in rows:
-        items = row[8]
-        if isinstance(items, str):
-            items = json.loads(items)
-
-        result.append({
-            "id": row[0],
-            "date": row[1],
-            "nom": row[2],
-            "prenom": row[3],
-            "tel": row[4],
-            "adresse": row[5],
-            "pickup_time": row[6],
-            "note": row[7],
-            "items": items,
-            "total": row[9],
-            "printed": row[10]
-        })
-
-    return jsonify(result)
+    return jsonify([_order_json(row) for row in rows])
 
 @app.route("/admin/stats", methods=["GET"])
 def get_stats():
@@ -1713,7 +1774,7 @@ def get_stats():
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM orders")
+            cur.execute("SELECT * FROM orders WHERE COALESCE(source, 'online') <> 'table'")
             rows = cur.fetchall()
 
     total_today = 0
@@ -1913,60 +1974,29 @@ def init_customers():
             ADD COLUMN IF NOT EXISTS points INTEGER DEFAULT 0,
             ADD COLUMN IF NOT EXISTS reset_token TEXT,
             ADD COLUMN IF NOT EXISTS reset_token_expiry TIMESTAMP,
-            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW(),
+            ADD COLUMN IF NOT EXISTS pin_failed_attempts INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS pin_locked_until TIMESTAMP,
+            ADD COLUMN IF NOT EXISTS pin_email_count INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS pin_email_window TIMESTAMP;
             """)
 
 init_customers()
 
-@app.route("/points", methods=["POST"])
-def get_points():
-    data = request.json
-    email = data.get("email")
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT points FROM customers WHERE email = %s", (email,))
-            row = cur.fetchone()
-
-    return jsonify({
-        "points": row[0] if row else 0
-    })
-
 @app.route("/pending-orders", methods=["GET"])
+@kitchen_required
 def pending_orders():
-    limit = request.args.get("limit", 20, type=int)
+    limit = max(1, min(request.args.get("limit", 20, type=int), 50))
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-            SELECT * FROM orders
-            WHERE printed = FALSE
-            ORDER BY id ASC
-            LIMIT %s
-            """, (limit,))
+            cur.execute(
+                f"SELECT {ORDER_COLUMNS} FROM orders WHERE printed = FALSE ORDER BY id ASC LIMIT %s",
+                (limit,),
+            )
             rows = cur.fetchall()
 
-    result = []
-    for row in rows:
-        items = row[8]
-        if isinstance(items, str):
-            items = json.loads(items)
-
-        result.append({
-            "id": row[0],
-            "date": row[1],
-            "nom": row[2],
-            "prenom": row[3],
-            "tel": row[4],
-            "adresse": row[5],
-            "pickup_time": row[6],
-            "note": row[7],
-            "items": items,
-            "total": row[9],
-            "printed": row[10]
-        })
-
-    return jsonify(result)
+    return jsonify([_order_json(row) for row in rows])
 
 # =========================
 # STOCK API
