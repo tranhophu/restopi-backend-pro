@@ -3306,18 +3306,22 @@ def _purchases_between(cur, supplier, start, end, name=None):
     out = {}
     for key, d, q, u in cur.fetchall():
         out.setdefault(key, []).append((d, float(q or 0), u))
-    # 🔗 achats des formes liées (carton) : comptés sur le produit parent, en unité stock
-    for _, key, d, q, u in _linked_purchase_rows(cur, supplier=supplier, start=start, end=end, parent_name=name):
+    # 🔗 achats des formes liées (carton) : comptés sur le produit parent, en unité stock.
+    # Historique : y compris avant la liaison, pour que la consommation de ces périodes soit complète.
+    for _, key, d, q, u in _linked_purchase_rows(cur, supplier=supplier, start=start, end=end, parent_name=name,
+                                                 include_before_link=True):
         out.setdefault(key, []).append((d, q, u))
     return out
 
 
 def _linked_purchase_rows(cur, supplier=None, start=None, end=None, parent_name=None,
-                          parent_ids=None, after_control=False):
+                          parent_ids=None, after_control=False, include_before_link=False):
     """
     Achats des formes d'achat liées, rattachés au produit parent et convertis en unité stock
-    (2 carton de 15 → 30 pce). Seuls les achats APRÈS la date de liaison comptent : les précédents
-    sont déjà dans le stock compté à la liaison. Unité inconnue : gardée telle quelle (signalée « ? »).
+    (2 carton de 15 → 30 pce). Par défaut (stock théorique), seuls les achats APRÈS la date de liaison
+    comptent : les précédents sont déjà dans le stock compté à la liaison.
+    include_before_link=True (historique / consommation) : tous les achats de la forme.
+    Unité inconnue : gardée telle quelle (signalée « ? »).
     → [(parent_id, parent_nom_minuscule, date, quantité, unité)]
     """
     sql = """
@@ -3330,8 +3334,9 @@ def _linked_purchase_rows(cur, supplier=None, start=None, end=None, parent_name=
       ON LOWER(TRIM(m.product_name)) = LOWER(TRIM(c.name))
      AND LOWER(TRIM(m.supplier)) = LOWER(TRIM(c.supplier))
     WHERE m.movement_type IN ('ACHAT', 'RETOUR')
-    AND m.purchase_date > c.stock_link_from
     """
+    if not include_before_link:
+        sql += " AND m.purchase_date > c.stock_link_from"
     params = []
     if supplier is not None:
         sql += " AND LOWER(TRIM(c.supplier)) = LOWER(TRIM(%s))"
