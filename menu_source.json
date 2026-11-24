@@ -32,7 +32,7 @@
         { "name": "Samoussa au choix – 4 pièces", "desc": "Bœuf ou végé", "img": "menu_samoussa_4_pieces.jpg", "replace_img": true,
           "variants": [{ "label": "Bœuf", "product": "Samoussa au bœuf – 4 pièces", "price": 7.5 }, { "label": "Végé", "product": "Samoussa végé – 4 pièces", "price": 7.5 }] },
         { "name": "Tempura", "desc": "5 pièces", "img": "tempura.png", "variants": [{ "id": 62, "price": 7.9 }] },
-        { "name": "Mix assortiment nems", "desc": "5 pièces : 1 nem porc, 1 nem poulet, 1 nem crevette, 1 samoussa, 1 tempura", "img": "nem.png",
+        { "name": "Mix assortiment nems", "desc": "5 pièces : 1 nem porc, 1 nem poulet, 1 nem crevette, 1 samoussa, 1 tempura", "img": "Mix nems 5 pces.png",
           "variants": [{ "product": "Mix assortiment nems", "price": 7.9 }] }
       ]
     },
@@ -45,7 +45,7 @@
             { "label": "Crevette", "product": "Bouchée vapeur crevette – 3 pièces", "price": 4.9 },
             { "label": "Porc et crevette (+1€)", "id": 64, "price": 5.9, "img": "bouchee_au_porc_crevette.png" }
           ] },
-        { "name": "Bouchée vapeur au choix – 4 pièces", "desc": "Porc, poulet, crevette · porc et crevette +1,00 €", "img": "menu_bouchee_vapeur.jpg",
+        { "name": "Bouchée vapeur au choix – 4 pièces", "desc": "Porc, poulet, crevette · porc et crevette +1,00 €", "img": "Bouche au porc 4 pces.png",
           "variants": [
             { "label": "Porc", "product": "Bouchée vapeur porc – 4 pièces", "price": 5.9 }, { "label": "Poulet", "product": "Bouchée vapeur poulet – 4 pièces", "price": 5.9 },
             { "label": "Crevette", "product": "Bouchée vapeur crevette – 4 pièces", "price": 5.9 },
@@ -53,11 +53,11 @@
           ] },
         { "name": "Raviolis au choix – 3 pièces", "hidden": true, "desc": "Crevette ou végé", "img": "raviolis_aux_crevettes.png",
           "variants": [{ "label": "Crevette", "id": 9, "price": 4.9 }, { "label": "Végé", "id": 55, "price": 4.9 }] },
-        { "name": "Raviolis au choix – 4 pièces", "desc": "Crevette ou végé", "img": "raviolis_aux_crevettes.png",
+        { "name": "Raviolis au choix – 4 pièces", "desc": "Crevette ou végé", "img": "Raviolis 4 pces.png",
           "variants": [{ "label": "Crevette", "product": "Raviolis aux crevettes – 4 pièces", "price": 5.9 }, { "label": "Végé", "product": "Raviolis végé – 4 pièces", "price": 5.9 }] },
         { "name": "Brioche au choix", "desc": "Porc laqué 5,50 € · végé 4,90 €", "img": "brioche.png",
           "variants": [{ "label": "Porc laqué", "id": 3, "price": 5.5 }, { "label": "Végé", "id": 4, "price": 4.9 }] },
-        { "name": "Mix assortiment vapeur", "desc": "5 pièces au choix : porc, poulet, crevette ou porc et crevette", "img": "menu_bouchee_vapeur.jpg",
+        { "name": "Mix assortiment vapeur", "desc": "5 pièces au choix : porc, poulet, crevette ou porc et crevette", "img": "Mix assotissement vapeur 5pces.png",
           "variants": [{ "product": "Mix assortiment vapeur", "price": 7.9,
             "choose": { "label": "Pièce", "count": 5, "from": ["Porc", "Poulet", "Crevette", "Porc et crevette"] } }] }
       ]
