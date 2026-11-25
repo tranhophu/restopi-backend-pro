@@ -28,6 +28,8 @@ def table_key(secret, table):
 
 
 FREE_TABLE = "libre"
+NO_TABLE = 0  # QR général, « On ne sait pas » : le client donne son nom à la place
+MAX_NAME = 40
 
 
 def is_free_key(secret, key):
@@ -35,13 +37,21 @@ def is_free_key(secret, key):
     return bool(secret and key) and hmac.compare_digest(table_key(secret, FREE_TABLE), str(key))
 
 
+def clean_name(name):
+    text = " ".join(str(name or "").split())
+    return text[:MAX_NAME]
+
+
 def verify_table(catalog, secret, table, key):
+    """Numéro de table (int) ou None. NO_TABLE seulement avec le QR général."""
     if not secret or not key:
         return None
     try:
         number = int(table)
     except (TypeError, ValueError):
         return None
+    if number == NO_TABLE:
+        return NO_TABLE if is_free_key(secret, key) else None
     if number not in catalog["tables"]:
         return None
     if hmac.compare_digest(table_key(secret, number), str(key)) or is_free_key(secret, key):

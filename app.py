@@ -1570,7 +1570,7 @@ def table_menu():
             return jsonify({"error": "QR code invalide"}), 403
         return jsonify({"choose": catalog["tables"]})
     table = table_orders.verify_table(catalog, TABLE_SECRET, request.args.get("t"), request.args.get("k"))
-    if not table:
+    if table is None:
         return jsonify({"error": "QR code invalide"}), 403
 
     test = request.args.get("test") == "1"
@@ -1593,8 +1593,12 @@ def table_order():
     data = request.get_json(silent=True) or {}
     catalog = table_orders.load_catalog()
     table = table_orders.verify_table(catalog, TABLE_SECRET, data.get("t"), data.get("k"))
-    if not table:
+    if table is None:
         return jsonify({"error": "QR code invalide"}), 403
+    no_table = table == table_orders.NO_TABLE
+    name = table_orders.clean_name(data.get("nom"))
+    if no_table and not name:
+        return jsonify({"error": "Indiquez votre nom pour que le serveur vous trouve."}), 400
 
     test = data.get("test") is True
     if test and not check_admin(request):
@@ -1611,9 +1615,13 @@ def table_order():
         return jsonify({"error": str(e)}), 400
 
     note = table_orders.clean_note(data.get("note"))
-    if table_orders.is_free_key(TABLE_SECRET, data.get("k")):
+    if no_table:
+        # pas de numéro : le serveur cherche le client par son nom
+        note = f"SANS TABLE - client : {name}. {note}".strip()
+    elif table_orders.is_free_key(TABLE_SECRET, data.get("k")):
         # numéro tapé par le client : le serveur peut vérifier en salle
         note = f"QR GENERAL - table indiquee par le client. {note}".strip()
+    label = f"Sans table - {name}" if no_table else f"Table {table}"
     if test:
         # visible sur le ticket avec l'imprimante actuelle : la cuisine ne prépare pas
         note = f"TEST - NE PAS PREPARER. {note}".strip()
@@ -1630,10 +1638,12 @@ def table_order():
             with conn.cursor() as cur:
                 # une table à la fois : un double appui ne sort jamais deux tickets
                 cur.execute("SELECT pg_advisory_xact_lock(%s)", (770000 + table,))
+                # sans table : limites comptées par nom, pas pour tous les clients « sans table »
                 cur.execute(
                     "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM orders "
-                    "WHERE source = 'table' AND table_number = %s AND id >= %s",
-                    (table, now_ms - TABLE_WINDOW_MS),
+                    "WHERE source = 'table' AND table_number = %s AND id >= %s"
+                    + (" AND nom = %s" if no_table else ""),
+                    (table, now_ms - TABLE_WINDOW_MS) + ((label,) if no_table else ()),
                 )
                 count, last_id = cur.fetchone()
                 if not test and last_id >= now_ms - TABLE_COOLDOWN_MS:
@@ -1648,7 +1658,7 @@ def table_order():
                     ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,FALSE,%s,%s)
                     """,
                     (
-                        order_id, now.strftime("%d/%m/%Y %H:%M:%S"), f"{'TEST ' if test else ''}Table {table}", "", "",
+                        order_id, now.strftime("%d/%m/%Y %H:%M:%S"), f"{'TEST ' if test else ''}{label}", "", "",
                         "Sur place - 1er étage", "À payer en caisse",
                         note,
                         json.dumps(items, ensure_ascii=False), total,
