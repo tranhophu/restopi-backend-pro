@@ -2020,8 +2020,11 @@ def pending_orders():
 
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # les plus récentes en attente (puis remises dans l'ordre) : de vieilles
+            # commandes jamais marquées imprimées ne doivent pas masquer les nouvelles
             cur.execute(
-                f"SELECT {ORDER_COLUMNS} FROM orders WHERE printed = FALSE ORDER BY id ASC LIMIT %s",
+                f"SELECT * FROM (SELECT {ORDER_COLUMNS} FROM orders WHERE printed = FALSE "
+                f"ORDER BY id DESC LIMIT %s) recent ORDER BY id ASC",
                 (limit,),
             )
             rows = cur.fetchall()
