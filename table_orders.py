@@ -10,8 +10,9 @@ import unicodedata
 import menu_sync
 
 SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "formules.json")
-MAX_LINES = 30
-MAX_UNITS = 40
+# garde-fou seulement (requête trafiquée) : une vraie tablée n'approche jamais ces chiffres
+MAX_LINES = 150
+MAX_UNITS = 300
 MAX_QTY = 20
 CARTE_TABS = [("entree", "Entrées"), ("plat", "Plats"), ("dessert", "Desserts"), ("boisson", "Boissons")]
 MAX_NOTE = 200

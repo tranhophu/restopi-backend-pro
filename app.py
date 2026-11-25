@@ -1480,6 +1480,10 @@ def _order_json(row):
     items = row[8]
     if isinstance(items, str):
         items = json.loads(items)
+    table = row[12]
+    if table == table_orders.NO_TABLE and (row[11] or "").startswith("table"):
+        # « On ne sait pas » : 0 serait lu comme « à emporter » par l'imprimante et l'écran cuisine
+        table = f"? - {(row[2] or '').split('Sans table - ', 1)[-1]}"
     return {
         "id": row[0],
         "date": row[1],
@@ -1493,7 +1497,7 @@ def _order_json(row):
         "total": row[9],
         "printed": row[10],
         "source": row[11] or "online",
-        "table": row[12],
+        "table": table,
     }
 
 
