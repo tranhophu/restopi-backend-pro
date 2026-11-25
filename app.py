@@ -1564,6 +1564,11 @@ def _test_service(catalog, key):
 @app.route("/table/menu", methods=["GET"])
 def table_menu():
     catalog = table_orders.load_catalog()
+    if request.args.get("t") == table_orders.FREE_TABLE:
+        # QR général : la page demande d'abord le numéro de table
+        if not table_orders.is_free_key(TABLE_SECRET, request.args.get("k")):
+            return jsonify({"error": "QR code invalide"}), 403
+        return jsonify({"choose": catalog["tables"]})
     table = table_orders.verify_table(catalog, TABLE_SECRET, request.args.get("t"), request.args.get("k"))
     if not table:
         return jsonify({"error": "QR code invalide"}), 403
@@ -1606,6 +1611,9 @@ def table_order():
         return jsonify({"error": str(e)}), 400
 
     note = table_orders.clean_note(data.get("note"))
+    if table_orders.is_free_key(TABLE_SECRET, data.get("k")):
+        # numéro tapé par le client : le serveur peut vérifier en salle
+        note = f"QR GENERAL - table indiquee par le client. {note}".strip()
     if test:
         # visible sur le ticket avec l'imprimante actuelle : la cuisine ne prépare pas
         note = f"TEST - NE PAS PREPARER. {note}".strip()
@@ -1664,6 +1672,9 @@ def admin_table_links():
     for table in table_orders.load_catalog()["tables"]:
         url = f"{TABLE_PAGE_URL}?t={table}&k={table_orders.table_key(TABLE_SECRET, table)}"
         links.append({"table": table, "url": url, "svg": segno.make(url, error="m").svg_inline(omitsize=True, border=4)})
+    free = table_orders.FREE_TABLE
+    url = f"{TABLE_PAGE_URL}?t={free}&k={table_orders.table_key(TABLE_SECRET, free)}"
+    links.append({"table": free, "url": url, "svg": segno.make(url, error="m").svg_inline(omitsize=True, border=4)})
     return jsonify(links)
 
 @app.route("/contact", methods=["POST"])

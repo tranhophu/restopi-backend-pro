@@ -27,6 +27,14 @@ def table_key(secret, table):
     return hmac.new(secret.encode(), f"table:{table}".encode(), hashlib.sha256).hexdigest()[:16]
 
 
+FREE_TABLE = "libre"
+
+
+def is_free_key(secret, key):
+    """QR général : le client indique lui-même son numéro de table."""
+    return bool(secret and key) and hmac.compare_digest(table_key(secret, FREE_TABLE), str(key))
+
+
 def verify_table(catalog, secret, table, key):
     if not secret or not key:
         return None
@@ -36,7 +44,9 @@ def verify_table(catalog, secret, table, key):
         return None
     if number not in catalog["tables"]:
         return None
-    return number if hmac.compare_digest(table_key(secret, number), str(key)) else None
+    if hmac.compare_digest(table_key(secret, number), str(key)) or is_free_key(secret, key):
+        return number
+    return None
 
 
 def current_service(catalog, now):
