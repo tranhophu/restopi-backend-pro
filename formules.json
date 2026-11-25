@@ -1,6 +1,6 @@
 {
   "_aide": "Commande à table (QR). Source : Menu_Au_Ptit_Vietnam_A4_impression.pdf, pages 2 et 3. extra = supplément en euros, sur un plat ou sur un choix.",
-  "tables": [1, 2, 3, 4, 5, 6],
+  "tables": [1, 2, 3, 4, 5, 6, 7, 8, 9],
   "service": {
     "days": [0, 1, 2, 3, 4, 5],
     "windows": [
