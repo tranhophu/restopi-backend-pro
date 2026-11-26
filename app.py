@@ -7330,14 +7330,44 @@ def costing_data():
             ]
 
             cur.execute("""
-            SELECT name, supplier, purchase_unit, stock_unit, conversion_factor,
-                   last_purchase_price, average_price, COALESCE(purchase_tva, 5.5),
-                   content_qty, content_unit
-            FROM stock_products
-            ORDER BY supplier, name
+            SELECT sp.name, sp.supplier, sp.purchase_unit, sp.stock_unit, sp.conversion_factor,
+                   sp.last_purchase_price, sp.average_price, COALESCE(sp.purchase_tva, 5.5),
+                   sp.content_qty, sp.content_unit,
+                   sp.id, sp.stock_parent_id, COALESCE(sp.stock_quantity, 0),
+                   a.last_date, COALESCE(a.n12, 0)
+            FROM stock_products sp
+            LEFT JOIN (
+                SELECT LOWER(TRIM(product_name)) AS n, LOWER(TRIM(supplier)) AS s,
+                       MAX(purchase_date) AS last_date,
+                       COUNT(*) FILTER (WHERE purchase_date >= CURRENT_DATE - INTERVAL '12 months') AS n12
+                FROM stock_movements
+                WHERE movement_type = 'ACHAT'
+                GROUP BY 1, 2
+            ) a ON a.n = LOWER(TRIM(sp.name)) AND a.s = LOWER(TRIM(sp.supplier))
+            ORDER BY sp.supplier, sp.name
             """)
-            stock = [
-                {
+            rows = cur.fetchall()
+
+            # un produit « carton » lié à un parent : le stock est tenu sur le parent,
+            # et un achat du carton compte aussi comme achat du parent
+            by_id = {r[10]: r for r in rows}
+            last_date = {r[10]: r[13] for r in rows}
+            buys = {r[10]: int(r[14]) for r in rows}
+            for r in rows:
+                p = r[11]
+                if p in by_id:
+                    if r[13] and (not last_date[p] or r[13] > last_date[p]):
+                        last_date[p] = r[13]
+                    buys[p] += int(r[14])
+
+            stock = []
+            for r in rows:
+                p = r[11] if r[11] in by_id else None
+                qty = float(by_id[p][12] if p else r[12])
+                ld = last_date[r[10]]
+                if p and last_date[p] and (not ld or last_date[p] > ld):
+                    ld = last_date[p]
+                stock.append({
                     "name": r[0], "supplier": r[1],
                     "purchase_unit": r[2] or "", "stock_unit": r[3] or "",
                     "conversion_factor": float(r[4] or 1),
@@ -7346,9 +7376,12 @@ def costing_data():
                     "purchase_tva": float(r[7]),
                     "content_qty": float(r[8]) if r[8] else None,
                     "content_unit": r[9] or "",
-                }
-                for r in cur.fetchall()
-            ]
+                    # aide au choix entre produits semblables
+                    "stock_quantity": qty,
+                    "stock_qty_unit": (by_id[p][3] if p else r[3]) or (by_id[p][2] if p else r[2]) or "",
+                    "last_purchase_date": ld.isoformat() if ld else "",
+                    "purchases_12m": buys[r[10]],
+                })
 
             cur.execute("SELECT menu_product_id, portions, extra_cost, note, updated_at FROM recipes")
             recipes = {
