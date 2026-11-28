@@ -7297,6 +7297,24 @@ def sort_sheet():
 
 
 # =========================
+# FICHES CUISINE (recettes de base : produits + étapes) — page recettes.html
+# Données dans kitchen_recipes.json, servies seulement aux admins
+# =========================
+
+@app.route("/admin/kitchen-recipes", methods=["GET"])
+def kitchen_recipes():
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kitchen_recipes.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return jsonify({"recipes": json.load(f)})
+    except (OSError, ValueError) as e:
+        return jsonify({"error": f"Fiches cuisine illisibles : {e}"}), 500
+
+
+# =========================
 # COÛT DES PLATS
 # =========================
 
